@@ -8,7 +8,7 @@ import (
 
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
-	"github.com/vulpemventures/go-elements/address"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	"github.com/vulpemventures/go-elements/elementsutil"
 	"github.com/vulpemventures/go-elements/network"
 	"github.com/vulpemventures/go-elements/psetv2"
@@ -61,13 +61,18 @@ func (s *Service) Notification() ports.Notification {
 	return s.wallet.Notification()
 }
 
+// Network returns the Sequentia network parameters for the network the ocean
+// wallet reports. The ocean-wallet adapter stringifies the wallet's network
+// enum to "mainnet"/"testnet"/"regtest"; seqnet.ByName also accepts the
+// Sequentia names and "liquid", so the mapping is robust regardless of the
+// exact spelling. The native (policy) asset is genesis-derived and supplied at
+// runtime from the wallet's GetInfo.nativeAsset (read from the node's
+// getsidechaininfo.pegged_asset). Falls back to Sequentia mainnet if the signal
+// is unrecognised.
 func (s *Service) Network() network.Network {
-	net := network.Liquid
-	if s.staticInfo.GetNetwork() == network.Testnet.Name {
-		net = network.Testnet
-	}
-	if s.staticInfo.GetNetwork() == network.Regtest.Name {
-		net = network.Regtest
+	net, ok := seqnet.ByName(s.staticInfo.GetNetwork())
+	if !ok {
+		net = seqnet.SequentiaMainnet
 	}
 	net.AssetID = s.staticInfo.GetNativeAsset()
 	return net
@@ -81,6 +86,7 @@ func (s *Service) SendToMany(
 	account string, outs []ports.TxOutput, msatsPerByte uint64,
 ) (string, error) {
 	ctx := context.Background()
+	net := s.Network()
 	txManager := s.wallet.Transaction()
 	accountManager := s.wallet.Account()
 	changeAmountPerAsset := make(map[string]uint64)
@@ -118,7 +124,7 @@ func (s *Service) SendToMany(
 
 		i := 0
 		for asset, amount := range changeAmountPerAsset {
-			info, _ := address.FromConfidential(addresses[i])
+			info, _ := seqnet.FromConfidential(addresses[i], &net)
 			outputs = append(outputs, output{
 				asset, amount, hex.EncodeToString(info.Script),
 				hex.EncodeToString(info.BlindingKey),
@@ -153,7 +159,7 @@ func (s *Service) SendToMany(
 		if err != nil {
 			return "", err
 		}
-		info, _ := address.FromConfidential(addresses[0])
+		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
 			lbtc, change, hex.EncodeToString(info.Script),
 			hex.EncodeToString(info.BlindingKey),
@@ -202,6 +208,7 @@ func (s *Service) CompleteSwap(
 	feesToAdd bool,
 ) (string, []ports.Utxo, int64, error) {
 	ctx := context.Background()
+	net := s.Network()
 	txManager := s.wallet.Transaction()
 	accountManager := s.wallet.Account()
 	inputs := make([]ports.TxInput, 0)
@@ -262,7 +269,7 @@ func (s *Service) CompleteSwap(
 	if err != nil {
 		return "", nil, -1, err
 	}
-	info, _ := address.FromConfidential(addresses[0])
+	info, _ := seqnet.FromConfidential(addresses[0], &net)
 	amountP := swapRequest.GetAmountP()
 	if swapRequest.GetFeeAsset() == swapRequest.GetAssetP() && feesToAdd {
 		amountP += swapRequest.GetFeeAmount()
@@ -278,7 +285,7 @@ func (s *Service) CompleteSwap(
 		if err != nil {
 			return "", nil, -1, err
 		}
-		info, _ := address.FromConfidential(addresses[0])
+		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
 			swapRequest.GetAssetR(), change, hex.EncodeToString(info.Script),
 			hex.EncodeToString(info.BlindingKey),
@@ -316,7 +323,7 @@ func (s *Service) CompleteSwap(
 		if err != nil {
 			return "", nil, -1, err
 		}
-		info, _ := address.FromConfidential(addresses[0])
+		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
 			lbtc, change, hex.EncodeToString(info.Script),
 			hex.EncodeToString(info.BlindingKey),

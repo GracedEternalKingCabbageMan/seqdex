@@ -181,7 +181,7 @@ func (s *service) MarketFragmenterSplitFunds(
 			amount := percentageAmount(baseBalance, percentage)
 			for i := 0; i < n; i++ {
 				addr := addresses[offset+i]
-				outputs = append(outputs, output{market.BaseAsset, amount, addr})
+				outputs = append(outputs, output{market.BaseAsset, amount, addr, s.network})
 			}
 		}
 	}
@@ -199,7 +199,7 @@ func (s *service) MarketFragmenterSplitFunds(
 			amount := percentageAmount(quoteBalance, percentage)
 			for i := 0; i < n; i++ {
 				addr := addresses[offset+i]
-				outputs = append(outputs, output{market.QuoteAsset, amount, addr})
+				outputs = append(outputs, output{market.QuoteAsset, amount, addr, s.network})
 			}
 		}
 	}

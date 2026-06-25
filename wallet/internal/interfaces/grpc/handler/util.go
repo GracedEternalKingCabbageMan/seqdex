@@ -30,11 +30,11 @@ func parsePassword(password string) (string, error) {
 
 func parseNetwork(network string) pb.GetInfoResponse_Network {
 	switch network {
-	case "liquid":
+	case seqnet.Mainnet, "liquid", "mainnet":
 		return pb.GetInfoResponse_NETWORK_MAINNET
-	case "testnet":
+	case seqnet.Testnet, "testnet":
 		return pb.GetInfoResponse_NETWORK_TESTNET
-	case "regtest":
+	case seqnet.Regtest, "regtest":
 		return pb.GetInfoResponse_NETWORK_REGTEST
 	default:
 		return pb.GetInfoResponse_NETWORK_UNSPECIFIED

@@ -7,7 +7,8 @@ import (
 
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
-	"github.com/vulpemventures/go-elements/address"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
+	"github.com/vulpemventures/go-elements/network"
 )
 
 const (
@@ -122,7 +123,7 @@ func (s *service) FeeFragmenterSplitFunds(
 		if i == numFragments-1 {
 			amount = balance
 		}
-		outputs = append(outputs, output{lbtc, amount, addresses[i]})
+		outputs = append(outputs, output{lbtc, amount, addresses[i], s.network})
 		balance -= feeFragmentAmount
 	}
 
@@ -174,6 +175,7 @@ type output struct {
 	asset   string
 	amount  uint64
 	address string
+	net     network.Network
 }
 
 func (o output) GetAsset() string {
@@ -185,12 +187,12 @@ func (o output) GetAmount() uint64 {
 }
 
 func (o output) GetScript() string {
-	script, _ := address.ToOutputScript(o.address)
+	script, _ := seqnet.ToOutputScript(o.address, &o.net)
 	return hex.EncodeToString(script)
 }
 
 func (o output) GetBlindingKey() string {
-	info, _ := address.FromConfidential(o.address)
+	info, _ := seqnet.FromConfidential(o.address, &o.net)
 	return hex.EncodeToString(info.BlindingKey)
 }
 
