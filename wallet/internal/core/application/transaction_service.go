@@ -355,6 +355,39 @@ func (ts *TransactionService) SignPset(
 	})
 }
 
+// exchangeRateScale mirrors the node's exchange_rate_scale (= COIN, 1e8): a fee
+// asset's open-fee-market rate is atoms-of-asset per exchange_rate_scale native
+// atoms. The native (policy) asset is valued 1:1 at exactly this scale.
+const exchangeRateScale = 100_000_000
+
+// feeExchangeRate returns the open-fee-market rate for asset (atoms-of-asset per
+// exchange_rate_scale native atoms) and whether the asset is fee-eligible. The
+// native asset is always eligible at 1:1; every other asset is eligible only
+// when the node reports a positive rate for it. A nil/unsupporting scanner
+// yields (0, false) so callers fall back to the native fee asset.
+func (ts *TransactionService) feeExchangeRate(asset string) (uint64, bool) {
+	if asset == ts.network.AssetID {
+		return exchangeRateScale, true
+	}
+	if ts.bcScanner == nil {
+		return 0, false
+	}
+	return ts.bcScanner.FeeExchangeRate(asset)
+}
+
+// feeInAsset converts a native-denominated network fee (atoms) into feeAsset
+// atoms, rounding UP so the native-equivalent the node computes
+// (native_equivalent = amount * rate / exchange_rate_scale) never underpays the
+// required fee. rate is atoms-of-asset per exchange_rate_scale native atoms; a
+// rate equal to exchange_rate_scale (native, 1:1) returns nativeFee unchanged,
+// and a zero rate is treated as native.
+func feeInAsset(nativeFee, rate uint64) uint64 {
+	if rate == 0 {
+		return nativeFee
+	}
+	return (nativeFee*exchangeRateScale + rate - 1) / rate
+}
+
 func (ts *TransactionService) Transfer(
 	ctx context.Context, accountName string, outputs Outputs,
 	millisatsPerByte uint64,
@@ -405,9 +438,29 @@ func (ts *TransactionService) Transfer(
 		return "", fmt.Errorf("no utxos found for account %s", accountName)
 	}
 
+	// Open fee market: by default the network fee is paid in the asset being
+	// transacted, valued native-equivalent, rather than always in the native
+	// asset. No asset is privileged. The native asset is always fee-eligible at
+	// 1:1, so feeRate == exchangeRateScale and feeInAsset is the identity, which
+	// reduces every code path below to today's native-only behavior. We only
+	// switch the fee asset away from native when the transfer moves EXACTLY ONE
+	// distinct, non-native asset that the node deems fee-eligible (rate > 0);
+	// otherwise (native-only, multi-asset, or non-eligible) we keep native.
+	feeAsset := ts.network.AssetID
+	feeRate := uint64(exchangeRateScale)
+	if assets := outputs.totalAmountByAsset(); len(assets) == 1 {
+		for asset := range assets {
+			if asset != ts.network.AssetID {
+				if rate, eligible := ts.feeExchangeRate(asset); eligible {
+					feeAsset = asset
+					feeRate = rate
+				}
+			}
+		}
+	}
+
 	changeByAsset := make(map[string]uint64)
 	selectedUtxos := make([]*domain.Utxo, 0)
-	lbtc := ts.network.AssetID
 	dust := uint64(0)
 	for targetAsset, targetAmount := range outputs.totalAmountByAsset() {
 		utxos, change, err := DefaultCoinSelector.SelectUtxos(utxos, targetAmount, targetAsset)
@@ -416,8 +469,8 @@ func (ts *TransactionService) Transfer(
 		}
 		selectedUtxos = append(selectedUtxos, utxos...)
 		if change > 0 {
-			// If the lbtc change is dust, it is added as fee amount.
-			if targetAsset == lbtc && change < ts.dustAmount {
+			// If the feeAsset change is dust, it is added as fee amount.
+			if targetAsset == feeAsset && change < ts.dustAmount {
 				dust = change
 			} else {
 				changeByAsset[targetAsset] = change
@@ -474,21 +527,24 @@ func (ts *TransactionService) Transfer(
 	}
 
 	outs := outputs.toWalletOutputs()
-	feeAmount := wallet.EstimateFees(
+	// EstimateFees returns the fee in NATIVE atoms; convert it to feeAsset atoms
+	// (round UP). For the native fee asset feeRate == exchangeRateScale so this
+	// is the identity and the whole section behaves exactly as before.
+	feeAmount := feeInAsset(wallet.EstimateFees(
 		inputs, append(outs, changeOutputs...), millisatsPerByte,
-	)
+	), feeRate)
 	if dust >= feeAmount {
 		// If the dust amount covers the fee amount we are done as the dust
 		// just pays for the tx fees.
 		feeAmount = dust
 	} else {
-		// If lbtc change covers the fee amount, we subtract the latter from the
-		// former. The remaining lbtc change can be become fees if it end up being
-		// dust.
-		if feeAmount <= changeByAsset[lbtc] {
+		// If feeAsset change covers the fee amount, we subtract the latter from
+		// the former. The remaining feeAsset change can become fees if it ends up
+		// being dust.
+		if feeAmount <= changeByAsset[feeAsset] {
 			var outIndex int
 			for i, out := range changeOutputs {
-				if out.Asset == lbtc {
+				if out.Asset == feeAsset {
 					outIndex = i
 					changeOutputs[i].Amount -= feeAmount
 					break
@@ -503,11 +559,11 @@ func (ts *TransactionService) Transfer(
 			}
 		}
 
-		// If feeAmount is greater than the lbtc change, another coin-selection
+		// If feeAmount is greater than the feeAsset change, another coin-selection
 		// round is required, but only in case the user is not trasferring the
 		// whole balance.
-		if feeAmount > changeByAsset[lbtc] {
-			if changeByAsset[lbtc] == 0 {
+		if feeAmount > changeByAsset[feeAsset] {
+			if changeByAsset[feeAsset] == 0 {
 				// If there's no dust it means no change was actually produced during
 				// the first coin selection. In this case, the fee amount is subtracted
 				// from the output of the same asset with the biggest amount.
@@ -515,7 +571,7 @@ func (ts *TransactionService) Transfer(
 					outIndex := 0
 					outAmount := uint64(0)
 					for i, out := range outputs {
-						if out.Asset == lbtc {
+						if out.Asset == feeAsset {
 							if out.Amount >= outAmount {
 								outIndex = i
 								outAmount = out.Amount
@@ -539,8 +595,8 @@ func (ts *TransactionService) Transfer(
 					}
 				}
 			} else {
-				targetAsset := lbtc
-				targetAmount := changeByAsset[lbtc] - feeAmount
+				targetAsset := feeAsset
+				targetAmount := changeByAsset[feeAsset] - feeAmount
 
 				// Coin-selection must be done over remaining utxos.
 				remainingUtxos := getRemainingUtxos(utxos, selectedUtxos)
@@ -568,20 +624,22 @@ func (ts *TransactionService) Transfer(
 					inputsByIndex[uint32(len(inputs))] = input
 				}
 
-				// Now that we have all inputs and outputs, estimate the real fee amount.
-				feeAmount := wallet.EstimateFees(
+				// Now that we have all inputs and outputs, estimate the real fee
+				// amount (native atoms) and convert it to feeAsset atoms (round UP)
+				// so the comparisons below are all denominated in feeAsset.
+				feeAmount := feeInAsset(wallet.EstimateFees(
 					inputs, append(outs, changeOutputs...), millisatsPerByte,
-				)
+				), feeRate)
 
 				outAmount := uint64(0)
 				for _, out := range outs {
-					if out.Asset == lbtc {
+					if out.Asset == feeAsset {
 						outAmount += out.Amount
 					}
 				}
 				inAmount := uint64(0)
 				for _, in := range inputs {
-					if in.Asset == lbtc {
+					if in.Asset == feeAsset {
 						inAmount += in.Value
 					}
 				}
@@ -591,7 +649,7 @@ func (ts *TransactionService) Transfer(
 				changeAmount := inAmount - outAmount - feeAmount
 				changeIndex := 0
 				for i, out := range changeOutputs {
-					if out.Asset == lbtc {
+					if out.Asset == feeAsset {
 						changeIndex = i
 						break
 					}
@@ -611,7 +669,7 @@ func (ts *TransactionService) Transfer(
 
 	outs = append(outs, changeOutputs...)
 	outs = append(outs, wallet.Output{
-		Asset:  ts.network.AssetID,
+		Asset:  feeAsset,
 		Amount: feeAmount,
 	})
 

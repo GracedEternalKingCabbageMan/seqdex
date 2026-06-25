@@ -201,6 +201,12 @@ func (s *service) GetTransactions(txids []string) ([]domain.Transaction, error) 
 	return nil, fmt.Errorf("not implemented")
 }
 
+// FeeExchangeRate has no open fee market behind a neutrino backend, so every
+// asset is reported ineligible and callers fall back to the native fee asset.
+func (s *service) FeeExchangeRate(assetHex string) (uint64, bool) {
+	return 0, false
+}
+
 func (s *service) GetLatestBlock() ([]byte, uint32, error) {
 	block, err := s.headersRepo.ChainTip(context.Background())
 	if err != nil {

@@ -3,6 +3,7 @@ package elements_scanner
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -280,6 +281,52 @@ func (s *service) BroadcastTransaction(txHex string) (string, error) {
 
 func (s *service) GetTransactions(txids []string) ([]domain.Transaction, error) {
 	return nil, fmt.Errorf("not implemented")
+}
+
+// FeeExchangeRate resolves the open-fee-market exchange rate for assetHex from
+// the node (getfeeexchangerates: atoms-of-asset per exchange_rate_scale native
+// atoms). A node with an asset registry keys the rate map by human LABEL (e.g.
+// "GOLD") rather than the asset hex, so we also pull dumpassetlabels
+// (label -> hex) and resolve label-keyed entries back to their hex before
+// matching. Any RPC error, a missing asset, or a non-positive rate yields
+// (0, false) so callers fall back to the native fee asset.
+func (s *service) FeeExchangeRate(assetHex string) (uint64, bool) {
+	resp, err := s.rpcClient.call("getfeeexchangerates", nil)
+	if err != nil {
+		return 0, false
+	}
+	rates, ok := resp.(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	want := strings.ToLower(assetHex)
+
+	// Best-effort label -> hex map; nil/empty if the node has no asset registry
+	// (the rate keys are then already hex) or doesn't support the call.
+	labels := make(map[string]string)
+	if lr, lerr := s.rpcClient.call("dumpassetlabels", nil); lerr == nil {
+		if lm, ok := lr.(map[string]interface{}); ok {
+			for label, hexVal := range lm {
+				if h, ok := hexVal.(string); ok {
+					labels[label] = h
+				}
+			}
+		}
+	}
+
+	for key, raw := range rates {
+		rate, ok := raw.(float64)
+		if !ok || rate <= 0 {
+			continue
+		}
+		if strings.ToLower(key) == want {
+			return uint64(rate), true
+		}
+		if h, ok := labels[key]; ok && strings.ToLower(h) == want {
+			return uint64(rate), true
+		}
+	}
+	return 0, false
 }
 
 func (s *service) GetLatestBlock() ([]byte, uint32, error) {

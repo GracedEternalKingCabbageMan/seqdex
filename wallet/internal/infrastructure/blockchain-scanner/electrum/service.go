@@ -376,6 +376,12 @@ func (s *service) BroadcastTransaction(txHex string) (string, error) {
 	return s.client.broadcastTx(txHex)
 }
 
+// FeeExchangeRate has no open fee market behind an electrum backend, so every
+// asset is reported ineligible and callers fall back to the native fee asset.
+func (s *service) FeeExchangeRate(assetHex string) (uint64, bool) {
+	return 0, false
+}
+
 // GetTransactions returns info about the given txids.
 func (s *service) GetTransactions(txids []string) ([]domain.Transaction, error) {
 	res, err := s.client.getTxs(txids)

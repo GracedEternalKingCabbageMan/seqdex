@@ -142,6 +142,10 @@ func (m *mockBcScanner) GetUtxos(utxos []domain.Utxo) ([]domain.Utxo, error) {
 	return res, args.Error(1)
 }
 
+func (m *mockBcScanner) FeeExchangeRate(assetHex string) (uint64, bool) {
+	return 0, false
+}
+
 func (m *mockBcScanner) GetUtxosForAddresses(addresses []domain.AddressInfo) ([]*domain.Utxo, error) {
 	args := m.Called(addresses)
 	var res []*domain.Utxo
