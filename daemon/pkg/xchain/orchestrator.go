@@ -44,31 +44,51 @@ type Party struct {
 // Swap orchestrates a single Design-A cross-chain HTLC swap. It is written
 // purely against LockPrimitive and the leg builders, so swapping in a PTLC
 // primitive later requires no orchestration change.
+//
+// The BTC (parent / anchor-source) leg is pluggable via btcBackend: it runs
+// either against an Elements-mode parent (NewSwap) or a REAL bitcoind regtest/
+// testnet4 (NewSwapBitcoin). The SEQ (anchored Sequentia) leg is always
+// Elements-format.
 type Swap struct {
-	btc *Chain // the BTC (parent / anchor-source) leg
-	seq *Chain // the Sequentia (anchored) leg
+	btcBackend btcBackend // the BTC (parent / anchor-source) leg, Elements or Bitcoin
+	seq        *Chain     // the Sequentia (anchored) leg
 
-	btcLeg *ElementsLeg
 	seqLeg *ElementsLeg
 
 	hash *HashLock // the shared hashlock (hash known to both; secret to Alice)
 }
 
-// NewSwap wires an orchestrator to the two chains and a hashlock primitive.
+// NewSwap wires an orchestrator to an ELEMENTS-mode parent (BTC leg) and the
+// anchored Sequentia node (SEQ leg). This is the original constructor and the
+// default for back-compat.
 func NewSwap(btc, seq *Chain, prim *HashLock) *Swap {
 	return &Swap{
-		btc:    btc,
-		seq:    seq,
-		btcLeg: NewElementsLeg(LegBTC, prim),
-		seqLeg: NewElementsLeg(LegSEQ, prim),
-		hash:   prim,
+		btcBackend: newElementsBTCBackend(btc, prim),
+		seq:        seq,
+		seqLeg:     NewElementsLeg(LegSEQ, prim),
+		hash:       prim,
+	}
+}
+
+// NewSwapBitcoin wires an orchestrator to a REAL bitcoind parent (BTC leg, in
+// Bitcoin transaction format) and the anchored Sequentia node (SEQ leg, still
+// Elements-format). This is the "real-bitcoind-leg": use it when the parent is a
+// genuine bitcoind (regtest or testnet4), where the taker funds/refunds the BTC
+// HTLC with a real Bitcoin signer and the maker must verify/claim it in Bitcoin
+// format.
+func NewSwapBitcoin(btc *BitcoinChain, seq *Chain, prim *HashLock) *Swap {
+	return &Swap{
+		btcBackend: newBitcoinBTCBackend(btc, prim),
+		seq:        seq,
+		seqLeg:     NewElementsLeg(LegSEQ, prim),
+		hash:       prim,
 	}
 }
 
 // LegLock records a funded HTLC leg.
 type LegLock struct {
-	Script  []byte
-	Funded  *FundedHTLC
+	Script   []byte
+	Funded   *FundedHTLC
 	Locktime uint32
 }
 
@@ -76,22 +96,11 @@ type LegLock struct {
 // leg and the parent height at which it confirmed (Hp), which the SEQ-leg
 // ordering check is measured against.
 func (s *Swap) LockBTCLeg(claimPub, refundPub []byte, amountCoins string, locktime uint32) (*LegLock, int64, error) {
-	script, err := s.btcLeg.HTLCScript(claimPub, refundPub, locktime)
+	script, err := s.btcBackend.HTLCScript(claimPub, refundPub, locktime)
 	if err != nil {
 		return nil, 0, err
 	}
-	funded, err := s.btc.LockHTLC(script, amountCoins, "") // "" => pegged bitcoin asset
-	if err != nil {
-		return nil, 0, err
-	}
-	if err := s.btc.Mine(1); err != nil {
-		return nil, 0, err
-	}
-	hp, err := s.btc.BlockCount()
-	if err != nil {
-		return nil, 0, err
-	}
-	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, hp, nil
+	return s.btcBackend.LockBTCLeg(script, amountCoins, locktime)
 }
 
 // LockSEQLeg performs step 2: Bob locks the SEQ leg only after the BTC leg is
@@ -185,31 +194,10 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 }
 
 // ClaimBTCLeg performs step 5: Bob redeems the BTC leg with the now-revealed
-// preimage. Returns the redeem txid.
+// preimage. Returns the redeem txid. The spend is built in the BTC backend's
+// transaction format (Elements or Bitcoin).
 func (s *Swap) ClaimBTCLeg(leg *LegLock, bobClaim *Key, fee uint64) (string, error) {
-	dest, err := s.btc.NewDestScript()
-	if err != nil {
-		return "", err
-	}
-	rawHex, err := s.btcLeg.Redeem(leg.Script, ElementsSpendInput{
-		TxID:    leg.Funded.TxID,
-		Vout:    leg.Funded.Vout,
-		Amount:  leg.Funded.Amount,
-		AssetID: leg.Funded.AssetID,
-		DestSPK: dest,
-		Fee:     fee,
-	}, bobClaim)
-	if err != nil {
-		return "", err
-	}
-	txid, err := s.btc.Broadcast(rawHex)
-	if err != nil {
-		return "", err
-	}
-	if err := s.btc.Mine(1); err != nil {
-		return "", err
-	}
-	return txid, nil
+	return s.btcBackend.ClaimBTCLeg(leg, bobClaim, fee)
 }
 
 // RefundSEQLeg builds (but does not broadcast) the SEQ-leg CLTV refund for Bob,

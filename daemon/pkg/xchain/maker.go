@@ -66,62 +66,14 @@ func (s *Swap) VerifyBTCLeg(
 	if !bytes.Equal(hashH, s.hash.Hash) {
 		return nil, fmt.Errorf("%w: btc-leg H=%x != quote H=%x", ErrBTCLegInvalid, hashH, s.hash.Hash)
 	}
-	// Recompute the canonical Design-A script and compare to what the taker sent.
-	want, err := s.btcLeg.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(want, providedScript) {
-		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrBTCLegInvalid, want, providedScript)
-	}
-
-	// The funded output must pay the recomputed script's P2SH at the claimed
-	// outpoint, with the agreed amount/asset, and be confirmed.
-	wantP2SH, err := s.btc.P2SHAddress(want)
-	if err != nil {
-		return nil, err
-	}
-	out, err := s.btc.OutputAt(txid, vout)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBTCLegInvalid, err)
-	}
-	wantSPK, err := s.btc.AddressScriptPubKey(wantP2SH)
-	if err != nil {
-		return nil, err
-	}
-	if out.ScriptPubKeyHex != wantSPK {
-		return nil, fmt.Errorf("%w: vout %d:%d does not pay the HTLC P2SH", ErrBTCLegInvalid, vout, vout)
-	}
-	if out.ValueAtoms != amount {
-		return nil, fmt.Errorf("%w: btc-leg value %d != quoted %d", ErrBTCLegInvalid, out.ValueAtoms, amount)
-	}
-	if assetID != "" && out.AssetID != assetID {
-		return nil, fmt.Errorf("%w: btc-leg asset %s != %s", ErrBTCLegInvalid, out.AssetID, assetID)
-	}
-	confs, err := s.btc.TxConfirmations(txid)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBTCLegInvalid, err)
-	}
-	if confs < minConf {
-		return nil, fmt.Errorf("%w: btc-leg has %d confirmations, need %d", ErrBTCLegUnconfirmed, confs, minConf)
-	}
-
-	height, err := s.btc.BlockCount()
-	if err != nil {
-		return nil, err
-	}
-	legHeight := height - int64(confs) + 1 // height at which it confirmed
-
-	return &VerifiedBTCLeg{
-		Leg: &LegLock{
-			Script: want,
-			Funded: &FundedHTLC{TxID: txid, Vout: vout, Amount: out.ValueAtoms, AssetID: out.AssetID},
-			Locktime: btcLocktime,
-		},
-		Height:         legHeight,
-		Confirmations:  confs,
-		ExpectedScript: want,
-	}, nil
+	// Delegate the format-specific verification (Elements vs Bitcoin) to the BTC
+	// backend: it recomputes the canonical Design-A script, locates the funded
+	// HTLC P2SH output, and checks value/asset/confirmations in its own tx
+	// format. The hashlock-vs-quote check above is format-agnostic.
+	return s.btcBackend.VerifyBTCLeg(
+		hashH, makerClaimPub, takerRefundPub, providedScript,
+		btcLocktime, txid, vout, amount, assetID, minConf,
+	)
 }
 
 // WatchSEQClaim polls the SEQ chain for a spend of the SEQ-leg outpoint and,

@@ -53,6 +53,7 @@ var (
 	// Cross-chain (XchainService) maker; nil unless XCHAIN_PARENT_RPC is set.
 	xchainSvc                                                   *xchainmaker.Service
 	xchainParentRPC, xchainSeqRPC, xchainWallet, xchainSeqAsset string
+	xchainParentKind, xchainParentChain                         string
 	xchainPriceSeqPerBtc                                        float64
 	xchainFeeBps, xchainSpendFee                                uint64
 	xchainBtcLocktimeDelta, xchainSeqLocktimeDelta              uint32
@@ -173,6 +174,8 @@ func loadConfig() error {
 	oceanWalletAddr = config.GetString(config.OceanWalletAddrKey)
 	// Cross-chain maker config (only used when XCHAIN_PARENT_RPC is set).
 	xchainParentRPC = config.GetString(config.XchainParentRPCKey)
+	xchainParentKind = config.GetString(config.XchainParentKindKey)
+	xchainParentChain = config.GetString(config.XchainParentChainKey)
 	xchainSeqRPC = config.GetString(config.XchainSeqRPCKey)
 	xchainWallet = config.GetString(config.XchainWalletKey)
 	xchainSeqAsset = config.GetString(config.XchainSeqAssetKey)
@@ -222,21 +225,13 @@ func newXchainService() (*xchainmaker.Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", config.XchainSeqRPCKey, err)
 	}
-	btc := xchain.NewChain(btcRPC, xchainWallet)
 	seq := xchain.NewChain(seqRPC, xchainWallet)
 
-	btcAsset, err := btc.PeggedAsset()
-	if err != nil {
-		return nil, fmt.Errorf("read parent pegged asset: %w", err)
-	}
-
 	cfg := xchainmaker.Config{
-		BTC:         btc,
 		SEQ:         seq,
 		CoinDivisor: 1e8,
 		Markets: []xchainmaker.Market{{
 			SeqAsset:       xchainSeqAsset,
-			BtcAsset:       btcAsset,
 			Name:           "BTC/SEQ-ASSET",
 			PriceSeqPerBtc: xchainPriceSeqPerBtc,
 			FeeBps:         xchainFeeBps,
@@ -249,12 +244,37 @@ func newXchainService() (*xchainmaker.Service, error) {
 		PollInterval:     500 * time.Millisecond,
 	}
 
+	var btcAsset, parentDesc string
+	switch xchainParentKind {
+	case "bitcoin":
+		params, perr := xchain.BitcoinChainParams(xchainParentChain)
+		if perr != nil {
+			return nil, fmt.Errorf("%s: %w", config.XchainParentChainKey, perr)
+		}
+		cfg.ParentKind = xchainmaker.ParentBitcoin
+		cfg.BTCBitcoin = xchain.NewBitcoinChain(btcRPC, xchainWallet, params)
+		btcAsset = "" // real BTC has no asset id
+		parentDesc = "bitcoin/" + xchainParentChain
+	case "elements", "":
+		btc := xchain.NewChain(btcRPC, xchainWallet)
+		cfg.ParentKind = xchainmaker.ParentElements
+		cfg.BTC = btc
+		btcAsset, err = btc.PeggedAsset()
+		if err != nil {
+			return nil, fmt.Errorf("read parent pegged asset: %w", err)
+		}
+		parentDesc = "elements asset=" + btcAsset
+	default:
+		return nil, fmt.Errorf("%s: unknown %q (want bitcoin|elements)", config.XchainParentKindKey, xchainParentKind)
+	}
+	cfg.Markets[0].BtcAsset = btcAsset
+
 	svc, err := xchainmaker.New(cfg)
 	if err != nil {
 		return nil, err
 	}
 	svc.Start()
-	log.Infof("cross-chain XchainService enabled: parent(BTC) asset=%s seq asset=%s wallet=%q", btcAsset, xchainSeqAsset, xchainWallet)
+	log.Infof("cross-chain XchainService enabled: parent(BTC)=%s seq asset=%s wallet=%q", parentDesc, xchainSeqAsset, xchainWallet)
 	return svc, nil
 }
 

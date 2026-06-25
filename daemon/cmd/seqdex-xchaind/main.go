@@ -19,7 +19,10 @@
 // Config (env; secrets/keys come from the node wallets via RPC, never argv):
 //
 //	XCHAIN_LISTEN     gRPC listen addr (default 127.0.0.1:9955)
-//	PARENT_RPC        parent ("BTC") node RPC url, http://user:pass@host:port
+//	SEQDEX_XCHAIN_PARENT_KIND   "elements" (default) or "bitcoin" (real bitcoind)
+//	SEQDEX_XCHAIN_PARENT_RPC    parent ("BTC") node RPC url (falls back to PARENT_RPC)
+//	SEQDEX_XCHAIN_PARENT_CHAIN  bitcoin parent network: regtest (default) | testnet4
+//	PARENT_RPC        legacy alias for SEQDEX_XCHAIN_PARENT_RPC
 //	SEQ_RPC           anchored Sequentia node RPC url, http://user:pass@host:port
 //	WALLET            wallet name on both nodes (default "w")
 //	SEQ_ASSET         the SEQ-side asset id (hex) to offer
@@ -56,7 +59,12 @@ func run() error {
 	listen := envOr("XCHAIN_LISTEN", "127.0.0.1:9955")
 	wallet := envOr("WALLET", "w")
 
-	btcRPC, err := rpcFromEnv("PARENT_RPC")
+	// The parent ("BTC") leg can run against an Elements-mode node (default, for
+	// back-compat) or a REAL bitcoind (regtest/testnet4). Selected by
+	// SEQDEX_XCHAIN_PARENT_KIND; the RPC is SEQDEX_XCHAIN_PARENT_RPC (falling back
+	// to the legacy PARENT_RPC).
+	parentKindStr := envOr("SEQDEX_XCHAIN_PARENT_KIND", "elements")
+	btcRPC, err := rpcFromEnv("SEQDEX_XCHAIN_PARENT_RPC", "PARENT_RPC")
 	if err != nil {
 		return err
 	}
@@ -64,36 +72,55 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	btc := xchain.NewChain(btcRPC, wallet)
 	seq := xchain.NewChain(seqRPC, wallet)
 
 	seqAsset := os.Getenv("SEQ_ASSET")
 	if seqAsset == "" {
 		return fmt.Errorf("SEQ_ASSET not set (the SEQ-side asset id the maker offers)")
 	}
-	btcAsset, err := btc.PeggedAsset()
-	if err != nil {
-		return fmt.Errorf("read parent pegged asset: %w", err)
-	}
 
 	cfg := xchainmaker.Config{
-		BTC:         btc,
 		SEQ:         seq,
 		CoinDivisor: 1e8,
+		QuoteTTL:    2 * time.Minute,
 		Markets: []xchainmaker.Market{{
 			SeqAsset:       seqAsset,
-			BtcAsset:       btcAsset,
 			Name:           "BTC/SEQ-ASSET",
 			PriceSeqPerBtc: floatEnv("PRICE_SEQ_PER_BTC", 100),
 			FeeBps:         uintEnv("FEE_BPS", 0),
 		}},
-		QuoteTTL:         2 * time.Minute,
 		BtcLocktimeDelta: uint32(uintEnv("BTC_LOCKTIME_DELTA", 100)),
 		SeqLocktimeDelta: uint32(uintEnv("SEQ_LOCKTIME_DELTA", 50)),
 		MinBTCConf:       int(uintEnv("MIN_BTC_CONF", 1)),
 		SpendFee:         uintEnv("SPEND_FEE", 1000),
 		PollInterval:     500 * time.Millisecond,
 	}
+
+	var btcAsset string
+	switch parentKindStr {
+	case "bitcoin":
+		chainName := envOr("SEQDEX_XCHAIN_PARENT_CHAIN", "regtest")
+		params, perr := xchain.BitcoinChainParams(chainName)
+		if perr != nil {
+			return perr
+		}
+		cfg.ParentKind = xchainmaker.ParentBitcoin
+		cfg.BTCBitcoin = xchain.NewBitcoinChain(btcRPC, wallet, params)
+		btcAsset = "" // real BTC has no asset id
+		fmt.Printf("seqdex-xchaind: parent=BITCOIN chain=%s\n", chainName)
+	case "elements", "":
+		btc := xchain.NewChain(btcRPC, wallet)
+		cfg.ParentKind = xchainmaker.ParentElements
+		cfg.BTC = btc
+		btcAsset, err = btc.PeggedAsset()
+		if err != nil {
+			return fmt.Errorf("read parent pegged asset: %w", err)
+		}
+		fmt.Println("seqdex-xchaind: parent=ELEMENTS")
+	default:
+		return fmt.Errorf("unknown SEQDEX_XCHAIN_PARENT_KIND %q (want bitcoin|elements)", parentKindStr)
+	}
+	cfg.Markets[0].BtcAsset = btcAsset
 
 	svc, err := xchainmaker.New(cfg)
 	if err != nil {
@@ -115,10 +142,16 @@ func run() error {
 	return grpcSrv.Serve(lis)
 }
 
-func rpcFromEnv(key string) (*xchain.RPC, error) {
-	raw := os.Getenv(key)
+func rpcFromEnv(keys ...string) (*xchain.RPC, error) {
+	var raw, key string
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			raw, key = v, k
+			break
+		}
+	}
 	if raw == "" {
-		return nil, fmt.Errorf("%s not set (expected http://user:pass@host:port)", key)
+		return nil, fmt.Errorf("%s not set (expected http://user:pass@host:port)", keys[0])
 	}
 	u, err := url.Parse(raw)
 	if err != nil {

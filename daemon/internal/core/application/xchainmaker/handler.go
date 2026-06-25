@@ -85,7 +85,7 @@ func (s *Service) GetXchainQuote(
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "gen seq key: %v", err)
 	}
-	btcHeight, err := s.cfg.BTC.BlockCount()
+	btcHeight, err := s.btcHeight()
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "btc height: %v", err)
 	}
@@ -167,7 +167,7 @@ func (s *Service) ProposeXchainSwap(
 	// yet). The SAME primitive is shared by both legs, so injecting the secret
 	// later lets ClaimBTCLeg build the BTC redeem.
 	prim := xchain.NewHashLockFromHash(hashH)
-	orch := xchain.NewSwap(s.cfg.BTC, s.cfg.SEQ, prim)
+	orch := s.newOrch(prim)
 
 	// --- PENDING_BTC_LOCK: verify the taker's BTC leg. ---
 	vbtc, err := orch.VerifyBTCLeg(

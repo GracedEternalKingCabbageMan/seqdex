@@ -49,10 +49,29 @@ type Market struct {
 	FeeBps uint64
 }
 
+// ParentKind selects the BTC-leg (parent / anchor-source) transaction format.
+type ParentKind int
+
+const (
+	// ParentElements: the parent is an Elements-mode node (asset commitments,
+	// Elements serialization). The maker uses xchain.Chain + ElementsLeg. This is
+	// the default for back-compat.
+	ParentElements ParentKind = iota
+	// ParentBitcoin: the parent is a REAL bitcoind (regtest or testnet4). The
+	// maker uses xchain.BitcoinChain + BitcoinLeg, verifying/claiming the BTC
+	// HTLC in Bitcoin transaction format. This is the "real-bitcoind-leg".
+	ParentBitcoin
+)
+
 // Config wires the maker to the two chains and its reserves/keys.
 type Config struct {
-	BTC *xchain.Chain // parent ("BTC") leg, maker's wallet
-	SEQ *xchain.Chain // anchored Sequentia leg, maker's wallet
+	// ParentKind selects the BTC-leg format. When ParentBitcoin, BTCBitcoin is
+	// used for the parent and BTC may be nil; otherwise BTC (Elements) is used.
+	ParentKind ParentKind
+
+	BTC        *xchain.Chain        // Elements parent ("BTC") leg, maker's wallet (ParentElements)
+	BTCBitcoin *xchain.BitcoinChain // real bitcoind parent ("BTC") leg (ParentBitcoin)
+	SEQ        *xchain.Chain        // anchored Sequentia leg, maker's wallet
 
 	// SeqAmountCoins formats SEQ atoms -> decimal coin string for sendtoaddress.
 	// CoinDivisor is the smallest-unit divisor for both assets (1e8).
@@ -144,8 +163,18 @@ type Service struct {
 
 // New builds a maker service. The caller must Start it to run the watcher loop.
 func New(cfg Config) (*Service, error) {
-	if cfg.BTC == nil || cfg.SEQ == nil {
-		return nil, fmt.Errorf("xchainmaker: BTC and SEQ chains are required")
+	if cfg.SEQ == nil {
+		return nil, fmt.Errorf("xchainmaker: SEQ chain is required")
+	}
+	switch cfg.ParentKind {
+	case ParentBitcoin:
+		if cfg.BTCBitcoin == nil {
+			return nil, fmt.Errorf("xchainmaker: ParentBitcoin requires BTCBitcoin (a bitcoind parent)")
+		}
+	default:
+		if cfg.BTC == nil {
+			return nil, fmt.Errorf("xchainmaker: ParentElements requires BTC (an Elements parent)")
+		}
 	}
 	if cfg.BtcLocktimeDelta <= cfg.SeqLocktimeDelta {
 		return nil, fmt.Errorf("xchainmaker: BtcLocktimeDelta (%d) must exceed SeqLocktimeDelta (%d)",
@@ -208,9 +237,36 @@ func (s *Service) seqReserveAtoms(seqAsset string) (uint64, error) {
 	return bal, nil
 }
 
-// btcReserveAtoms reports the maker's confirmed BTC (pegged) balance (atoms).
+// btcReserveAtoms reports the maker's confirmed BTC balance (atoms/sats). For a
+// real bitcoind parent it reads getbalance (the wallet's spendable BTC); for an
+// Elements parent it reads the pegged "bitcoin" asset balance.
 func (s *Service) btcReserveAtoms() (uint64, error) {
+	if s.cfg.ParentKind == ParentBitcoin {
+		var bal float64
+		if err := s.cfg.BTCBitcoin.RPC().Call(&bal, "getbalance"); err != nil {
+			return 0, err
+		}
+		return uint64(bal*1e8 + 0.5), nil
+	}
 	return s.cfg.BTC.AssetBalance("") // "" => default pegged bitcoin
+}
+
+// btcHeight reports the parent chain height (either backend).
+func (s *Service) btcHeight() (int64, error) {
+	if s.cfg.ParentKind == ParentBitcoin {
+		return s.cfg.BTCBitcoin.BlockCount()
+	}
+	return s.cfg.BTC.BlockCount()
+}
+
+// newOrch builds a swap orchestrator bound to the configured parent backend
+// (Elements or real Bitcoin) for the BTC leg and the Sequentia node for the SEQ
+// leg, sharing the given hashlock primitive.
+func (s *Service) newOrch(prim *xchain.HashLock) *xchain.Swap {
+	if s.cfg.ParentKind == ParentBitcoin {
+		return xchain.NewSwapBitcoin(s.cfg.BTCBitcoin, s.cfg.SEQ, prim)
+	}
+	return xchain.NewSwap(s.cfg.BTC, s.cfg.SEQ, prim)
 }
 
 func (s *Service) availableSeq(seqAsset string) (uint64, error) {

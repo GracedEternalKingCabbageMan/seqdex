@@ -72,6 +72,13 @@ const (
 
 	// XchainParentRPCKey: parent ("BTC") node RPC url. Presence enables Xchain.
 	XchainParentRPCKey = "XCHAIN_PARENT_RPC"
+	// XchainParentKindKey: parent ("BTC") leg format: "elements" (default) or
+	// "bitcoin" (a real bitcoind regtest/testnet4). When "bitcoin" the maker
+	// verifies/claims the BTC HTLC in Bitcoin transaction format.
+	XchainParentKindKey = "XCHAIN_PARENT_KIND"
+	// XchainParentChainKey: when XCHAIN_PARENT_KIND=bitcoin, the Bitcoin network:
+	// "regtest" (default) or "testnet4".
+	XchainParentChainKey = "XCHAIN_PARENT_CHAIN"
 	// XchainSeqRPCKey: anchored Sequentia node RPC url for the SEQ leg.
 	XchainSeqRPCKey = "XCHAIN_SEQ_RPC"
 	// XchainWalletKey: wallet name on both nodes.
@@ -123,6 +130,8 @@ func InitConfig() error {
 	vip.SetDefault(DBTypeKey, application.DBBadger)
 
 	// Cross-chain maker defaults (only consulted when XCHAIN_PARENT_RPC is set).
+	vip.SetDefault(XchainParentKindKey, "elements")
+	vip.SetDefault(XchainParentChainKey, "regtest")
 	vip.SetDefault(XchainWalletKey, "w")
 	vip.SetDefault(XchainPriceSeqPerBtcKey, 100)
 	vip.SetDefault(XchainFeeBpsKey, 0)
