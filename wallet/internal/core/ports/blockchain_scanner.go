@@ -57,4 +57,12 @@ type BlockchainScanner interface {
 	BroadcastTransaction(txHex string) (string, error)
 	// GetTransactions returns info about the given txids.
 	GetTransactions(txids []string) ([]domain.Transaction, error)
+
+	// FeeExchangeRate resolves an asset's open-fee-market exchange rate from the
+	// node (atoms-of-asset per exchange_rate_scale native atoms, where
+	// exchange_rate_scale = COIN = 1e8). It returns (rate, true) only when the
+	// asset is fee-eligible (rate > 0); otherwise (0, false). Implementations
+	// backed by something other than a Sequentia node (no open fee market) just
+	// return (0, false) so callers fall back to the native fee asset.
+	FeeExchangeRate(assetHex string) (uint64, bool)
 }
