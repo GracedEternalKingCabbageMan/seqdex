@@ -173,13 +173,24 @@ func (eu elementsUnspent) AssetCommitment() string {
 	return eu.UAssetCommitment
 }
 
+// ValueBlinder / AssetBlinder return the unblinding factors in go-elements'
+// INTERNAL little-endian byte order, matching what the esplora explorer
+// returns (it sources them from confidential.UnblindOutputWithKey, i.e. raw
+// internal order). The Elements node's listunspent reports amountblinder /
+// assetblinder as transaction-id-style hex, i.e. byte-REVERSED relative to the
+// internal representation, so we reverse them here. Without this reversal the
+// proposer's revealed swap blinders are off by a byte-order flip: the maker's
+// BlindLast still balances the in-memory tally (so blinding "succeeds"), but
+// the on-chain Pedersen value commitments do not, and the node rejects the
+// broadcast with bad-txns-in-ne-out. Verified empirically: node blinder ==
+// reverse(go-elements UnblindOutputWithKey blinder).
 func (eu elementsUnspent) ValueBlinder() []byte {
 	amountBlinder, _ := hex.DecodeString(eu.UAmountBlinder)
-	return amountBlinder
+	return elementsutil.ReverseBytes(amountBlinder)
 }
 func (eu elementsUnspent) AssetBlinder() []byte {
 	assetBlinder, _ := hex.DecodeString(eu.UAssetBlinder)
-	return assetBlinder
+	return elementsutil.ReverseBytes(assetBlinder)
 }
 
 func (eu elementsUnspent) Script() []byte {
