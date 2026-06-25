@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package ocean.v1;
+
+import "ocean/v1/types.proto";
+
+// AccountService is used to manage accounts in HD Wallet.
+// It supports generating addresses, listing utxos and balances for specific account or
+// list of addresses and selecting utxos.
+service AccountService {
+  // CreateAccountBIP44 creates a new BIP44 account.
+  rpc CreateAccountBIP44(CreateAccountBIP44Request) returns (CreateAccountBIP44Response);
+
+  // CreateAccountMultiSig creates a new multisig account.
+  rpc CreateAccountMultiSig(CreateAccountMultiSigRequest) returns (CreateAccountMultiSigResponse);
+
+  // CreateAccountCustom creates a new custom account for which loading a template.
+  rpc CreateAccountCustom(CreateAccountCustomRequest) returns (CreateAccountCustomResponse);
+
+  // SetAccountLabel sets a label for the account that can be used later to refer to it.
+  rpc SetAccountLabel(SetAccountLabelRequest) returns (SetAccountLabelResponse);
+
+  // SetAccountTemplate sets the template for the account used to generate new addresses.
+  rpc SetAccountTemplate(SetAccountTemplateRequest) returns (SetAccountTemplateResponse);
+
+  // DeriveAddresses generates new address(es) for the account.
+  rpc DeriveAddresses(DeriveAddressesRequest) returns (DeriveAddressesResponse);
+
+  // DeriveChangeAddresses generates new change address(es) for the account.
+  rpc DeriveChangeAddresses(DeriveChangeAddressesRequest) returns (DeriveChangeAddressesResponse);
+
+  // ListAddresses returns all derived addresses for the account.
+  rpc ListAddresses(ListAddressesRequest) returns (ListAddressesResponse);
+
+  // Balance returns the balance for the account, or for specific list of 
+  // account's addresses.
+  rpc Balance(BalanceRequest) returns (BalanceResponse);
+
+  // ListUtxos returns the utxos for the account, or specific list of 
+  // account's addresses.
+  rpc ListUtxos(ListUtxosRequest) returns (ListUtxosResponse);
+
+  // DeleteAccount deletes an existing account. The operation is allowed only
+  // if the account has zero balance.
+  rpc DeleteAccount(DeleteAccountRequest) returns (DeleteAccountResponse);
+}
+
+message CreateAccountBIP44Request{
+  // Optional label for the new account.
+  string label = 1;
+  // Optional flag for full unconfidential account.
+  bool unconfidential = 2;
+}
+message CreateAccountBIP44Response{
+  // Info about the new account.
+  AccountInfo info = 1;
+}
+
+message CreateAccountMultiSigRequest{
+  // Optional label for the new account.
+  string label = 1;
+  // Optional flag for full unconfidential account.
+  bool unconf = 2;
+}
+message CreateAccountMultiSigResponse{
+  // Info about the new account.
+  AccountInfo info = 1;
+}
+
+message CreateAccountCustomRequest{
+  // Optional label for the new account.
+  string label = 1;
+  // Optional flag for full unconfidential account.
+  bool unconf = 2;
+}
+message CreateAccountCustomResponse{
+  // Info about the new account.
+  AccountInfo info = 1;
+}
+
+message SetAccountLabelRequest {
+  // Account namespace or label.
+  string account_name = 1;
+  // New account label.
+  string label = 2;
+}
+message SetAccountLabelResponse {
+  // Info about the updated account.
+  AccountInfo info = 1;
+}
+
+message SetAccountTemplateRequest {
+  // Account namespace or label.
+  string account_name = 1;
+  // Output descriptor template.
+  Template template = 2;
+}
+message SetAccountTemplateResponse {}
+
+message DeriveAddressesRequest{
+  // Account namespace or label.
+  string account_name = 1;
+  // The number of addresses to generate.
+  uint64 num_of_addresses = 2;
+}
+message DeriveAddressesResponse{
+  repeated string addresses = 1;
+}
+
+message DeriveChangeAddressesRequest{
+  // Account namespace or label.
+  string account_name = 1;
+  // The number of addresses to generate.
+  uint64 num_of_addresses = 2;
+}
+message DeriveChangeAddressesResponse{
+  repeated string addresses = 1;
+}
+
+message ListAddressesRequest {
+  // Account namespace or label.
+  string account_name = 1;
+}
+message ListAddressesResponse {
+  repeated string addresses = 1;
+}
+
+message BalanceRequest{
+  // Account namespace or label.
+  string account_name = 1;
+  // Addresses for which calculating balance. If not specified, the cumulative
+  // balance is returned.
+  repeated string addresses = 3;
+}
+
+message BalanceResponse{
+  // The balance (total, confirmed, unconfirmed) per each asset.
+  map<string, BalanceInfo> balance = 1;
+}
+
+message ListUtxosRequest{
+  // Account namespace or label.
+  string account_name = 1;
+  // List of account's addresses for which listing utxos. If not specified,
+  // the list of all utxos owned by the account is returned.
+  repeated string addresses = 3;
+}
+message ListUtxosResponse{
+  // List of spendable utxos.
+  Utxos spendable_utxos = 1;
+  // List of currently locked utxos.
+  Utxos locked_utxos = 2;
+}
+
+message DeleteAccountRequest{
+  // Account namespace or label.
+  string account_name = 1;
+}
+message DeleteAccountResponse{}

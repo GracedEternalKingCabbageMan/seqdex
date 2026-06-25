@@ -1,0 +1,18 @@
+# Build artifacts
+/bin/
+*.test
+*.out
+
+# Go workspace (kept local; not committed until the daemon/wallet modules land)
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local env / secrets
+*.env
+!*.example.env
+datadir/

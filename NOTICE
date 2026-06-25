@@ -1,0 +1,21 @@
+SeqDEX
+Copyright (c) 2026 The SeqDEX Authors
+
+This product includes software derived from the following MIT-licensed projects.
+Their original copyright and permission notices are retained below as required.
+
+-------------------------------------------------------------------------------
+TDEX (tdex-daemon, tdex-protobuf) — https://github.com/tdex-network
+
+MIT License
+Copyright (c) 2020 TDex Network
+
+-------------------------------------------------------------------------------
+Ocean wallet daemon — https://github.com/vulpemventures/ocean
+
+MIT License
+Copyright (c) 2022 Vulpem Ventures
+-------------------------------------------------------------------------------
+
+The full MIT license text applies to the portions of this software derived from
+the above projects. See LICENSE for the SeqDEX license, which is also MIT.
