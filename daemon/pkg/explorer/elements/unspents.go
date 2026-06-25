@@ -9,12 +9,12 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
-	"github.com/vulpemventures/go-elements/address"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	"github.com/vulpemventures/go-elements/transaction"
 )
 
 func (e *elements) GetUnspents(addr string, blindKeys [][]byte) ([]explorer.Utxo, error) {
-	addrLabel, err := addressLabel(addr)
+	addrLabel, err := e.addressLabel(addr)
 	if err != nil {
 		return nil, fmt.Errorf("label: %w", err)
 	}
@@ -25,7 +25,7 @@ func (e *elements) GetUnspents(addr string, blindKeys [][]byte) ([]explorer.Utxo
 	}
 
 	if !isAddressImported {
-		blindKey, err := findBlindKeyForAddress(addr, blindKeys)
+		blindKey, err := e.findBlindKeyForAddress(addr, blindKeys)
 		if err != nil {
 			return nil, fmt.Errorf("find key: %w", err)
 		}
@@ -54,7 +54,7 @@ func (e *elements) GetUnspentsForAddresses(
 ) ([]explorer.Utxo, error) {
 	sortedBlindingKeys := make([][]byte, 0, len(addresses))
 	for _, addr := range addresses {
-		blindKey, err := findBlindKeyForAddress(addr, blindingKeys)
+		blindKey, err := e.findBlindKeyForAddress(addr, blindingKeys)
 		if err != nil {
 			return nil, fmt.Errorf("find key: %w", err)
 		}
@@ -62,7 +62,7 @@ func (e *elements) GetUnspentsForAddresses(
 	}
 
 	for i, addr := range addresses {
-		addrLabel, err := addressLabel(addr)
+		addrLabel, err := e.addressLabel(addr)
 		if err != nil {
 			return nil, fmt.Errorf("label: %w", err)
 		}
@@ -163,16 +163,20 @@ func (e *elements) getUtxoDetails(
 // address within those watched by the Elements node.
 // This way, it's easy to know if an address is already watched by the node,
 // preventing to re-import it.
-func addressLabel(addr string) (string, error) {
-	script, err := address.ToOutputScript(addr)
+//
+// The address <-> script conversion is routed through pkg/seqnet against the
+// explorer's Sequentia network (go-elements' address.ToOutputScript hardcodes
+// the Liquid HRPs and would reject Sequentia addresses).
+func (e *elements) addressLabel(addr string) (string, error) {
+	script, err := seqnet.ToOutputScript(addr, e.network)
 	if err != nil {
 		return "", ErrInvalidAddress
 	}
 	return hex.EncodeToString(script), nil
 }
 
-func findBlindKeyForAddress(addr string, blindKeys [][]byte) ([]byte, error) {
-	data, err := address.FromConfidential(addr)
+func (e *elements) findBlindKeyForAddress(addr string, blindKeys [][]byte) ([]byte, error) {
+	data, err := seqnet.FromConfidential(addr, e.network)
 	if err != nil {
 		return nil, err
 	}

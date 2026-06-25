@@ -95,7 +95,7 @@ type txResult struct {
 // already tracked. The transactions are retrieved via the
 // listreceivedbyaddress RPC.
 func (e *elements) GetTransactionsForAddress(addr string, blindingKey []byte) ([]explorer.Transaction, error) {
-	addrLabel, err := addressLabel(addr)
+	addrLabel, err := e.addressLabel(addr)
 	if err != nil {
 		return nil, fmt.Errorf("label: %w", err)
 	}

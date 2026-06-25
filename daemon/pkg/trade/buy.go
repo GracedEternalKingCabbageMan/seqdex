@@ -8,13 +8,14 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	tradeclient "github.com/aejkcs50/seqdex/daemon/pkg/trade/client"
 	trademarket "github.com/aejkcs50/seqdex/daemon/pkg/trade/market"
 	tradetype "github.com/aejkcs50/seqdex/daemon/pkg/trade/type"
 
 	"github.com/aejkcs50/seqdex/daemon/pkg/swap"
-	"github.com/vulpemventures/go-elements/address"
 	"github.com/vulpemventures/go-elements/elementsutil"
+	"github.com/vulpemventures/go-elements/network"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -45,7 +46,7 @@ type BuyOrSellOpts struct {
 	FeeAsset    string
 }
 
-func (o BuyOrSellOpts) validate() error {
+func (o BuyOrSellOpts) validate(net *network.Network) error {
 	if err := o.Market.Validate(); err != nil {
 		return err
 	}
@@ -58,7 +59,7 @@ func (o BuyOrSellOpts) validate() error {
 	if len(o.Address) <= 0 {
 		return ErrNullAddress
 	}
-	if _, err := address.ToOutputScript(o.Address); err != nil {
+	if _, err := seqnet.ToOutputScript(o.Address, net); err != nil {
 		return ErrInvalidAddress
 	}
 	if len(o.BlindingKey) <= 0 {
@@ -74,7 +75,7 @@ func (o BuyOrSellOpts) validate() error {
 // the server which the inner client is connected to. This method returns the
 // SwapAccept serialized message eventually returned by the counter-party.
 func (t *Trade) Buy(opts BuyOrSellOpts) ([]byte, error) {
-	if err := opts.validate(); err != nil {
+	if err := opts.validate(t.network); err != nil {
 		return nil, err
 	}
 
@@ -175,7 +176,7 @@ func (t *Trade) marketOrderRequest(
 		return nil, err
 	}
 
-	outputScript, _ := address.ToOutputScript(addr)
+	outputScript, _ := seqnet.ToOutputScript(addr, t.network)
 	_, pk := btcec.PrivKeyFromBytes(blindingKey)
 	outputBlindingKey := pk.SerializeCompressed()
 
@@ -220,6 +221,8 @@ func (t *Trade) marketOrderRequest(
 		Market:      market,
 		SwapRequest: swapRequestMsg,
 		TradeType:   tradeType,
+		FeeAsset:    preview.FeeAsset,
+		FeeAmount:   preview.FeeAmount,
 	})
 	if err != nil {
 		return nil, err
