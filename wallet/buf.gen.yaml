@@ -1,0 +1,13 @@
+version: v1
+managed:
+  enabled: true
+  go_package_prefix:
+    default: github.com/aejkcs50/seqdex/wallet/api-spec/protobuf/gen
+plugins:
+  # Golang
+  - plugin: go
+    out: api-spec/protobuf/gen/go
+    opt: paths=source_relative
+  - plugin: go-grpc
+    out: api-spec/protobuf/gen/go
+    opt: paths=source_relative,require_unimplemented_servers=false
