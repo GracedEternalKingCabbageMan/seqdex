@@ -8,8 +8,6 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
-	"github.com/vulpemventures/go-elements/confidential"
-	"github.com/vulpemventures/go-elements/elementsutil"
 	"github.com/vulpemventures/go-elements/network"
 	"github.com/vulpemventures/go-elements/payment"
 	"github.com/vulpemventures/go-elements/psetv2"
@@ -54,43 +52,6 @@ func NewSwapTx(
 			index, prevout.RangeProof,
 		); err != nil {
 			return "", err
-		}
-
-		// For confidential inputs, attach the explicit asset/value blind
-		// proofs. The responder's (maker's) ocean wallet adds these for its
-		// own inputs before blinding as the last blinder; without matching
-		// proofs on the proposer's (taker's) input, the assembled CT swap tx
-		// fails consensus value verification ("bad-txns-in-ne-out"). This
-		// mirrors wallet/pkg/wallet UpdatePset's confidential-input handling.
-		if u.IsConfidential() {
-			// 32-byte little-endian asset id (no 0x01 prefix), matching the
-			// maker wallet's UpdatePset explicit-asset handling.
-			asset, _ := elementsutil.TxIDToBytes(u.Asset())
-			// The elements node returns asset/value blinders in display
-			// (big-endian) order via listunspent; go-elements' confidential
-			// proof helpers expect the raw little-endian blinding factor, so
-			// reverse them here (the maker wallet stores them already in
-			// internal order from its own unblinding).
-			assetBlinder := elementsutil.ReverseBytes(u.AssetBlinder())
-			valueBlinder := elementsutil.ReverseBytes(u.ValueBlinder())
-			assetProof, err := confidential.CreateBlindAssetProof(
-				asset, prevout.Asset, assetBlinder,
-			)
-			if err != nil {
-				return "", err
-			}
-			valueProof, err := confidential.CreateBlindValueProof(
-				nil, valueBlinder, u.Value(), prevout.Value, prevout.Asset,
-			)
-			if err != nil {
-				return "", err
-			}
-			if err := updater.AddInExplicitAsset(index, asset, assetProof); err != nil {
-				return "", err
-			}
-			if err := updater.AddInExplicitValue(index, u.Value(), valueProof); err != nil {
-				return "", err
-			}
 		}
 	}
 
