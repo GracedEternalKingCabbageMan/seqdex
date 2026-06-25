@@ -16,3 +16,6 @@ go.work.sum
 *.env
 !*.example.env
 datadir/
+
+# local build outputs (scp'd to the box)
+/dist/

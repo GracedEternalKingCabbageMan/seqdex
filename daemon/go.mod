@@ -12,9 +12,14 @@ replace github.com/aejkcs50/seqdex/daemon/old-v0 => ./cmd/migration/v0-v1/v0-dom
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
+	github.com/aejkcs50/seqdex/daemon/old-v0 v0.0.0-00010101000000-000000000000
+	github.com/aejkcs50/seqdex/daemon/pkg/explorer v0.0.0-20211001103242-a11e4485705a
+	github.com/aejkcs50/seqdex/daemon/pkg/macaroons v0.0.0-20210813140257-70d50a8b72a4
+	github.com/aejkcs50/seqdex/daemon/pkg/securestore v0.0.0-20210813140257-70d50a8b72a4
 	github.com/btcsuite/btcd v0.23.4
 	github.com/btcsuite/btcd/btcec/v2 v2.2.0
 	github.com/btcsuite/btcd/btcutil v1.1.3
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/desertbit/timer v0.0.0-20180107155436-c41aec40b27f // indirect
 	github.com/dgraph-io/badger/v3 v3.2103.2
@@ -43,10 +48,6 @@ require (
 	github.com/spf13/viper v1.12.0
 	github.com/stretchr/testify v1.8.2
 	github.com/tdex-network/reflection v1.1.0
-	github.com/aejkcs50/seqdex/daemon/old-v0 v0.0.0-00010101000000-000000000000
-	github.com/aejkcs50/seqdex/daemon/pkg/explorer v0.0.0-20211001103242-a11e4485705a
-	github.com/aejkcs50/seqdex/daemon/pkg/macaroons v0.0.0-20210813140257-70d50a8b72a4
-	github.com/aejkcs50/seqdex/daemon/pkg/securestore v0.0.0-20210813140257-70d50a8b72a4
 	github.com/thanhpk/randstr v1.0.4
 	github.com/timshannon/badgerhold/v3 v3.0.0 // indirect
 	github.com/timshannon/badgerhold/v4 v4.0.2
