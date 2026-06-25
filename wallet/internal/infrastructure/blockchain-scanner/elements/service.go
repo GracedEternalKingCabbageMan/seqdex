@@ -69,7 +69,11 @@ func NewElementsScanner(args ServiceArgs) (ports.BlockchainScanner, error) {
 		return nil, err
 	}
 
-	rpcClient, err := newRpcClient(args.RpcAddr, 5)
+	// SEQUENTIA: the previous 5s HTTP timeout was too low — large blocks (and
+	// the initial getblockchaininfo handshake while the node is busy) could
+	// exceed it, making CreateWallet/GetLatestBlock fail at ~5s. Use a generous
+	// fixed default instead.
+	rpcClient, err := newRpcClient(args.RpcAddr, rpcTimeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -271,12 +275,26 @@ func (s *service) GetTransactions(txids []string) ([]domain.Transaction, error) 
 }
 
 func (s *service) GetLatestBlock() ([]byte, uint32, error) {
-	block, err := s.headersRepo.ChainTip(context.Background())
+	// SEQUENTIA: take the tip hash straight from the node rather than computing
+	// it via go-elements' block.Header.Hash(), which mis-serializes anchored
+	// Sequentia headers (it omits m_anchor_height/m_anchor_hash) and so would
+	// return a hash that does not exist on-chain.
+	concrete, ok := s.headersRepo.(*headersRepo)
+	if !ok {
+		// Fallback for any non-node-RPC headers repo: derive from ChainTip.
+		// (The default Sequentia path always uses *headersRepo.)
+		block, err := s.headersRepo.ChainTip(context.Background())
+		if err != nil {
+			return nil, 0, err
+		}
+		hash, _ := block.Hash()
+		return hash.CloneBytes(), block.Height, nil
+	}
+	hash, height, err := concrete.chainTipHash()
 	if err != nil {
 		return nil, 0, err
 	}
-	hash, _ := block.Hash()
-	return hash.CloneBytes(), block.Height, nil
+	return hash.CloneBytes(), height, nil
 }
 
 func (s *service) GetBlockHash(height uint32) ([]byte, error) {

@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// rpcTimeoutSeconds is the default per-request HTTP timeout for the node JSON-RPC
+// client. It must be generous enough for large `getblock`/`getblockfilter`
+// responses and for the initial getblockchaininfo handshake when the node is
+// still busy at startup; the historical 5s value was too low and made
+// CreateWallet/GetLatestBlock fail with a request timeout.
+const rpcTimeoutSeconds = 30
+
 // RpcClient represents a JSON RPC client (over HTTP(s)).
 type rpcClient struct {
 	serverAddr string
