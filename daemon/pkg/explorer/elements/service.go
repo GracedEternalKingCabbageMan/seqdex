@@ -8,25 +8,49 @@ import (
 	"strconv"
 
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
+	"github.com/vulpemventures/go-elements/network"
 )
 
 type elements struct {
 	client          *RPCClient
 	rescanTimestamp interface{}
+	// network is the Sequentia network whose HRPs/version bytes drive the
+	// address <-> output-script conversions used to label and import watched
+	// addresses. go-elements' top-level address helpers hardcode Liquid, so
+	// the elements explorer must carry the network explicitly and route every
+	// address call through pkg/seqnet.
+	network *network.Network
 }
 
-// NewService returns the Elements implementation of the Explorer interface.
+// NewService returns the Elements implementation of the Explorer interface
+// targeting Sequentia mainnet address params. Use NewServiceWithNetwork to
+// pick a different (e.g. regtest) Sequentia network.
+//
 // It establishes an insecure connection with the JSON-RPC interface of the
 // node with no TLS termination.
 func NewService(endpoint string, rescanTimestamp interface{}) (
 	explorer.Service,
 	error,
 ) {
+	net := seqnet.SequentiaMainnet
+	return NewServiceWithNetwork(endpoint, rescanTimestamp, &net)
+}
+
+// NewServiceWithNetwork is NewService with an explicit Sequentia network, so
+// the address helpers (label/import) use the correct HRPs and version bytes.
+func NewServiceWithNetwork(
+	endpoint string, rescanTimestamp interface{}, net *network.Network,
+) (explorer.Service, error) {
 	if err := validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
 	if err := validateRescanTimestamp(rescanTimestamp); err != nil {
 		return nil, err
+	}
+	if net == nil {
+		n := seqnet.SequentiaMainnet
+		net = &n
 	}
 
 	parsedEndpoint, _ := url.Parse(endpoint)
@@ -44,7 +68,7 @@ func NewService(endpoint string, rescanTimestamp interface{}) (
 		return nil, err
 	}
 
-	service := &elements{client, rescanTimestamp}
+	service := &elements{client, rescanTimestamp, net}
 	if _, err := service.GetBlockHeight(); err != nil {
 		return nil, fmt.Errorf("healt check: %w", err)
 	}

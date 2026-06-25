@@ -10,7 +10,7 @@ import (
 // eventually, the resulting SwapAccept serialized message returned by the
 // counter-party is returned to the caller.
 func (t *Trade) Sell(opts BuyOrSellOpts) ([]byte, error) {
-	if err := opts.validate(); err != nil {
+	if err := opts.validate(t.network); err != nil {
 		return nil, err
 	}
 

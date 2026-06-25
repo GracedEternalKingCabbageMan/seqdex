@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	tradeclient "github.com/aejkcs50/seqdex/daemon/pkg/trade/client"
 	"github.com/vulpemventures/go-elements/network"
 )
@@ -11,7 +12,8 @@ import (
 var (
 	// ErrInvalidChain ...
 	ErrInvalidChain = fmt.Errorf(
-		"chain must be either '%s' or '%s", network.Liquid.Name, network.Regtest.Name,
+		"chain must be a known Sequentia network (e.g. '%s', '%s' or '%s')",
+		seqnet.Mainnet, seqnet.Testnet, seqnet.Regtest,
 	)
 	// ErrInvalidProviderURL ...
 	ErrInvalidProviderURL = fmt.Errorf(
@@ -31,7 +33,16 @@ type Trade struct {
 
 // NewTradeOpts is the struct given to NewTrade method
 type NewTradeOpts struct {
-	Chain           string
+	// Chain is a Sequentia network signal accepted by seqnet.ByName, i.e. one
+	// of the Sequentia names ("sequentia", "sequentia-testnet",
+	// "sequentia-regtest") or the ocean-adapter spellings
+	// ("mainnet"/"testnet"/"regtest").
+	Chain string
+	// NativeAsset is the network's policy/native asset (the node's
+	// getsidechaininfo.pegged_asset). It is genesis-derived and therefore must
+	// be supplied at runtime; it is stamped onto the network's AssetID so the
+	// go-elements PSET/blinding machinery treats it as the fee asset.
+	NativeAsset     string
 	ExplorerService explorer.Service
 	Client          *tradeclient.Client
 }
@@ -55,20 +66,28 @@ func NewTrade(opts NewTradeOpts) (*Trade, error) {
 		return nil, err
 	}
 
+	net := networkFromString(opts.Chain)
+	net.AssetID = opts.NativeAsset
+
 	return &Trade{
-		network:  networkFromString(opts.Chain),
+		network:  net,
 		explorer: opts.ExplorerService,
 		client:   opts.Client,
 	}, nil
 }
 
 func isValidChain(chain string) bool {
-	return chain == network.Liquid.Name || chain == network.Regtest.Name
+	_, ok := seqnet.ByName(chain)
+	return ok
 }
 
+// networkFromString resolves a Sequentia network from its signal. It returns a
+// COPY (seqnet.ByName already copies) so callers may safely stamp AssetID.
 func networkFromString(chain string) *network.Network {
-	if chain == network.Liquid.Name {
-		return &network.Liquid
+	net, ok := seqnet.ByName(chain)
+	if !ok {
+		// Should never happen: callers go through validate() first.
+		net = seqnet.SequentiaMainnet
 	}
-	return &network.Regtest
+	return &net
 }

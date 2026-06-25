@@ -22,6 +22,13 @@ type TradeProposeOpts struct {
 	Market      trademarket.Market
 	SwapRequest []byte
 	TradeType   tradetype.TradeType
+	// FeeAsset / FeeAmount are carried on the ProposeTradeRequest itself (the
+	// tdex.v2 SwapRequest message does not serialize them). The daemon's
+	// proposeTrade handler validates these top-level fields, so the taker SDK
+	// must populate them from the trade preview, otherwise the daemon rejects
+	// the proposal with "invalid fee asset".
+	FeeAsset  string
+	FeeAmount uint64
 }
 
 func (o TradeProposeOpts) validate() error {
@@ -56,6 +63,8 @@ func (c *Client) TradePropose(opts TradeProposeOpts) (*tdexv2.ProposeTradeRespon
 		Market:      market,
 		SwapRequest: swapRequest,
 		Type:        tdexv2.TradeType(opts.TradeType),
+		FeeAsset:    opts.FeeAsset,
+		FeeAmount:   opts.FeeAmount,
 	}
 	return c.client.ProposeTrade(context.Background(), request)
 }
