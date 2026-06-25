@@ -1,0 +1,328 @@
+package config
+
+import (
+	"encoding/hex"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/spf13/viper"
+	"github.com/vulpemventures/go-elements/network"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
+)
+
+const (
+	// DatadirKey is the key to customize the ocean datadir.
+	DatadirKey = "DATADIR"
+	// DbTypeKey is the key to customize the type of database to use.
+	DbTypeKey = "DB_TYPE"
+	// BlockchainScannerTypeKey is the key to customize the type of blockchain
+	// scanner to use.
+	BlockchainScannerTypeKey = "BLOCKCHAIN_SCANNER_TYPE"
+	// PortKey is the key to customize the port where the wallet will be listening to.
+	PortKey = "PORT"
+	// ProfilerPortKey is the key to customize the port where the profiler will
+	// be listening to.
+	ProfilerPortKey = "PROFILER_PORT"
+	// NetworkKey is the key to customize the Liquid network.
+	NetworkKey = "NETWORK"
+	// NativeAssetKey is the key to customize the native LBTC asset of the Liquid
+	// network. Should be used only for testing purposes.
+	NativeAssetKey = "NATIVE_ASSET"
+	// LogLevelKey is the key to customize the log level to catch more specific
+	// or more high level logs.
+	LogLevelKey = "LOG_LEVEL"
+	// TLSExtraIPKey is the key to bind one or more public IPs to the TLS key pair.
+	// Should be used only when enabling TLS.
+	TLSExtraIPKey = "TLS_EXTRA_IP"
+	// TLSExtraDomainKey is the key to bind one or more public dns domains to the
+	// TLS key pair. Should be used only when enabling TLS.
+	TLSExtraDomainKey = "TLS_EXTRA_DOMAIN"
+	// NoTLSKey is the key to disable TLS encryption.
+	NoTLSKey = "NO_TLS"
+	// NoProfilerKey is the key to disable Prometheus profiling.
+	NoProfilerKey = "NO_PROFILER"
+	// StatsIntervalKey is the key to customize the interval for the profiled to
+	// gather profiling stats.
+	StatsIntervalKey = "STATS_INTERVAL"
+	// NodePeersKey is the key to customize the list of peers the embedded SPV
+	// node will connect to when started
+	NodePeersKey = "NODE_PEERS"
+	// ElementsNodeRpcAddrKey is the key to set the rpc address of the node to connect
+	// to when using elements-node-based blockchain scanner.
+	ElementsNodeRpcAddrKey = "NODE_RPC_ADDR"
+	// UtxoExpiryDurationKey is the key to customize the waiting time for one or
+	// more previously locked utxos to be unlocked if not yet spent.
+	UtxoExpiryDurationKey = "UTXO_EXPIRY_DURATION_IN_SECONDS"
+	// RootPathKey is the key to use a custom root path for the wallet,
+	// instead of the default m/84'/[1776|1]' (depending on network).
+	RootPathKey = "ROOT_PATH"
+	// ElectrumUrlKey is the key for the electrum server endpoint consumed by the
+	// electrum blockchain scanner.
+	ElectrumUrlKey = "ELECTRUM_URL"
+	// DbUserKey is user used to connect to db
+	DbUserKey = "DB_USER"
+	// DbPassKey is password used to connect to db
+	DbPassKey = "DB_PASS"
+	// DbHostKey is host where db is installed
+	DbHostKey = "DB_HOST"
+	// DbPortKey is port on which db is listening
+	DbPortKey = "DB_PORT"
+	// DbNameKey is name of database
+	DbNameKey = "DB_NAME"
+	// DbMigrationPath is the path to migration files
+	DbMigrationPath = "DB_MIGRATION_PATH"
+	// DustAmountKey is the key to customize the dust amount threshold
+	DustAmountKey = "DUST_AMOUNT"
+	// PasswordKey is the key to set the password for auto-init/auto-unlock.
+	PasswordKey = "PASSWORD"
+	// MnemonicKey is the key to set the mnemonic for auto-init.
+	MnemonicKey = "MNEMONIC"
+
+	// DbLocation is the folder inside the datadir containing db files.
+	DbLocation = "db"
+	// TLSLocation is the folder inside the datadir containing TLS key and
+	// certificate.
+	TLSLocation = "tls"
+	// ScannerLocation is the folder inside the datadir containing blockchain
+	// scanner files.
+	ScannerLocation = "blockchain"
+	// ProfilerLocation is the folder inside the datadir containing profiler
+	// stats files.
+	ProfilerLocation = "stats"
+)
+
+var (
+	vip *viper.Viper
+
+	defaultDatadir            = btcutil.AppDataDir("seqdex-wallet", false)
+	defaultDbType             = "badger"
+	defaultBcScannerType      = "elements"
+	defaultPort               = 18000
+	defaultLogLevel           = 4
+	defaultNetwork            = seqnet.Testnet
+	defaultProfilerPort       = 18001
+	defaultStatsInterval      = 600 // 10 minutes
+	defaultUtxoExpiryDuration = 360 // 6 minutes (3 blocks)
+	defaultElectrumUrl        = "ssl://blockstream.info:995"
+	defaultDustAmount         = uint64(450)
+
+	supportedNetworks = seqnet.All
+	coinTypeByNetwork = map[string]int{
+		seqnet.Mainnet: 1776,
+		seqnet.Testnet: 1,
+		seqnet.Regtest: 1,
+	}
+	SupportedDbs = supportedType{
+		"badger":   {},
+		"inmemory": {},
+		"postgres": {},
+	}
+	SupportedBcScanners = supportedType{
+		"neutrino": {},
+		"elements": {},
+		"electrum": {},
+	}
+)
+
+func init() {
+	vip = viper.New()
+	vip.SetEnvPrefix("OCEAN")
+	vip.AutomaticEnv()
+
+	vip.SetDefault(DatadirKey, defaultDatadir)
+	vip.SetDefault(DbTypeKey, defaultDbType)
+	vip.SetDefault(BlockchainScannerTypeKey, defaultBcScannerType)
+	vip.SetDefault(PortKey, defaultPort)
+	vip.SetDefault(NetworkKey, defaultNetwork)
+	vip.SetDefault(LogLevelKey, defaultLogLevel)
+	vip.SetDefault(NoTLSKey, false)
+	vip.SetDefault(NoProfilerKey, false)
+	vip.SetDefault(ProfilerPortKey, defaultProfilerPort)
+	vip.SetDefault(StatsIntervalKey, defaultStatsInterval)
+	vip.SetDefault(UtxoExpiryDurationKey, defaultUtxoExpiryDuration)
+	vip.SetDefault(DbUserKey, "root")
+	vip.SetDefault(DbPassKey, "secret")
+	vip.SetDefault(DbHostKey, "127.0.0.1")
+	vip.SetDefault(DbPortKey, 5432)
+	vip.SetDefault(DbNameKey, "oceand-db")
+	vip.SetDefault(DbMigrationPath, "file://internal/infrastructure/storage/db/postgres/migration")
+	vip.SetDefault(ElectrumUrlKey, defaultElectrumUrl)
+	vip.SetDefault(DustAmountKey, defaultDustAmount)
+
+	if err := validate(); err != nil {
+		log.Fatalf("invalid config: %s", err)
+	}
+
+	if err := initDatadir(); err != nil {
+		log.Fatalf("config: error while creating datadir: %s", err)
+	}
+}
+
+func validate() error {
+	datadir := GetString(DatadirKey)
+	if len(datadir) <= 0 {
+		return fmt.Errorf("datadir must not be null")
+	}
+
+	net := GetString(NetworkKey)
+	if len(net) == 0 {
+		return fmt.Errorf("network must not be null")
+	}
+	if _, ok := supportedNetworks[net]; !ok {
+		nets := make([]string, 0, len(supportedNetworks))
+		for net := range supportedNetworks {
+			nets = append(nets, net)
+		}
+		return fmt.Errorf("unknown network, must be one of: %v", nets)
+	}
+
+	// On Sequentia the native/policy asset is derived from each network's genesis,
+	// so it is not a compile-time constant: it must be provided for every network
+	// via NATIVE_ASSET (the node's getsidechaininfo.pegged_asset).
+	asset := GetString(NativeAssetKey)
+	if len(asset) == 0 {
+		return fmt.Errorf(
+			"%s must be set to the network's native/policy asset id "+
+				"(hex of getsidechaininfo.pegged_asset)", NativeAssetKey,
+		)
+	}
+	buf, err := hex.DecodeString(asset)
+	if err != nil {
+		return fmt.Errorf("invalid native asset string format, must be hex")
+	}
+	if len(buf) != 32 {
+		return fmt.Errorf(
+			"invalid native asset length, must be exactly 32 bytes in hex string format",
+		)
+	}
+
+	dbType := GetString(DbTypeKey)
+	if _, ok := SupportedDbs[dbType]; !ok {
+		return fmt.Errorf("unsupported database type, must be one of %s", SupportedDbs)
+	}
+
+	bcScannerType := GetString(BlockchainScannerTypeKey)
+	if _, ok := SupportedBcScanners[bcScannerType]; !ok {
+		return fmt.Errorf(
+			"unsupported blockchain scanner type, must be one of %s", SupportedBcScanners,
+		)
+	}
+
+	if bcScannerType == "neutrino" {
+		nodePeers := GetStringSlice(NodePeersKey)
+		if len(nodePeers) == 0 {
+			return fmt.Errorf("node peers list must not be empty")
+		}
+	}
+
+	port := GetInt(PortKey)
+	noProfiler := GetBool(NoProfilerKey)
+	if !noProfiler {
+		profilerPort := GetInt(ProfilerPortKey)
+		if port == profilerPort {
+			return fmt.Errorf("port and profiler port must not be equal")
+		}
+	}
+
+	if IsSet(MnemonicKey) && !IsSet(PasswordKey) {
+		return fmt.Errorf("password must be defined if mnemonic is set")
+	}
+
+	return nil
+}
+
+func GetDatadir() string {
+	return filepath.Join(GetString(DatadirKey), GetString(NetworkKey))
+}
+
+func GetNetwork() *network.Network {
+	// Copy so we never mutate the shared seqnet definition; set the runtime
+	// native/policy asset from config.
+	net := *supportedNetworks[GetString(NetworkKey)]
+	if nativeAsset := GetString(NativeAssetKey); nativeAsset != "" {
+		net.AssetID = nativeAsset
+	}
+	return &net
+}
+
+func GetRootPath() string {
+	rootPath := GetString(RootPathKey)
+	if rootPath != "" {
+		return rootPath
+	}
+
+	coinType := coinTypeByNetwork[GetString(NetworkKey)]
+	return fmt.Sprintf("m/84'/%d'", coinType)
+}
+
+func GetString(key string) string {
+	return vip.GetString(key)
+}
+
+func GetInt(key string) int {
+	return vip.GetInt(key)
+}
+
+func GetBool(key string) bool {
+	return vip.GetBool(key)
+}
+
+func GetStringSlice(key string) []string {
+	return vip.GetStringSlice(key)
+}
+
+func Set(key string, val interface{}) {
+	vip.Set(key, val)
+}
+
+func Unset(key string) {
+	vip.Set(key, nil)
+}
+
+func IsSet(key string) bool {
+	return vip.IsSet(key)
+}
+
+func initDatadir() error {
+	datadir := GetDatadir()
+	if err := makeDirectoryIfNotExists(filepath.Join(datadir, DbLocation)); err != nil {
+		return err
+	}
+
+	noProfiler := GetBool(NoProfilerKey)
+	if !noProfiler {
+		if err := makeDirectoryIfNotExists(filepath.Join(datadir, ProfilerLocation)); err != nil {
+			return err
+		}
+	}
+
+	noTls := GetBool(NoTLSKey)
+	if noTls {
+		return nil
+	}
+	if err := makeDirectoryIfNotExists(filepath.Join(datadir, TLSLocation)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func makeDirectoryIfNotExists(path string) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return os.MkdirAll(path, os.ModeDir|0755)
+	}
+	return nil
+}
+
+type supportedType map[string]struct{}
+
+func (t supportedType) String() string {
+	types := make([]string, 0, len(t))
+	for tt := range t {
+		types = append(types, tt)
+	}
+	return strings.Join(types, " | ")
+}
