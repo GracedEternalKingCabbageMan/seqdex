@@ -73,11 +73,11 @@ const (
 )
 
 var vip *viper.Viper
-var defaultDatadir = btcutil.AppDataDir("tdex-daemon", false)
+var defaultDatadir = btcutil.AppDataDir("seqdex-daemon", false)
 
 func InitConfig() error {
 	vip = viper.New()
-	vip.SetEnvPrefix("TDEX")
+	vip.SetEnvPrefix("SEQDEX")
 	vip.AutomaticEnv()
 
 	vip.SetDefault(TradeListeningPortKey, 9945)

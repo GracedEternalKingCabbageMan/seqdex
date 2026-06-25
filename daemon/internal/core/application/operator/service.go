@@ -14,7 +14,7 @@ import (
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application/wallet"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
-	"github.com/vulpemventures/go-elements/address"
+	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	"github.com/vulpemventures/go-elements/confidential"
 	"github.com/vulpemventures/go-elements/elementsutil"
 	"github.com/vulpemventures/go-elements/network"
@@ -358,7 +358,7 @@ func (s *service) getTxInfo(
 
 	findOwnedUtxo := func(out *transaction.TxOutput) *txOutputInfo {
 		for _, addr := range addresses {
-			script, _ := address.ToOutputScript(addr)
+			script, _ := seqnet.ToOutputScript(addr, &s.network)
 			if bytes.Equal(script, out.Script) {
 				key, _, _ := masterKey.DeriveKey(out.Script)
 				unblinded, _ := confidential.UnblindOutputWithKey(out, key.Serialize())
