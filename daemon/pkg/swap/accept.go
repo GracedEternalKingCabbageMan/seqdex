@@ -3,8 +3,8 @@ package swap
 import (
 	"fmt"
 
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	tdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v1"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 	"github.com/thanhpk/randstr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -31,13 +31,13 @@ func (o AcceptOpts) validate() error {
 	return fmt.Errorf("invalid swap transaction format")
 }
 
-func (o AcceptOpts) unblindedIns() []*tdexv2.UnblindedInput {
+func (o AcceptOpts) unblindedIns() []*seqdexv1.UnblindedInput {
 	if len(o.UnblindedInputs) <= 0 {
 		return nil
 	}
-	list := make([]*tdexv2.UnblindedInput, 0, len(o.UnblindedInputs))
+	list := make([]*seqdexv1.UnblindedInput, 0, len(o.UnblindedInputs))
 	for _, in := range o.UnblindedInputs {
-		list = append(list, &tdexv2.UnblindedInput{
+		list = append(list, &seqdexv1.UnblindedInput{
 			Index:         in.Index,
 			Asset:         in.Asset,
 			Amount:        in.Amount,
@@ -82,12 +82,12 @@ func Accept(opts AcceptOpts) (string, []byte, error) {
 	case opts.forV2():
 		fallthrough
 	default:
-		var msgRequest tdexv2.SwapRequest
+		var msgRequest seqdexv1.SwapRequest
 		if err := proto.Unmarshal(opts.Message, &msgRequest); err != nil {
 			return "", nil, fmt.Errorf("unmarshal swap request %w", err)
 		}
 
-		message = &tdexv2.SwapAccept{
+		message = &seqdexv1.SwapAccept{
 			Id:              randomID,
 			RequestId:       msgRequest.GetId(),
 			Transaction:     opts.Transaction,

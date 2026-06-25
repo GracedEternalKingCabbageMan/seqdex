@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/btcsuite/btcd/btcec/v2"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	"github.com/aejkcs50/seqdex/daemon/pkg/explorer"
 	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	tradeclient "github.com/aejkcs50/seqdex/daemon/pkg/trade/client"
 	trademarket "github.com/aejkcs50/seqdex/daemon/pkg/trade/market"
 	tradetype "github.com/aejkcs50/seqdex/daemon/pkg/trade/type"
+	"github.com/btcsuite/btcd/btcec/v2"
 
 	"github.com/aejkcs50/seqdex/daemon/pkg/swap"
 	"github.com/vulpemventures/go-elements/elementsutil"
@@ -236,7 +236,7 @@ func (t *Trade) marketOrderRequest(
 }
 
 func (t *Trade) marketOrderComplete(swapAcceptMsg []byte, w *Wallet) (string, error) {
-	swapAccept := &tdexv2.SwapAccept{}
+	swapAccept := &seqdexv1.SwapAccept{}
 	if err := proto.Unmarshal(swapAcceptMsg, swapAccept); err != nil {
 		return "", err
 	}

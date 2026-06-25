@@ -4,6 +4,14 @@
 // and acts as the taker's counterparty for BTC->SEQ-asset swaps, built on the
 // proven pkg/xchain mechanism.
 //
+// DEPRECATED for browser/integrated use (Phase 6b): the main daemon (cmd/tdexd)
+// now folds XchainService onto its multiplexed Trade listener (gRPC + grpc-web +
+// grpc-gateway REST with permissive CORS), enabled by setting XCHAIN_PARENT_RPC
+// / XCHAIN_SEQ_RPC / XCHAIN_SEQ_ASSET. Prefer the integrated endpoint so one
+// CORS-enabled daemon URL serves Trade + Xchain to the web wallet. This
+// standalone (bare gRPC, no REST/grpc-web/CORS) is retained only as a
+// lightweight maker process for setups without the full trade daemon.
+//
 // It is the API/state-machine counterpart to the mechanism demo
 // (cmd/seqdex-xchain-swapdemo): rather than driving both swap roles in one
 // process, it plays ONLY the maker and serves a remote taker over gRPC.

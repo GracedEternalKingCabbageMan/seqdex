@@ -14,8 +14,13 @@ import (
 	pricefeeder "github.com/aejkcs50/seqdex/daemon/internal/infrastructure/price-feeder"
 	pricefeederstore "github.com/aejkcs50/seqdex/daemon/internal/infrastructure/price-feeder/store/badger"
 
-	"github.com/shopspring/decimal"
-	log "github.com/sirupsen/logrus"
+	"net/url"
+	"strconv"
+
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/core/application/xchainmaker"
+	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
+
 	"github.com/aejkcs50/seqdex/daemon/internal/config"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
@@ -27,6 +32,8 @@ import (
 	grpcinterface "github.com/aejkcs50/seqdex/daemon/internal/interfaces/grpc"
 	boltsecurestore "github.com/aejkcs50/seqdex/daemon/pkg/securestore/bolt"
 	"github.com/aejkcs50/seqdex/daemon/pkg/stats"
+	"github.com/shopspring/decimal"
+	log "github.com/sirupsen/logrus"
 
 	_ "net/http/pprof" // #nosec
 )
@@ -42,6 +49,14 @@ var (
 	// App services config
 	feeBalanceThreshold                   uint64
 	pricesSlippagePercentage, satsPerByte decimal.Decimal
+
+	// Cross-chain (XchainService) maker; nil unless XCHAIN_PARENT_RPC is set.
+	xchainSvc                                                   *xchainmaker.Service
+	xchainParentRPC, xchainSeqRPC, xchainWallet, xchainSeqAsset string
+	xchainPriceSeqPerBtc                                        float64
+	xchainFeeBps, xchainSpendFee                                uint64
+	xchainBtcLocktimeDelta, xchainSeqLocktimeDelta              uint32
+	xchainMinBtcConf                                            int
 
 	version = "dev"
 	commit  = "none"
@@ -88,6 +103,15 @@ func main() {
 		TxSatsPerByte:       satsPerByte,
 		DBType:              dbType,
 		DBConfig:            dbDir,
+	}
+
+	// Optionally build the integrated cross-chain swap maker (XchainService).
+	xchainSvc, err = newXchainService()
+	if err != nil {
+		log.WithError(err).Fatal("failed to initialize cross-chain xchain service")
+	}
+	if xchainSvc != nil {
+		log.RegisterExitHandler(xchainSvc.Close)
 	}
 
 	runOnOnePort := operatorSvcPort == tradeSvcPort
@@ -147,8 +171,91 @@ func loadConfig() error {
 	tradeSvcPort = config.GetInt(config.TradeListeningPortKey)
 	operatorSvcPort = config.GetInt(config.OperatorListeningPortKey)
 	oceanWalletAddr = config.GetString(config.OceanWalletAddrKey)
+	// Cross-chain maker config (only used when XCHAIN_PARENT_RPC is set).
+	xchainParentRPC = config.GetString(config.XchainParentRPCKey)
+	xchainSeqRPC = config.GetString(config.XchainSeqRPCKey)
+	xchainWallet = config.GetString(config.XchainWalletKey)
+	xchainSeqAsset = config.GetString(config.XchainSeqAssetKey)
+	xchainPriceSeqPerBtc = config.GetFloat(config.XchainPriceSeqPerBtcKey)
+	xchainFeeBps = uint64(config.GetInt(config.XchainFeeBpsKey))
+	xchainSpendFee = uint64(config.GetInt(config.XchainSpendFeeKey))
+	xchainBtcLocktimeDelta = uint32(config.GetInt(config.XchainBtcLocktimeDeltaKey))
+	xchainSeqLocktimeDelta = uint32(config.GetInt(config.XchainSeqLocktimeDeltaKey))
+	xchainMinBtcConf = config.GetInt(config.XchainMinBtcConfKey)
 
 	return nil
+}
+
+// rpcFromURL parses an http://user:pass@host:port RPC url into an xchain.RPC.
+func rpcFromURL(raw string) (*xchain.RPC, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse rpc url: %w", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	user := u.User.Username()
+	pass, _ := u.User.Password()
+	return xchain.NewRPC(host, port, user, pass), nil
+}
+
+// newXchainService builds the integrated cross-chain swap maker from config, or
+// returns (nil, nil) when XCHAIN_PARENT_RPC is unset (xchain disabled). When
+// enabled it requires XCHAIN_SEQ_RPC and XCHAIN_SEQ_ASSET. The returned service
+// is already Start()ed; the caller must Close() it on shutdown.
+func newXchainService() (*xchainmaker.Service, error) {
+	if xchainParentRPC == "" {
+		return nil, nil
+	}
+	if xchainSeqRPC == "" {
+		return nil, fmt.Errorf("%s is set but %s is missing", config.XchainParentRPCKey, config.XchainSeqRPCKey)
+	}
+	if xchainSeqAsset == "" {
+		return nil, fmt.Errorf("%s is set but %s is missing (the SEQ-side asset the maker offers)", config.XchainParentRPCKey, config.XchainSeqAssetKey)
+	}
+
+	btcRPC, err := rpcFromURL(xchainParentRPC)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", config.XchainParentRPCKey, err)
+	}
+	seqRPC, err := rpcFromURL(xchainSeqRPC)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", config.XchainSeqRPCKey, err)
+	}
+	btc := xchain.NewChain(btcRPC, xchainWallet)
+	seq := xchain.NewChain(seqRPC, xchainWallet)
+
+	btcAsset, err := btc.PeggedAsset()
+	if err != nil {
+		return nil, fmt.Errorf("read parent pegged asset: %w", err)
+	}
+
+	cfg := xchainmaker.Config{
+		BTC:         btc,
+		SEQ:         seq,
+		CoinDivisor: 1e8,
+		Markets: []xchainmaker.Market{{
+			SeqAsset:       xchainSeqAsset,
+			BtcAsset:       btcAsset,
+			Name:           "BTC/SEQ-ASSET",
+			PriceSeqPerBtc: xchainPriceSeqPerBtc,
+			FeeBps:         xchainFeeBps,
+		}},
+		QuoteTTL:         2 * time.Minute,
+		BtcLocktimeDelta: xchainBtcLocktimeDelta,
+		SeqLocktimeDelta: xchainSeqLocktimeDelta,
+		MinBTCConf:       xchainMinBtcConf,
+		SpendFee:         xchainSpendFee,
+		PollInterval:     500 * time.Millisecond,
+	}
+
+	svc, err := xchainmaker.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	svc.Start()
+	log.Infof("cross-chain XchainService enabled: parent(BTC) asset=%s seq asset=%s wallet=%q", btcAsset, xchainSeqAsset, xchainWallet)
+	return svc, nil
 }
 
 type buildData struct{}
@@ -189,6 +296,13 @@ func NewGrpcService(
 		addr = connectAddr
 	}
 
+	// XchainService is the cross-chain maker; nil when xchain is disabled. The
+	// gRPC layer only registers it (gRPC + grpc-web + REST gateway) when set.
+	var xchain seqdexv1.XchainServiceServer
+	if xchainSvc != nil {
+		xchain = xchainSvc
+	}
+
 	if runOnOnePort {
 		opts := grpcinterface.ServiceOptsOnePort{
 			NoMacaroons:              noMacaroons,
@@ -203,6 +317,7 @@ func NewGrpcService(
 			ConnectProto:             connectProto,
 			BuildData:                buildData{},
 			AppConfig:                appConfig,
+			XchainService:            xchain,
 		}
 
 		return grpcinterface.NewServiceOnePort(opts)
@@ -226,6 +341,7 @@ func NewGrpcService(
 		ConnectProto:             connectProto,
 		BuildData:                buildData{},
 		AppConfig:                appConfig,
+		XchainService:            xchain,
 	}
 
 	return grpcinterface.NewService(opts)

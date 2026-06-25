@@ -5,9 +5,9 @@ import (
 
 	"gopkg.in/macaroon-bakery.v2/bakery"
 
-	reflectionv1 "github.com/tdex-network/reflection/api-spec/protobuf/gen/reflection/v1"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	daemonv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex-daemon/v2"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	reflectionv1 "github.com/tdex-network/reflection/api-spec/protobuf/gen/reflection/v1"
 	grpchealth "google.golang.org/grpc/health/grpc_health_v1"
 )
 
@@ -211,32 +211,49 @@ func Whitelist() map[string][]bakery.Op {
 			Entity: EntityUnlocker,
 			Action: "write",
 		}},
-		fmt.Sprintf("/%s/ListMarkets", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/ListMarkets", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "read",
 		}},
-		fmt.Sprintf("/%s/GetMarketBalance", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/GetMarketBalance", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "read",
 		}},
-		fmt.Sprintf("/%s/GetMarketPrice", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/GetMarketPrice", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "read",
 		}},
-		fmt.Sprintf("/%s/PreviewTrade", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/PreviewTrade", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "read",
 		}},
-		fmt.Sprintf("/%s/ProposeTrade", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/ProposeTrade", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "write",
 		}},
-		fmt.Sprintf("/%s/CompleteTrade", tdexv2.TradeService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%s/CompleteTrade", seqdexv1.TradeService_ServiceDesc.ServiceName): {{
 			Entity: EntityTrade,
 			Action: "write",
 		}},
-		fmt.Sprintf("/%v/SupportedContentTypes", tdexv2.TransportService_ServiceDesc.ServiceName): {{
+		fmt.Sprintf("/%v/SupportedContentTypes", seqdexv1.TransportService_ServiceDesc.ServiceName): {{
 			Entity: EntityTransport,
+			Action: "read",
+		}},
+		// Cross-chain (XchainService) maker RPCs are public, like TradeService.
+		fmt.Sprintf("/%s/ListXchainMarkets", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
+			Entity: EntityTrade,
+			Action: "read",
+		}},
+		fmt.Sprintf("/%s/GetXchainQuote", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
+			Entity: EntityTrade,
+			Action: "read",
+		}},
+		fmt.Sprintf("/%s/ProposeXchainSwap", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
+			Entity: EntityTrade,
+			Action: "write",
+		}},
+		fmt.Sprintf("/%s/GetXchainSwap", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
+			Entity: EntityTrade,
 			Action: "read",
 		}},
 		fmt.Sprintf("/%s/GetInfo", reflectionv1.ReflectionService_ServiceDesc.ServiceName): {{

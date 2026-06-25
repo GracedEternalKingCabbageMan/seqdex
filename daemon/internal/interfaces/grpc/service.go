@@ -11,14 +11,11 @@ import (
 	"os"
 	"path/filepath"
 
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
+	daemonv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex-daemon/v2"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
 	reflectionv1 "github.com/tdex-network/reflection/api-spec/protobuf/gen/reflection/v1"
-	daemonv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex-daemon/v2"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 
-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	log "github.com/sirupsen/logrus"
-	"github.com/tdex-network/reflection"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
 	interfaces "github.com/aejkcs50/seqdex/daemon/internal/interfaces"
@@ -27,6 +24,9 @@ import (
 	"github.com/aejkcs50/seqdex/daemon/internal/interfaces/grpc/permissions"
 	httpinterface "github.com/aejkcs50/seqdex/daemon/internal/interfaces/http"
 	"github.com/aejkcs50/seqdex/daemon/pkg/macaroons"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	log "github.com/sirupsen/logrus"
+	"github.com/tdex-network/reflection"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
@@ -113,6 +113,10 @@ type ServiceOpts struct {
 	NoOperatorTls bool
 	ConnectAddr   string
 	ConnectProto  string
+
+	// XchainService, when non-nil, is the integrated cross-chain swap maker,
+	// registered on the Trade listener (gRPC + grpc-web + grpc-gateway REST).
+	XchainService seqdexv1.XchainServiceServer
 }
 
 func (o ServiceOpts) validate() error {
@@ -571,9 +575,12 @@ func (s *service) newTradeServer(tlsConfig *tls.Config) (*http.Server, error) {
 	// Server grpc.
 	grpcServer := grpc.NewServer(serverOpts...)
 	tradeHandler := grpchandler.NewTradeHandler(s.opts.AppConfig.TradeService())
-	tdexv2.RegisterTradeServiceServer(grpcServer, tradeHandler)
+	seqdexv1.RegisterTradeServiceServer(grpcServer, tradeHandler)
 	transportHandler := grpchandler.NewTransportHandler()
-	tdexv2.RegisterTransportServiceServer(grpcServer, transportHandler)
+	seqdexv1.RegisterTransportServiceServer(grpcServer, transportHandler)
+	if s.opts.XchainService != nil {
+		seqdexv1.RegisterXchainServiceServer(grpcServer, s.opts.XchainService)
+	}
 	healthHandler := grpchandler.NewHealthHandler()
 	grpchealth.RegisterHealthServer(grpcServer, healthHandler)
 	reflection.Register(grpcServer)
@@ -605,15 +612,23 @@ func (s *service) newTradeServer(tlsConfig *tls.Config) (*http.Server, error) {
 			},
 		}),
 	)
-	if err := tdexv2.RegisterTransportServiceHandler(
+	if err := seqdexv1.RegisterTransportServiceHandler(
 		ctx, gwmux, conn,
 	); err != nil {
 		return nil, err
 	}
-	if err := tdexv2.RegisterTradeServiceHandler(
+	if err := seqdexv1.RegisterTradeServiceHandler(
 		ctx, gwmux, conn,
 	); err != nil {
 		return nil, err
+	}
+	if s.opts.XchainService != nil {
+		if err := seqdexv1.RegisterXchainServiceHandler(
+			ctx, gwmux, conn,
+		); err != nil {
+			return nil, err
+		}
+		log.Info("cross-chain xchain interface registered on the trade listener")
 	}
 	if err := reflectionv1.RegisterReflectionServiceHandler(
 		ctx, gwmux, conn,

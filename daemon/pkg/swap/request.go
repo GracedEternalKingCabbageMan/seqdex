@@ -3,8 +3,8 @@ package swap
 import (
 	"fmt"
 
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	tdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v1"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 	"github.com/thanhpk/randstr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -68,13 +68,13 @@ func (o RequestOpts) id() string {
 	return randstr.Hex(8)
 }
 
-func (o RequestOpts) unblindedIns() []*tdexv2.UnblindedInput {
+func (o RequestOpts) unblindedIns() []*seqdexv1.UnblindedInput {
 	if len(o.UnblindedInputs) <= 0 {
 		return nil
 	}
-	list := make([]*tdexv2.UnblindedInput, 0, len(o.UnblindedInputs))
+	list := make([]*seqdexv1.UnblindedInput, 0, len(o.UnblindedInputs))
 	for _, in := range o.UnblindedInputs {
-		list = append(list, &tdexv2.UnblindedInput{
+		list = append(list, &seqdexv1.UnblindedInput{
 			Index:         in.Index,
 			Asset:         in.Asset,
 			Amount:        in.Amount,
@@ -113,7 +113,7 @@ func Request(opts RequestOpts) ([]byte, error) {
 	case opts.forV2():
 		fallthrough
 	default:
-		message = &tdexv2.SwapRequest{
+		message = &seqdexv1.SwapRequest{
 			Id: id,
 			// Proposer
 			AssetP:  opts.AssetToSend,
