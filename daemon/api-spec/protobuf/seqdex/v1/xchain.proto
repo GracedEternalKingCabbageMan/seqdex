@@ -14,6 +14,8 @@ syntax = "proto3";
 // (satisfying the BTC-leg-first ordering rule).
 package seqdex.v1;
 
+import "google/api/annotations.proto";
+
 // XchainService is the daemon-side cross-chain swap maker. A taker drives a
 // full BTC->SEQ-asset swap over these RPCs:
 //
@@ -32,22 +34,42 @@ package seqdex.v1;
 service XchainService {
   // ListXchainMarkets returns the BTC/SEQ-asset pairs the maker will swap and
   // its current reserves on each leg.
-  rpc ListXchainMarkets(ListXchainMarketsRequest) returns (ListXchainMarketsResponse);
+  rpc ListXchainMarkets(ListXchainMarketsRequest) returns (ListXchainMarketsResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/markets"
+      body: "*"
+    };
+  }
 
   // GetXchainQuote returns a firm-ish quote for buying `seq_amount` units of the
   // market's SEQ asset with BTC, including the maker's pubkeys and the two
   // CLTV timeouts. The quote is held in memory for a short window.
-  rpc GetXchainQuote(GetXchainQuoteRequest) returns (GetXchainQuoteResponse);
+  rpc GetXchainQuote(GetXchainQuoteRequest) returns (GetXchainQuoteResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/quote"
+      body: "*"
+    };
+  }
 
   // ProposeXchainSwap is called by the taker AFTER it has locked + confirmed the
   // BTC leg. The daemon verifies the BTC leg against the quote (script, H,
   // amount, recipient, confirmed), then locks the SEQ leg and returns it, or a
   // failure.
-  rpc ProposeXchainSwap(ProposeXchainSwapRequest) returns (ProposeXchainSwapResponse);
+  rpc ProposeXchainSwap(ProposeXchainSwapRequest) returns (ProposeXchainSwapResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/propose"
+      body: "*"
+    };
+  }
 
   // GetXchainSwap reports the current swap state so the taker can poll for the
   // maker's BTC-leg claim (and for the preimage the daemon extracted).
-  rpc GetXchainSwap(GetXchainSwapRequest) returns (GetXchainSwapResponse);
+  rpc GetXchainSwap(GetXchainSwapRequest) returns (GetXchainSwapResponse) {
+    option (google.api.http) = {
+      post: "/v1/xchain/swap"
+      body: "*"
+    };
+  }
 }
 
 // XchainSwapState is the maker state machine. Lifecycle (happy path):

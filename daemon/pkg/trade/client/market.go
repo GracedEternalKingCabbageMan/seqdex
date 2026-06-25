@@ -5,15 +5,15 @@ import (
 	"encoding/hex"
 	"errors"
 
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 
 	trademarket "github.com/aejkcs50/seqdex/daemon/pkg/trade/market"
 	tradetype "github.com/aejkcs50/seqdex/daemon/pkg/trade/type"
 )
 
 // Markets calls the Markets rpc and returns its response
-func (c *Client) Markets() (*tdexv2.ListMarketsResponse, error) {
-	return c.client.ListMarkets(context.Background(), &tdexv2.ListMarketsRequest{})
+func (c *Client) Markets() (*seqdexv1.ListMarketsResponse, error) {
+	return c.client.ListMarkets(context.Background(), &seqdexv1.ListMarketsRequest{})
 }
 
 // BalancesOpts is the struct given to Balances method
@@ -29,13 +29,13 @@ func (o BalancesOpts) validate() error {
 }
 
 // Balances crafts the request and calls the Balances rpc
-func (c *Client) GetMarketBalance(opts BalancesOpts) (*tdexv2.GetMarketBalanceResponse, error) {
+func (c *Client) GetMarketBalance(opts BalancesOpts) (*seqdexv1.GetMarketBalanceResponse, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
 
-	request := &tdexv2.GetMarketBalanceRequest{
-		Market: &tdexv2.Market{
+	request := &seqdexv1.GetMarketBalanceRequest{
+		Market: &seqdexv1.Market{
 			BaseAsset:  opts.Market.BaseAsset,
 			QuoteAsset: opts.Market.QuoteAsset,
 		},
@@ -72,17 +72,17 @@ func (o PreviewTradeOpts) validate() error {
 }
 
 // PreviewTrade crafts the request and calls the PreviewTrade rpc
-func (c *Client) PreviewTrade(opts PreviewTradeOpts) (*tdexv2.PreviewTradeResponse, error) {
+func (c *Client) PreviewTrade(opts PreviewTradeOpts) (*seqdexv1.PreviewTradeResponse, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
 
-	request := &tdexv2.PreviewTradeRequest{
-		Market: &tdexv2.Market{
+	request := &seqdexv1.PreviewTradeRequest{
+		Market: &seqdexv1.Market{
 			BaseAsset:  opts.Market.BaseAsset,
 			QuoteAsset: opts.Market.QuoteAsset,
 		},
-		Type:     tdexv2.TradeType(opts.TradeType),
+		Type:     seqdexv1.TradeType(opts.TradeType),
 		Amount:   opts.Amount,
 		Asset:    opts.Asset,
 		FeeAsset: opts.FeeAsset,

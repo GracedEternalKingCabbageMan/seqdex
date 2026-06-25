@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/aejkcs50/seqdex/daemon/internal/interfaces/grpc/permissions"
 
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	daemonv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex-daemon/v2"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 )
 
 func TestRestrictedMethods(t *testing.T) {
@@ -38,8 +38,8 @@ func TestWhitelistedMethods(t *testing.T) {
 		allMethods = append(allMethods, fmt.Sprintf("/%s/%s", daemonv2.WalletService_ServiceDesc.ServiceName, m.MethodName))
 	}
 
-	for _, v := range tdexv2.TradeService_ServiceDesc.Methods {
-		allMethods = append(allMethods, fmt.Sprintf("/%s/%s", tdexv2.TradeService_ServiceDesc.ServiceName, v.MethodName))
+	for _, v := range seqdexv1.TradeService_ServiceDesc.Methods {
+		allMethods = append(allMethods, fmt.Sprintf("/%s/%s", seqdexv1.TradeService_ServiceDesc.ServiceName, v.MethodName))
 	}
 
 	allMethods = append(allMethods, fmt.Sprintf("/%s/%s", grpchealth.Health_ServiceDesc.ServiceName, "Check"))

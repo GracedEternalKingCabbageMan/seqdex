@@ -1,7 +1,7 @@
 package swap_parser
 
 import (
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	"github.com/aejkcs50/seqdex/daemon/pkg/swap"
 	"github.com/vulpemventures/go-elements/psetv2"
@@ -81,7 +81,7 @@ func (s service) SerializeFail(id string, errCode int) (string, []byte) {
 func (s service) DeserializeRequest(
 	msg []byte, feeAsset string, feeAmount uint64,
 ) *domain.SwapRequest {
-	swap := &tdexv2.SwapRequest{}
+	swap := &seqdexv1.SwapRequest{}
 	//nolint
 	proto.Unmarshal(msg, swap)
 	unblindedIns := make([]domain.UnblindedInput, 0, len(swap.GetUnblindedInputs()))
@@ -108,7 +108,7 @@ func (s service) DeserializeRequest(
 }
 
 func (s service) DeserializeAccept(msg []byte) *domain.SwapAccept {
-	swap := &tdexv2.SwapAccept{}
+	swap := &seqdexv1.SwapAccept{}
 	//nolint
 	proto.Unmarshal(msg, swap)
 	unblindedIns := make([]domain.UnblindedInput, 0, len(swap.GetUnblindedInputs()))
@@ -130,7 +130,7 @@ func (s service) DeserializeAccept(msg []byte) *domain.SwapAccept {
 }
 
 func (s service) DeserializeComplete(msg []byte) *domain.SwapComplete {
-	swap := &tdexv2.SwapComplete{}
+	swap := &seqdexv1.SwapComplete{}
 	//nolint
 	proto.Unmarshal(msg, swap)
 	return &domain.SwapComplete{
@@ -141,7 +141,7 @@ func (s service) DeserializeComplete(msg []byte) *domain.SwapComplete {
 }
 
 func (s service) DeserializeFail(msg []byte) *domain.SwapFail {
-	swap := &tdexv2.SwapFail{}
+	swap := &seqdexv1.SwapFail{}
 	//nolint
 	proto.Unmarshal(msg, swap)
 	return &domain.SwapFail{

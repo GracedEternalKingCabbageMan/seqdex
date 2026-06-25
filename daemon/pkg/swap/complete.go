@@ -4,8 +4,8 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	tdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v1"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 	"github.com/thanhpk/randstr"
 	"github.com/vulpemventures/go-elements/pset"
 	"github.com/vulpemventures/go-elements/psetv2"
@@ -31,7 +31,7 @@ func (o CompleteOpts) validate() error {
 		return fmt.Errorf("missing swap accept message")
 	}
 	v1Err := proto.Unmarshal(o.Message, &tdexv1.SwapAccept{})
-	v2Err := proto.Unmarshal(o.Message, &tdexv2.SwapAccept{})
+	v2Err := proto.Unmarshal(o.Message, &seqdexv1.SwapAccept{})
 	if isPsetV0(o.Transaction) && v1Err != nil {
 		return fmt.Errorf("invalid swap accept message")
 	}
@@ -101,7 +101,7 @@ func Complete(opts CompleteOpts) (string, []byte, error) {
 	case opts.forV2():
 		fallthrough
 	default:
-		var msgAccept tdexv2.SwapAccept
+		var msgAccept seqdexv1.SwapAccept
 		if err := proto.Unmarshal(opts.Message, &msgAccept); err != nil {
 			return "", nil, err
 		}
@@ -116,7 +116,7 @@ func Complete(opts CompleteOpts) (string, []byte, error) {
 			}
 		}
 
-		message = &tdexv2.SwapComplete{
+		message = &seqdexv1.SwapComplete{
 			Id:          randomID,
 			AcceptId:    msgAccept.GetId(),
 			Transaction: opts.Transaction,

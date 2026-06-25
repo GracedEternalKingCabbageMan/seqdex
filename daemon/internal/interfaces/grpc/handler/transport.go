@@ -3,12 +3,12 @@ package grpchandler
 import (
 	"context"
 
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 )
 
 type transportHandler struct{}
 
-func NewTransportHandler() tdexv2.TransportServiceServer {
+func NewTransportHandler() seqdexv1.TransportServiceServer {
 	return newTransportHandler()
 }
 
@@ -17,14 +17,14 @@ func newTransportHandler() *transportHandler {
 }
 
 func (t transportHandler) SupportedContentTypes(
-	context.Context, *tdexv2.SupportedContentTypesRequest,
-) (*tdexv2.SupportedContentTypesResponse, error) {
-	return &tdexv2.SupportedContentTypesResponse{
-		AcceptedTypes: []tdexv2.ContentType{
-			tdexv2.ContentType_CONTENT_TYPE_JSON,
-			tdexv2.ContentType_CONTENT_TYPE_GRPC,
-			tdexv2.ContentType_CONTENT_TYPE_GRPCWEB,
-			tdexv2.ContentType_CONTENT_TYPE_GRPCWEBTEXT,
+	context.Context, *seqdexv1.SupportedContentTypesRequest,
+) (*seqdexv1.SupportedContentTypesResponse, error) {
+	return &seqdexv1.SupportedContentTypesResponse{
+		AcceptedTypes: []seqdexv1.ContentType{
+			seqdexv1.ContentType_CONTENT_TYPE_JSON,
+			seqdexv1.ContentType_CONTENT_TYPE_GRPC,
+			seqdexv1.ContentType_CONTENT_TYPE_GRPCWEB,
+			seqdexv1.ContentType_CONTENT_TYPE_GRPCWEBTEXT,
 		},
 	}, nil
 }

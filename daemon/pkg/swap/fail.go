@@ -1,8 +1,8 @@
 package swap
 
 import (
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	tdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v1"
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
 	"github.com/thanhpk/randstr"
 	"google.golang.org/protobuf/proto"
 )
@@ -50,7 +50,7 @@ func FailV1(opts FailOpts) (string, []byte, error) {
 
 func Fail(opts FailOpts) (string, []byte, error) {
 	randomID := randstr.Hex(8)
-	msgFail := &tdexv2.SwapFail{
+	msgFail := &seqdexv1.SwapFail{
 		Id:             randomID,
 		MessageId:      opts.MessageID,
 		FailureCode:    uint32(opts.ErrCode),

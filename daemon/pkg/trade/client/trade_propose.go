@@ -7,7 +7,7 @@ import (
 	trademarket "github.com/aejkcs50/seqdex/daemon/pkg/trade/market"
 	tradetype "github.com/aejkcs50/seqdex/daemon/pkg/trade/type"
 
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -35,7 +35,7 @@ func (o TradeProposeOpts) validate() error {
 	if err := o.Market.Validate(); err != nil {
 		return err
 	}
-	if err := proto.Unmarshal(o.SwapRequest, &tdexv2.SwapRequest{}); err != nil {
+	if err := proto.Unmarshal(o.SwapRequest, &seqdexv1.SwapRequest{}); err != nil {
 		return ErrMalformedSwapRequestMessage
 	}
 	if err := o.TradeType.Validate(); err != nil {
@@ -46,23 +46,23 @@ func (o TradeProposeOpts) validate() error {
 }
 
 // TradePropose crafts the request and calls the TradePropose rpc
-func (c *Client) TradePropose(opts TradeProposeOpts) (*tdexv2.ProposeTradeResponse, error) {
+func (c *Client) TradePropose(opts TradeProposeOpts) (*seqdexv1.ProposeTradeResponse, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
 
-	market := &tdexv2.Market{
+	market := &seqdexv1.Market{
 		BaseAsset:  opts.Market.BaseAsset,
 		QuoteAsset: opts.Market.QuoteAsset,
 	}
-	swapRequest := &tdexv2.SwapRequest{}
+	swapRequest := &seqdexv1.SwapRequest{}
 	//nolint
 	proto.Unmarshal(opts.SwapRequest, swapRequest)
 
-	request := &tdexv2.ProposeTradeRequest{
+	request := &seqdexv1.ProposeTradeRequest{
 		Market:      market,
 		SwapRequest: swapRequest,
-		Type:        tdexv2.TradeType(opts.TradeType),
+		Type:        seqdexv1.TradeType(opts.TradeType),
 		FeeAsset:    opts.FeeAsset,
 		FeeAmount:   opts.FeeAmount,
 	}

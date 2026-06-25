@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application"
+	"github.com/btcsuite/btcd/btcutil"
 
 	"github.com/spf13/viper"
 )
@@ -64,6 +64,33 @@ const (
 	// DBTypeKey is used to switch database type between those supported
 	DBTypeKey = "DB_TYPE"
 
+	// --- Cross-chain (XchainService) maker config ---
+	// The integrated cross-chain swap maker is enabled only when
+	// XchainParentRPCKey is set (the daemon must reach a parent "BTC" node and an
+	// anchored Sequentia node). Secrets are carried inside the RPC URLs
+	// (http://user:pass@host:port) read from env/file, never argv.
+
+	// XchainParentRPCKey: parent ("BTC") node RPC url. Presence enables Xchain.
+	XchainParentRPCKey = "XCHAIN_PARENT_RPC"
+	// XchainSeqRPCKey: anchored Sequentia node RPC url for the SEQ leg.
+	XchainSeqRPCKey = "XCHAIN_SEQ_RPC"
+	// XchainWalletKey: wallet name on both nodes.
+	XchainWalletKey = "XCHAIN_WALLET"
+	// XchainSeqAssetKey: the SEQ-side asset id (hex) the maker offers.
+	XchainSeqAssetKey = "XCHAIN_SEQ_ASSET"
+	// XchainPriceSeqPerBtcKey: SEQ atoms given per BTC atom (maker ask).
+	XchainPriceSeqPerBtcKey = "XCHAIN_PRICE_SEQ_PER_BTC"
+	// XchainFeeBpsKey: maker fee in basis points charged on the BTC leg.
+	XchainFeeBpsKey = "XCHAIN_FEE_BPS"
+	// XchainBtcLocktimeDeltaKey: blocks above tip for T_btc (taker refund).
+	XchainBtcLocktimeDeltaKey = "XCHAIN_BTC_LOCKTIME_DELTA"
+	// XchainSeqLocktimeDeltaKey: blocks above tip for T_seq (maker refund).
+	XchainSeqLocktimeDeltaKey = "XCHAIN_SEQ_LOCKTIME_DELTA"
+	// XchainMinBtcConfKey: required BTC-leg confirmations before locking SEQ.
+	XchainMinBtcConfKey = "XCHAIN_MIN_BTC_CONF"
+	// XchainSpendFeeKey: explicit fee (atoms) for the maker's spends.
+	XchainSpendFeeKey = "XCHAIN_SPEND_FEE"
+
 	DbLocation        = "db"
 	TLSLocation       = "tls"
 	MacaroonsLocation = "macaroons"
@@ -94,6 +121,15 @@ func InitConfig() error {
 	vip.SetDefault(NoOperatorTlsKey, false)
 	vip.SetDefault(ConnectProtoKey, httpsProtocol)
 	vip.SetDefault(DBTypeKey, application.DBBadger)
+
+	// Cross-chain maker defaults (only consulted when XCHAIN_PARENT_RPC is set).
+	vip.SetDefault(XchainWalletKey, "w")
+	vip.SetDefault(XchainPriceSeqPerBtcKey, 100)
+	vip.SetDefault(XchainFeeBpsKey, 0)
+	vip.SetDefault(XchainBtcLocktimeDeltaKey, 100)
+	vip.SetDefault(XchainSeqLocktimeDeltaKey, 50)
+	vip.SetDefault(XchainMinBtcConfKey, 1)
+	vip.SetDefault(XchainSpendFeeKey, 1000)
 
 	if err := validate(); err != nil {
 		return fmt.Errorf("error while validating config: %s", err)

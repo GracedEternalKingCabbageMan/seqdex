@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	tdexv2 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/tdex/v2"
+	seqdexv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqdex/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
 	"google.golang.org/grpc/codes"
@@ -19,7 +19,7 @@ type tradeHandler struct {
 
 func NewTradeHandler(
 	tradeSvc application.TradeService,
-) tdexv2.TradeServiceServer {
+) seqdexv1.TradeServiceServer {
 	return newTradeHandler(tradeSvc)
 }
 
@@ -30,33 +30,33 @@ func newTradeHandler(tradeSvc application.TradeService) *tradeHandler {
 }
 
 func (t tradeHandler) ListMarkets(
-	ctx context.Context, _ *tdexv2.ListMarketsRequest,
-) (*tdexv2.ListMarketsResponse, error) {
+	ctx context.Context, _ *seqdexv1.ListMarketsRequest,
+) (*seqdexv1.ListMarketsResponse, error) {
 	return t.listMarkets(ctx)
 }
 
 func (t tradeHandler) GetMarketBalance(
-	ctx context.Context, req *tdexv2.GetMarketBalanceRequest,
-) (*tdexv2.GetMarketBalanceResponse, error) {
+	ctx context.Context, req *seqdexv1.GetMarketBalanceRequest,
+) (*seqdexv1.GetMarketBalanceResponse, error) {
 	return t.getMarketBalance(ctx, req)
 }
 
 func (t tradeHandler) GetMarketPrice(
-	ctx context.Context, req *tdexv2.GetMarketPriceRequest,
-) (*tdexv2.GetMarketPriceResponse, error) {
+	ctx context.Context, req *seqdexv1.GetMarketPriceRequest,
+) (*seqdexv1.GetMarketPriceResponse, error) {
 	marketPrice, err := t.getMarketPrice(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
-	marketBalance, err := t.getMarketBalance(ctx, &tdexv2.GetMarketBalanceRequest{
+	marketBalance, err := t.getMarketBalance(ctx, &seqdexv1.GetMarketBalanceRequest{
 		Market: req.GetMarket(),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return &tdexv2.GetMarketPriceResponse{
+	return &seqdexv1.GetMarketPriceResponse{
 		SpotPrice:         marketPrice.SpotPrice,
 		MinTradableAmount: marketPrice.MinTradableAmount,
 		Balance:           marketBalance.Balance,
@@ -64,49 +64,49 @@ func (t tradeHandler) GetMarketPrice(
 }
 
 func (t tradeHandler) PreviewTrade(
-	ctx context.Context, req *tdexv2.PreviewTradeRequest,
-) (*tdexv2.PreviewTradeResponse, error) {
+	ctx context.Context, req *seqdexv1.PreviewTradeRequest,
+) (*seqdexv1.PreviewTradeResponse, error) {
 	return t.previewTrade(ctx, req)
 }
 
 func (t tradeHandler) ProposeTrade(
-	ctx context.Context, req *tdexv2.ProposeTradeRequest,
-) (*tdexv2.ProposeTradeResponse, error) {
+	ctx context.Context, req *seqdexv1.ProposeTradeRequest,
+) (*seqdexv1.ProposeTradeResponse, error) {
 	return t.proposeTrade(ctx, req)
 }
 
 func (t tradeHandler) CompleteTrade(
-	ctx context.Context, req *tdexv2.CompleteTradeRequest,
-) (*tdexv2.CompleteTradeResponse, error) {
+	ctx context.Context, req *seqdexv1.CompleteTradeRequest,
+) (*seqdexv1.CompleteTradeResponse, error) {
 	return t.completeTrade(ctx, req)
 }
 
 func (t tradeHandler) listMarkets(
 	ctx context.Context,
-) (*tdexv2.ListMarketsResponse, error) {
+) (*seqdexv1.ListMarketsResponse, error) {
 	markets, err := t.tradeSvc.GetTradableMarkets(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	marketsWithFee := make([]*tdexv2.MarketWithFee, 0, len(markets))
+	marketsWithFee := make([]*seqdexv1.MarketWithFee, 0, len(markets))
 	for _, v := range markets {
-		m := &tdexv2.MarketWithFee{
-			Market: market{v.GetMarket()}.toProto(),
-			Fee: marketFeeInfo{
+		m := &seqdexv1.MarketWithFee{
+			Market: seqMarket{v.GetMarket()}.toProto(),
+			Fee: seqMarketFeeInfo{
 				v.GetPercentageFee(), v.GetFixedFee(),
 			}.toProto(),
 		}
 		marketsWithFee = append(marketsWithFee, m)
 	}
 
-	return &tdexv2.ListMarketsResponse{Markets: marketsWithFee}, nil
+	return &seqdexv1.ListMarketsResponse{Markets: marketsWithFee}, nil
 }
 
 func (t tradeHandler) getMarketBalance(
-	ctx context.Context, req *tdexv2.GetMarketBalanceRequest,
-) (*tdexv2.GetMarketBalanceResponse, error) {
-	market, err := parseMarket(req.GetMarket())
+	ctx context.Context, req *seqdexv1.GetMarketBalanceRequest,
+) (*seqdexv1.GetMarketBalanceResponse, error) {
+	market, err := parseMarketSeq(req.GetMarket())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -121,21 +121,21 @@ func (t tradeHandler) getMarketBalance(
 		baseBalance = balance[market.GetBaseAsset()].GetConfirmedBalance()
 		quoteBalance = balance[market.GetQuoteAsset()].GetConfirmedBalance()
 	}
-	return &tdexv2.GetMarketBalanceResponse{
-		Balance: &tdexv2.Balance{
+	return &seqdexv1.GetMarketBalanceResponse{
+		Balance: &seqdexv1.Balance{
 			BaseAmount:  baseBalance,
 			QuoteAmount: quoteBalance,
 		},
-		Fee: marketFeeInfo{
+		Fee: seqMarketFeeInfo{
 			info.GetPercentageFee(), info.GetFixedFee(),
 		}.toProto(),
 	}, nil
 }
 
 func (t tradeHandler) getMarketPrice(
-	ctx context.Context, req *tdexv2.GetMarketPriceRequest,
-) (*tdexv2.GetMarketPriceResponse, error) {
-	market, err := parseMarket(req.GetMarket())
+	ctx context.Context, req *seqdexv1.GetMarketPriceRequest,
+) (*seqdexv1.GetMarketPriceResponse, error) {
+	market, err := parseMarketSeq(req.GetMarket())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -146,20 +146,20 @@ func (t tradeHandler) getMarketPrice(
 	}
 
 	spotPrice, _ := price.Float64()
-	return &tdexv2.GetMarketPriceResponse{
+	return &seqdexv1.GetMarketPriceResponse{
 		SpotPrice:         spotPrice,
 		MinTradableAmount: minAmount,
 	}, nil
 }
 
 func (t tradeHandler) previewTrade(
-	ctx context.Context, req *tdexv2.PreviewTradeRequest,
-) (*tdexv2.PreviewTradeResponse, error) {
-	market, err := parseMarket(req.GetMarket())
+	ctx context.Context, req *seqdexv1.PreviewTradeRequest,
+) (*seqdexv1.PreviewTradeResponse, error) {
+	market, err := parseMarketSeq(req.GetMarket())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	tradeType, err := parseTradeType(req.GetType())
+	tradeType, err := parseTradeTypeSeq(req.GetType())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -185,11 +185,11 @@ func (t tradeHandler) previewTrade(
 		return nil, err
 	}
 
-	return &tdexv2.PreviewTradeResponse{
-		Previews: []*tdexv2.Preview{
+	return &seqdexv1.PreviewTradeResponse{
+		Previews: []*seqdexv1.Preview{
 			{
-				Price: marketPriceInfo{preview.GetMarketPrice()}.toProto(),
-				Fee: marketFeeInfo{
+				Price: seqMarketPriceInfo{preview.GetMarketPrice()}.toProto(),
+				Fee: seqMarketFeeInfo{
 					preview.GetMarketPercentageFee(), preview.GetMarketFixedFee(),
 				}.toProto(),
 				Amount:    preview.GetAmount(),
@@ -202,17 +202,17 @@ func (t tradeHandler) previewTrade(
 }
 
 func (t tradeHandler) proposeTrade(
-	ctx context.Context, req *tdexv2.ProposeTradeRequest,
-) (*tdexv2.ProposeTradeResponse, error) {
-	market, err := parseMarket(req.GetMarket())
+	ctx context.Context, req *seqdexv1.ProposeTradeRequest,
+) (*seqdexv1.ProposeTradeResponse, error) {
+	market, err := parseMarketSeq(req.GetMarket())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	tradeType, err := parseTradeType(req.GetType())
+	tradeType, err := parseTradeTypeSeq(req.GetType())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	swapRequest, err := parseSwapRequest(
+	swapRequest, err := parseSwapRequestSeq(
 		req.GetSwapRequest(), req.GetFeeAsset(), req.GetFeeAmount(),
 	)
 	if err != nil {
@@ -226,16 +226,16 @@ func (t tradeHandler) proposeTrade(
 		return nil, err
 	}
 
-	return &tdexv2.ProposeTradeResponse{
-		SwapAccept:     swapAcceptInfo{accept}.toProto(),
-		SwapFail:       swapFailInfo{fail}.toProto(),
+	return &seqdexv1.ProposeTradeResponse{
+		SwapAccept:     seqSwapAcceptInfo{accept}.toProto(),
+		SwapFail:       seqSwapFailInfo{fail}.toProto(),
 		ExpiryTimeUnix: uint64(swapExpiryTime),
 	}, nil
 }
 
 func (t tradeHandler) completeTrade(
-	ctx context.Context, req *tdexv2.CompleteTradeRequest,
-) (*tdexv2.CompleteTradeResponse, error) {
+	ctx context.Context, req *seqdexv1.CompleteTradeRequest,
+) (*seqdexv1.CompleteTradeResponse, error) {
 	var swapComplete ports.SwapComplete
 	if s := req.SwapComplete; s != nil {
 		swapComplete = s
@@ -251,9 +251,9 @@ func (t tradeHandler) completeTrade(
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	var swapFailStub *tdexv2.SwapFail
+	var swapFailStub *seqdexv1.SwapFail
 	if fail != nil {
-		swapFailStub = &tdexv2.SwapFail{
+		swapFailStub = &seqdexv1.SwapFail{
 			Id:             fail.GetId(),
 			MessageId:      fail.GetMessageId(),
 			FailureCode:    fail.GetFailureCode(),
@@ -261,7 +261,7 @@ func (t tradeHandler) completeTrade(
 		}
 	}
 
-	return &tdexv2.CompleteTradeResponse{
+	return &seqdexv1.CompleteTradeResponse{
 		Txid:     txID,
 		SwapFail: swapFailStub,
 	}, nil
