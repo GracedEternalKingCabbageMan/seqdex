@@ -32,6 +32,23 @@ elementsd -datadir=<dir> -server -daemon \
 These params match `seqnet.SequentiaRegtest` (bech32/blech32 `bcrt`, base58 111/196,
 confidential 4). `-blockfilterindex=1` is required by the elements scanner.
 
+#### Anchored headers (faithful to real Sequentia)
+Real Sequentia testnet/mainnet run with **Bitcoin anchoring + PoS on**
+(`g_con_bitcoin_anchor=true`, `g_con_pos=true`), so every block header carries the
+36-byte `m_anchor_height`+`m_anchor_hash` fields (and a large PoS committee witness).
+The plain regtest above has anchoring **off**, so it does NOT exercise that path. For a
+faithful test, run an anchored `elementsregtest` against a parent node — see
+`SequentiaByClaude/test/functional/feature_anchor_swap_consistency.py` (~L55-95). Key extra
+flags on the Sequentia node: `-con_bitcoin_anchor=1 -validateanchor=1 -anchorpollinterval=1
+-signblockscript=51 -con_elementsmode=1 -parentgenesisblockhash=<parent genesis>` plus the
+`-mainchainrpc*` connection to the parent. `getblockheader <hash> true` then shows
+`anchorheight`/`anchorhash` and `getanchorstatus` reports `ok`.
+
+Note: the wallet's elements scanner reads block/header **structure via JSON-RPC**
+(`getblockheader`/`getblock` verbosity) and uses go-elements only for individual
+transactions — go-elements cannot parse Sequentia's anchored/PoS headers, so raw-header
+deserialization is deliberately avoided.
+
 ### Run the wallet (node-RPC only, no Esplora)
 ```sh
 OCEAN_NETWORK=sequentia-regtest \
