@@ -4,7 +4,7 @@ A non-custodial, atomic-swap DEX for the [Sequentia](https://sequentia.io) Bitco
 sidechain. SeqDEX is a fork of the [TDEX](https://github.com/tdex-network) stack
 (`tdex-daemon` + `tdex-protobuf`) and the [Ocean](https://github.com/vulpemventures/ocean)
 wallet daemon, adapted to Sequentia and extended with **native-BTC ↔ Sequentia-asset
-cross-chain swaps** that lean on Sequentia's real-time Bitcoin anchoring.
+cross-chain swaps** that lean on Sequentia's Bitcoin anchoring.
 
 It is a backend product first: a liquidity-provider daemon exposing a language-neutral
 trade protocol, meant to be consumed by many client surfaces (the SWK web wallet first,
@@ -19,7 +19,7 @@ proto/      Protocol contract (buf). seqdex.v1 = public Trade + Swap + Transport
             contract, kept byte-identical so the daemon stays drop-in.
 daemon/     [phase 3] LP/market-maker daemon — fork of tdex-daemon.
 wallet/     [phase 2] Sequentia wallet daemon — thin fork of Ocean.
-xchain/     [phase 5] BTC ↔ SEQ cross-chain swap service (Design A, on-chain HTLC,
+xchain/     [phase 5] BTC ↔ Sequentia-asset cross-chain swap service (Design A, on-chain HTLC,
             anchor-aware finality), abstracted over a LockPrimitive so PTLC can drop in.
 docs/       Design docs. See docs/ARCHITECTURE.md.
 ```

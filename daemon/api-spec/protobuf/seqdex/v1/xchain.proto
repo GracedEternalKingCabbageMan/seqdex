@@ -1,15 +1,15 @@
 syntax = "proto3";
 
-// Package seqdex.v1 hosts the SeqDEX cross-chain (BTC<->SEQ-asset) swap API
+// Package seqdex.v1 hosts the SeqDEX cross-chain (BTC<->Sequentia-asset) swap API
 // (Phase 5, milestone 2). It is intentionally a NEW, stateful, multi-step
 // service distinct from the same-chain TradeService (which is a single atomic
 // PSET and does not fit cross-chain). The daemon is the cross-chain
 // MAKER/counterparty: it holds reserves of the parent-chain "BTC" asset and of
-// the anchored SEQ asset, and drives a Design-A single-secret HTLC swap built
+// the anchored Sequentia-chain asset, and drives a Design-A single-secret HTLC swap built
 // on the proven pkg/xchain mechanism.
 //
-// MVP direction (one direction only): the taker BUYS a SEQ asset, paying BTC.
-// This places the taker on the SEQ-receiving side (anchor-shortened ~1-conf
+// MVP direction (one direction only): the taker BUYS a Sequentia-chain asset, paying BTC.
+// This places the taker on the Sequentia-receiving side (anchor-shortened ~1-conf
 // benefit) and makes the taker the INITIATOR who locks the BTC leg first
 // (satisfying the BTC-leg-first ordering rule).
 package seqdex.v1;
@@ -17,7 +17,7 @@ package seqdex.v1;
 import "google/api/annotations.proto";
 
 // XchainService is the daemon-side cross-chain swap maker. A taker drives a
-// full BTC->SEQ-asset swap over these RPCs:
+// full BTC->Sequentia-asset swap over these RPCs:
 //
 //   1. ListXchainMarkets / GetXchainQuote  -> discover pairs + reserves, get a
 //      quote (amounts, price, fee, the maker's claim/refund pubkeys, timeouts
@@ -32,7 +32,7 @@ import "google/api/annotations.proto";
 //   5. The daemon watches the SEQ chain for the taker's claim, extracts s, and
 //      claims the BTC leg with s. GetXchainSwap lets the taker poll state.
 service XchainService {
-  // ListXchainMarkets returns the BTC/SEQ-asset pairs the maker will swap and
+  // ListXchainMarkets returns the BTC/Sequentia-asset pairs the maker will swap and
   // its current reserves on each leg.
   rpc ListXchainMarkets(ListXchainMarketsRequest) returns (ListXchainMarketsResponse) {
     option (google.api.http) = {
@@ -42,7 +42,7 @@ service XchainService {
   }
 
   // GetXchainQuote returns a firm-ish quote for buying `seq_amount` units of the
-  // market's SEQ asset with BTC, including the maker's pubkeys and the two
+  // market's Sequentia-chain asset with BTC, including the maker's pubkeys and the two
   // CLTV timeouts. The quote is held in memory for a short window.
   rpc GetXchainQuote(GetXchainQuoteRequest) returns (GetXchainQuoteResponse) {
     option (google.api.http) = {
@@ -93,7 +93,7 @@ enum XchainSwapState {
   XCHAIN_SWAP_STATE_FAILED = 6;
 }
 
-// XchainMarket identifies a swappable BTC/SEQ-asset pair.
+// XchainMarket identifies a swappable BTC/Sequentia-asset pair.
 message XchainMarket {
   // The parent-chain "BTC" (pegged bitcoin) asset id, hex.
   string btc_asset = 1;
@@ -101,11 +101,11 @@ message XchainMarket {
   string seq_asset = 2;
   // Human label, e.g. "BTC/SEQ-USDT".
   string name = 3;
-  // The maker's available SEQ-asset reserve (atoms) to sell.
+  // The maker's available Sequentia-asset reserve (atoms) to sell.
   uint64 seq_reserve = 4;
   // The maker's available BTC reserve (atoms) to receive into.
   uint64 btc_reserve = 5;
-  // Price: how many SEQ-asset atoms per 1 BTC atom (the maker's ask).
+  // Price: how many Sequentia-asset atoms per 1 BTC atom (the maker's ask).
   double price_seq_per_btc = 6;
 }
 
@@ -116,16 +116,16 @@ message ListXchainMarketsResponse {
 }
 
 message GetXchainQuoteRequest {
-  // The SEQ asset id (hex) identifying the market.
+  // The Sequentia-chain asset id (hex) identifying the market.
   string seq_asset = 1;
-  // How many units (atoms) of the SEQ asset the taker wants to BUY.
+  // How many units (atoms) of the Sequentia-chain asset the taker wants to BUY.
   uint64 seq_amount = 2;
 }
 
 message GetXchainQuoteResponse {
   // Opaque quote id; pass to ProposeXchainSwap.
   string quote_id = 1;
-  // SEQ-asset atoms the taker will receive.
+  // Sequentia-asset atoms the taker will receive.
   uint64 seq_amount = 2;
   // BTC atoms the taker must lock on the parent chain.
   uint64 btc_amount = 3;
@@ -180,7 +180,7 @@ message ProposeXchainSwapRequest {
   string taker_btc_refund_pub = 5;
 }
 
-// XchainSeqLeg describes the SEQ-leg HTLC the daemon locked for the taker.
+// XchainSeqLeg describes the Sequentia-leg HTLC the daemon locked for the taker.
 message XchainSeqLeg {
   string txid = 1;
   uint32 vout = 2;
@@ -188,11 +188,11 @@ message XchainSeqLeg {
   string block_hash = 3;
   // The anchorheight committed in that block's header (>= btc_leg.height).
   int64 anchor_height = 4;
-  // The SEQ-leg HTLC redeemScript, hex.
+  // The Sequentia-leg HTLC redeemScript, hex.
   string redeem_script = 5;
-  // Funded SEQ-asset value in atoms.
+  // Funded Sequentia-asset value in atoms.
   uint64 amount = 6;
-  // SEQ asset id, hex.
+  // Sequentia-chain asset id, hex.
   string asset_id = 7;
 }
 

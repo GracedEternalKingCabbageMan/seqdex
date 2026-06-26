@@ -15,7 +15,7 @@ Two layers:
 
 1. **Backend (Go):** the forked `daemon` (LP server, public Trade `:9945` + private
    Operator `:9000`) talking to the `wallet` (thin-forked Ocean) over the `ocean.v1`
-   gRPC contract. Plus `xchain`, the new BTC↔SEQ cross-chain swap service.
+   gRPC contract. Plus `xchain`, the new BTC↔Sequentia-asset cross-chain swap service.
 2. **Trader clients:** thin clients generated from the `seqdex.v1` protos, using a
    wallet library for PSET build/sign. The web PoC uses SWK's `lwk_wasm` (which already
    exports PSET/Signer/Esplora/Registry/Prices + a LiquidEx same-chain swap surface).
@@ -52,7 +52,7 @@ Two layers:
 
 ## 4. Cross-chain (phase 5): Design A, abstracted
 
-The novel piece. TDEX is same-chain only; `xchain` adds a BTC↔SEQ swap service where the
+The novel piece. TDEX is same-chain only; `xchain` adds a BTC↔Sequentia-asset swap service where the
 daemon is the counterparty/market-maker.
 
 - **Design A — on-chain HTLC (hashlock + CLTV refund).** Reuses the proven
@@ -60,11 +60,11 @@ daemon is the counterparty/market-maker.
   built/tested, maximally compatible across heterogeneous clients, and **composes with the
   future submarine-swap roadmap** (today's Lightning + Boltz submarine swaps are hashlock-based,
   sharing `payment_hash`).
-- **Anchoring removes the SEQ-side reorg buffer.** `feature_anchor_swap_consistency.py`
-  proves a SEQ block (and its swap leg) reverts iff its anchored Bitcoin block reverts. So:
-  lock BTC first, then the SEQ leg with `anchorheight ≥ BTC-leg height`, and the SEQ side
+- **Anchoring removes the Sequentia-side reorg buffer.** `feature_anchor_swap_consistency.py`
+  proves a Sequentia block (and its swap leg) reverts iff its anchored Bitcoin block reverts. So:
+  lock BTC first, then the Sequentia leg with `anchorheight ≥ BTC-leg height`, and the Sequentia side
   needs ~1 confirmation with no extra buffer. The claimant MUST verify the actual
-  `anchorheight` and `getanchorstatus` before treating the SEQ leg as safe (producer fallback
+  `anchorheight` and `getanchorstatus` before treating the Sequentia leg as safe (producer fallback
   can reuse a stale parent anchor). The anchoring win is **script-independent** — it applies
   equally to a later PTLC design.
 - **Abstract over a `LockPrimitive`** (hashlock | adaptor) so Design B (PTLC/Taproot
@@ -72,7 +72,7 @@ daemon is the counterparty/market-maker.
   Taproot key-path + Tapscript-refund standard-relay on the Sequentia chains, a vetted
   adaptor-sig lib across clients, and CT-interplay validation.
 - **Finality is anchor-bounded, never instant.** Settlement detection must be reorg-aware
-  (a "settled" SEQ leg can revert with Bitcoin) — this corrects TDEX's Liquid-style
+  (a "settled" Sequentia leg can revert with Bitcoin) — this corrects TDEX's Liquid-style
   immediate-finality assumption.
 - **Lightning is a future sub-project** (pure-LN and submarine swaps; needs c-lightning
   adapted for Sequentia). The PoC settles purely on-chain, but the client swap UI/UX state
