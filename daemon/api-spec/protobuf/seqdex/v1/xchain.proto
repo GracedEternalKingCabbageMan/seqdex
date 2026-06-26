@@ -25,11 +25,11 @@ import "google/api/annotations.proto";
 //   2. (taker) generate secret s, H=sha256(s); lock the BTC leg (claim=maker
 //      with s, refund=taker after T_btc); confirm it on the parent chain.
 //   3. ProposeXchainSwap(H, btcLeg, taker pubkeys) -> the daemon VERIFIES the
-//      BTC leg then locks the SEQ leg (claim=taker with s, refund=maker after
+//      BTC leg then locks the Sequentia leg (claim=taker with s, refund=maker after
 //      T_seq) in a Sequentia block, replying XchainSwapAccepted{seqLeg...}.
 //   4. (taker) VerifySeqLegSafe (anchorheight >= btc height && anchor ok), then
-//      claim the SEQ leg with s, revealing s on the SEQ chain.
-//   5. The daemon watches the SEQ chain for the taker's claim, extracts s, and
+//      claim the Sequentia leg with s, revealing s on the Sequentia chain.
+//   5. The daemon watches the Sequentia chain for the taker's claim, extracts s, and
 //      claims the BTC leg with s. GetXchainSwap lets the taker poll state.
 service XchainService {
   // ListXchainMarkets returns the BTC/Sequentia-asset pairs the maker will swap and
@@ -53,7 +53,7 @@ service XchainService {
 
   // ProposeXchainSwap is called by the taker AFTER it has locked + confirmed the
   // BTC leg. The daemon verifies the BTC leg against the quote (script, H,
-  // amount, recipient, confirmed), then locks the SEQ leg and returns it, or a
+  // amount, recipient, confirmed), then locks the Sequentia leg and returns it, or a
   // failure.
   rpc ProposeXchainSwap(ProposeXchainSwapRequest) returns (ProposeXchainSwapResponse) {
     option (google.api.http) = {
@@ -80,14 +80,14 @@ enum XchainSwapState {
   // A quote was issued; the daemon is waiting for the taker to lock the BTC leg
   // and call ProposeXchainSwap.
   XCHAIN_SWAP_STATE_PENDING_BTC_LOCK = 1;
-  // The daemon verified the BTC leg and locked the SEQ leg (anchored). Waiting
-  // for the taker to claim the SEQ leg (revealing the preimage).
+  // The daemon verified the BTC leg and locked the Sequentia leg (anchored). Waiting
+  // for the taker to claim the Sequentia leg (revealing the preimage).
   XCHAIN_SWAP_STATE_SEQ_LOCKED = 2;
-  // The taker claimed the SEQ leg; the daemon has read the preimage off-chain.
+  // The taker claimed the Sequentia leg; the daemon has read the preimage off-chain.
   XCHAIN_SWAP_STATE_SEQ_CLAIMED = 3;
   // The daemon claimed the BTC leg with the preimage. Swap complete.
   XCHAIN_SWAP_STATE_BTC_CLAIMED = 4;
-  // The maker refunded its SEQ leg after T_seq because the taker stalled.
+  // The maker refunded its Sequentia leg after T_seq because the taker stalled.
   XCHAIN_SWAP_STATE_REFUNDED = 5;
   // The swap failed (bad BTC leg, RPC error, etc.). Terminal.
   XCHAIN_SWAP_STATE_FAILED = 6;
@@ -99,7 +99,7 @@ message XchainMarket {
   string btc_asset = 1;
   // The anchored Sequentia asset id, hex.
   string seq_asset = 2;
-  // Human label, e.g. "BTC/SEQ-USDT".
+  // Human label, e.g. "BTC/USDX".
   string name = 3;
   // The maker's available Sequentia-asset reserve (atoms) to sell.
   uint64 seq_reserve = 4;
@@ -129,20 +129,20 @@ message GetXchainQuoteResponse {
   uint64 seq_amount = 2;
   // BTC atoms the taker must lock on the parent chain.
   uint64 btc_amount = 3;
-  // Effective price (SEQ atoms per BTC atom) used for this quote.
+  // Effective price (Sequentia-asset atoms per BTC atom) used for this quote.
   double price_seq_per_btc = 4;
   // Maker fee already folded into btc_amount (BTC atoms), for transparency.
   uint64 fee_btc = 5;
   // The maker's claim pubkey for the BTC leg (33-byte compressed, hex): the
   // taker locks the BTC leg claimable by THIS key with the preimage.
   string maker_btc_claim_pub = 6;
-  // The maker's refund pubkey for the SEQ leg (hex): the maker refunds its own
-  // SEQ leg with this key after T_seq.
+  // The maker's refund pubkey for the Sequentia leg (hex): the maker refunds its own
+  // Sequentia leg with this key after T_seq.
   string maker_seq_refund_pub = 7;
   // T_btc: the parent-chain CLTV height at/after which the TAKER may refund its
   // BTC leg. This is the LONGER timeout (taker refunds last).
   uint32 btc_locktime = 8;
-  // T_seq: the Sequentia CLTV height at/after which the MAKER may refund its SEQ
+  // T_seq: the Sequentia CLTV height at/after which the MAKER may refund its Sequentia
   // leg. This is the SHORTER timeout (T_btc > T_seq).
   uint32 seq_locktime = 9;
   // Unix seconds after which this quote is no longer accepted.
@@ -172,7 +172,7 @@ message ProposeXchainSwapRequest {
   string hash = 2;
   // The taker's confirmed BTC leg.
   XchainBtcLeg btc_leg = 3;
-  // The taker's claim pubkey for the SEQ leg (hex): the daemon locks the SEQ leg
+  // The taker's claim pubkey for the Sequentia leg (hex): the daemon locks the Sequentia leg
   // claimable by THIS key with the preimage.
   string taker_seq_claim_pub = 4;
   // The taker's refund pubkey on the BTC leg (hex), for the maker to recompute
@@ -184,7 +184,7 @@ message ProposeXchainSwapRequest {
 message XchainSeqLeg {
   string txid = 1;
   uint32 vout = 2;
-  // The Sequentia block that confirmed the SEQ leg.
+  // The Sequentia block that confirmed the Sequentia leg.
   string block_hash = 3;
   // The anchorheight committed in that block's header (>= btc_leg.height).
   int64 anchor_height = 4;
@@ -222,11 +222,11 @@ message GetXchainSwapResponse {
   string swap_id = 1;
   XchainSwapState state = 2;
   XchainSeqLeg seq_leg = 3;
-  // The taker's SEQ-leg claim txid, once observed (preimage revealed here).
+  // The taker's Sequentia-leg claim txid, once observed (preimage revealed here).
   string seq_claim_txid = 4;
   // The maker's BTC-leg claim txid, once the maker has claimed.
   string btc_claim_txid = 5;
-  // The preimage the maker extracted from the taker's SEQ claim, hex (empty
+  // The preimage the maker extracted from the taker's Sequentia claim, hex (empty
   // until SEQ_CLAIMED). Returned for proof/inspection on regtest.
   string preimage = 6;
   // Populated when state == FAILED or REFUNDED.
