@@ -45,6 +45,11 @@ type RealBackend struct {
 	// CompleteSwapFn runs the maker responder and MUST honor blind (skip BlindPset
 	// for an explicit swap). Wired to wallet.Service.CompleteSwap building blocks.
 	CompleteSwapFn func(req *seqdexv1.SwapRequest, blind bool) (signedPSET string, combined []swap.UnblindedInput, err error)
+
+	// lastReq is the taker's own most recent proposer SwapRequest. ProposerFinalize
+	// validates the maker-returned SwapAccept against it before signing, so it is
+	// authentic taker-side state (never relay-supplied).
+	lastReq *seqdexv1.SwapRequest
 }
 
 // NewRealBackend builds a RealBackend with the taker's signing + blinding keys.
@@ -110,6 +115,9 @@ func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidential
 	if err := proto.Unmarshal(reqBytes, &out); err != nil {
 		return nil, err
 	}
+	// Remember the request so ProposerFinalize can assert the maker-returned tx
+	// still pays this exact receive leg to this taker before signing.
+	b.lastReq = &out
 	return &out, nil
 }
 
@@ -147,6 +155,31 @@ func (b *RealBackend) ResponderComplete(req *seqdexv1.SwapRequest, blind bool) (
 func (b *RealBackend) ProposerFinalize(acc *seqdexv1.SwapAccept) (*seqdexv1.SwapComplete, string, error) {
 	if b.taker == nil || b.BroadcastFn == nil {
 		return nil, "", errNotWired
+	}
+	// SECURITY (taker theft): before signing the taker's inputs, validate the
+	// maker-returned tx actually pays the taker's receive leg to the taker's own
+	// script and leaves the taker's funding inputs intact. A malicious maker could
+	// otherwise return a tx that drops/redirects the taker's receive output (or
+	// swaps out its inputs) and steal the taker's pay leg the instant it signs.
+	if b.lastReq == nil {
+		return nil, "", fmt.Errorf("no prior swap request to validate the accept against")
+	}
+	if rid := acc.GetRequestId(); rid != "" && rid != b.lastReq.GetId() {
+		return nil, "", fmt.Errorf("accept request_id %q does not match our request %q", rid, b.lastReq.GetId())
+	}
+	recvScript, err := seqnet.ToOutputScript(b.taker.Address(), b.net)
+	if err != nil {
+		return nil, "", fmt.Errorf("taker receive script: %w", err)
+	}
+	if err := swap.ValidateProposerReceiveV2(swap.ValidateProposerReceiveV2Opts{
+		ProposerPsetBase64: b.lastReq.GetTransaction(),
+		FinalPsetBase64:    acc.GetTransaction(),
+		RecvScript:         recvScript,
+		RecvBlindingKey:    b.taker.BlindingKey(),
+		AssetR:             b.lastReq.GetAssetR(),
+		AmountR:            b.lastReq.GetAmountR(),
+	}); err != nil {
+		return nil, "", fmt.Errorf("refusing to sign maker-returned swap: %w", err)
 	}
 	signed, err := b.taker.Sign(acc.GetTransaction())
 	if err != nil {

@@ -12,7 +12,9 @@
 package validator
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,6 +23,24 @@ import (
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 )
+
+// ErrReplay signals that the submitted offer is a byte-identical replay of an
+// offer already resting in the book (same maker_pubkey + offer_id + maker_sig):
+// a no-op. It is NOT a validation failure; the caller should drop the submission
+// silently (re-acking the live order status) WITHOUT treating it as an error.
+// Crucially, an ErrReplay submission consumes NO per-maker_pubkey rate budget,
+// which is the whole point: see RestingOffers and ValidateOffer.
+var ErrReplay = errors.New("offer is an exact replay of an already-resting offer")
+
+// RestingOffers lets the validator consult the live order book so a byte-identical
+// replay of an already-resting offer is dropped WITHOUT charging the per-maker
+// pubkey rate budget. The offerstore.Store satisfies this interface. If no book
+// is wired (SetBook never called), the replay gate is skipped.
+type RestingOffers interface {
+	// RestingMakerSig returns the maker_sig of the offer currently resting under
+	// (makerPubkey, offerID), or ok=false if none rests.
+	RestingMakerSig(makerPubkey, offerID string) (sig []byte, ok bool)
+}
 
 // LivenessProbe checks (best-effort, read-only) that a maker plausibly holds the
 // asset it is offering. PHASE-1 STUB: the default NoopLivenessProbe always
@@ -69,10 +89,16 @@ func DefaultConfig() Config {
 type Validator struct {
 	cfg     Config
 	probe   LivenessProbe
+	book    RestingOffers
 	mu      sync.Mutex
 	pubHits map[string][]time.Time
 	ipHits  map[string][]time.Time
 }
+
+// SetBook wires the live order book so ValidateOffer can recognize a byte-identical
+// replay of an already-resting offer and decline to charge it the per-maker_pubkey
+// rate budget. Call once at wiring time (e.g. api.New); b may be nil to disable.
+func (v *Validator) SetBook(b RestingOffers) { v.book = b }
 
 // New returns a Validator. If probe is nil, NoopLivenessProbe is used.
 func New(cfg Config, probe LivenessProbe) *Validator {
@@ -95,7 +121,19 @@ func New(cfg Config, probe LivenessProbe) *Validator {
 
 // ValidateOffer runs all structural/semantic checks and rate limits. ip may be
 // empty (e.g. for a local CLI); IP rate limiting is then skipped.
+//
+// Order matters for rate limiting (review: per-maker_pubkey griefing). The
+// per-IP limit is charged FIRST, before the (relatively expensive) signature
+// verification, so a flood from one IP is throttled cheaply. The maker signature
+// is then verified, and ONLY after it succeeds is the per-maker_pubkey budget
+// charged: a maker_pubkey is attacker-replayable PUBLIC data, so a forged offer
+// bearing a victim's maker_pubkey must never consume the victim's budget. The
+// genuine maker (the only party able to produce a valid maker_sig) is therefore
+// the only one who spends its own per-pubkey budget.
 func (v *Validator) ValidateOffer(ctx context.Context, o *seqobv1.Offer, ip string) error {
+	if err := v.checkIPRate(ip); err != nil {
+		return err
+	}
 	if err := offer.VerifyOffer(o); err != nil {
 		return fmt.Errorf("signature: %w", err)
 	}
@@ -108,7 +146,24 @@ func (v *Validator) ValidateOffer(ctx context.Context, o *seqobv1.Offer, ip stri
 	if err := v.checkExpiry(o); err != nil {
 		return err
 	}
-	if err := v.checkRate(o, ip); err != nil {
+	// Replay-griefing defense: an attacker can harvest a victim maker's GENUINE
+	// signed offer from the public book and replay it here. It passes VerifyOffer
+	// (the signature is real), so without this gate it would consume the victim's
+	// per-maker_pubkey budget and could lock the victim out. If an offer with this
+	// (maker_pubkey, offer_id) is already resting with a byte-identical maker_sig
+	// -- i.e. identical signed content, since the signature is a deterministic,
+	// collision-resistant function of the whole signed payload -- the submission is
+	// a no-op replay: return ErrReplay WITHOUT charging the per-pubkey budget. A new
+	// offer_id, or a genuinely changed (re-signed) offer_edit, has a different
+	// maker_sig and falls through to consume budget and be stored.
+	if v.book != nil {
+		if sig, ok := v.book.RestingMakerSig(o.GetMakerPubkey(), o.GetOfferId()); ok && bytes.Equal(sig, o.GetMakerSig()) {
+			return ErrReplay
+		}
+	}
+	// Charge the per-maker_pubkey budget only now that maker_sig is verified and the
+	// offer is a genuinely new or changed resting offer (not a no-op replay).
+	if err := v.checkPubkeyRate(o.GetMakerPubkey()); err != nil {
 		return err
 	}
 	if err := v.probe.CheckOffer(ctx, o); err != nil {
@@ -184,27 +239,44 @@ func (v *Validator) checkExpiry(o *seqobv1.Offer) error {
 	return nil
 }
 
-func (v *Validator) checkRate(o *seqobv1.Offer, ip string) error {
+// checkIPRate enforces the per-IP sliding-window limit. It is keyed on the
+// connection (not the maker_pubkey) and is charged before signature verification
+// so a flood is throttled cheaply. ip may be empty (limit skipped).
+func (v *Validator) checkIPRate(ip string) error {
+	if ip == "" || v.cfg.MaxOffersPerMinPerIP <= 0 {
+		return nil
+	}
 	now := v.cfg.Now()
 	cutoff := now.Add(-time.Minute)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.cfg.MaxOffersPerMinPerPubkey > 0 {
-		hits := prune(v.pubHits[o.GetMakerPubkey()], cutoff)
-		if len(hits) >= v.cfg.MaxOffersPerMinPerPubkey {
-			v.pubHits[o.GetMakerPubkey()] = hits
-			return fmt.Errorf("rate limit: too many offers for this maker_pubkey")
-		}
-		v.pubHits[o.GetMakerPubkey()] = append(hits, now)
+	hits := prune(v.ipHits[ip], cutoff)
+	if len(hits) >= v.cfg.MaxOffersPerMinPerIP {
+		v.ipHits[ip] = hits
+		return fmt.Errorf("rate limit: too many offers from this IP")
 	}
-	if ip != "" && v.cfg.MaxOffersPerMinPerIP > 0 {
-		hits := prune(v.ipHits[ip], cutoff)
-		if len(hits) >= v.cfg.MaxOffersPerMinPerIP {
-			v.ipHits[ip] = hits
-			return fmt.Errorf("rate limit: too many offers from this IP")
-		}
-		v.ipHits[ip] = append(hits, now)
+	v.ipHits[ip] = append(hits, now)
+	return nil
+}
+
+// checkPubkeyRate enforces the per-maker_pubkey sliding-window limit. The CALLER
+// MUST have already verified maker_sig: maker_pubkey is attacker-replayable
+// public data, so only a genuine maker (which alone can produce a valid sig) may
+// reach here and consume its own budget.
+func (v *Validator) checkPubkeyRate(makerPubkey string) error {
+	if v.cfg.MaxOffersPerMinPerPubkey <= 0 {
+		return nil
 	}
+	now := v.cfg.Now()
+	cutoff := now.Add(-time.Minute)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	hits := prune(v.pubHits[makerPubkey], cutoff)
+	if len(hits) >= v.cfg.MaxOffersPerMinPerPubkey {
+		v.pubHits[makerPubkey] = hits
+		return fmt.Errorf("rate limit: too many offers for this maker_pubkey")
+	}
+	v.pubHits[makerPubkey] = append(hits, now)
 	return nil
 }
 

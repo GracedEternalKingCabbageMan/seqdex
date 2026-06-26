@@ -2,11 +2,15 @@ package validator
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"google.golang.org/protobuf/proto"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
@@ -122,6 +126,148 @@ func TestRateLimitPerPubkey(t *testing.T) {
 	o := signed(t, k, nil)
 	if err := v.ValidateOffer(context.Background(), o, ""); err == nil {
 		t.Fatalf("expected rate-limit rejection on 3rd offer")
+	}
+}
+
+// TestForgedOfferDoesNotConsumeVictimBudget proves the per-maker_pubkey budget is
+// charged only after maker_sig is verified: an attacker flooding forged offers
+// that bear a victim's maker_pubkey (but an invalid signature) cannot lock the
+// victim out, because those offers are rejected before the per-pubkey budget is
+// touched.
+func TestForgedOfferDoesNotConsumeVictimBudget(t *testing.T) {
+	c := cfg()
+	c.MaxOffersPerMinPerPubkey = 2
+	c.MaxOffersPerMinPerIP = 0
+	v := New(c, nil)
+	victim := key(t)
+	victimPub := hex.EncodeToString(victim.PubKey().SerializeCompressed())
+
+	// Attacker forges offers bearing the victim's maker_pubkey but breaks the sig.
+	for i := 0; i < 10; i++ {
+		forged := signed(t, victim, nil)
+		forged.MakerPubkey = victimPub
+		forged.WantAmount = 999 // mutate after signing -> invalid maker_sig
+		if err := v.ValidateOffer(context.Background(), forged, "9.9.9.9"); err == nil {
+			t.Fatalf("forged offer %d must be rejected", i)
+		}
+	}
+
+	// The victim's own per-pubkey budget is untouched: it can still post.
+	for i := 0; i < 2; i++ {
+		o := signed(t, victim, func(o *seqobv1.Offer) { o.OfferId = fmt.Sprintf("ok%d", i) })
+		if err := v.ValidateOffer(context.Background(), o, ""); err != nil {
+			t.Fatalf("victim offer %d should pass: %v", i, err)
+		}
+	}
+}
+
+// fakeBook is an in-memory RestingOffers that mirrors what the offerstore would
+// hold: the maker_sig currently resting under each (maker_pubkey, offer_id).
+type fakeBook struct {
+	mu   sync.Mutex
+	sigs map[string][]byte
+}
+
+func newFakeBook() *fakeBook { return &fakeBook{sigs: map[string][]byte{}} }
+
+func (b *fakeBook) RestingMakerSig(makerPubkey, offerID string) ([]byte, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sigs[makerPubkey+"|"+offerID]
+	return s, ok
+}
+
+// put records an offer as resting, mirroring the store.Submit the api layer runs
+// AFTER a successful ValidateOffer.
+func (b *fakeBook) put(o *seqobv1.Offer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sigs[o.GetMakerPubkey()+"|"+o.GetOfferId()] = o.GetMakerSig()
+}
+
+// TestReplayDoesNotExhaustBudget is the ITEM A regression: an attacker who
+// harvests a victim maker's GENUINE signed offer from the public book and replays
+// it on the submit path must NOT consume the victim's per-maker_pubkey budget
+// (each replay is a byte-identical no-op), while N DISTINCT new offers do.
+func TestReplayDoesNotExhaustBudget(t *testing.T) {
+	c := cfg()
+	c.MaxOffersPerMinPerPubkey = 3
+	c.MaxOffersPerMinPerIP = 0
+	v := New(c, nil)
+	book := newFakeBook()
+	v.SetBook(book)
+	victim := key(t)
+	ctx := context.Background()
+
+	// The victim posts ONE genuine offer: it consumes one budget unit and rests.
+	rest := signed(t, victim, func(o *seqobv1.Offer) { o.OfferId = "rest1" })
+	if err := v.ValidateOffer(ctx, rest, ""); err != nil {
+		t.Fatalf("first genuine offer should pass: %v", err)
+	}
+	book.put(rest) // mirror the store.Submit the api layer performs on success.
+
+	// Replaying that genuine offer many times is recognized as a no-op: ErrReplay,
+	// and crucially it charges NO budget. (Way more replays than the budget of 3.)
+	for i := 0; i < 50; i++ {
+		replay := proto.Clone(rest).(*seqobv1.Offer)
+		if err := v.ValidateOffer(ctx, replay, ""); !errors.Is(err, ErrReplay) {
+			t.Fatalf("replay %d: want ErrReplay, got %v", i, err)
+		}
+	}
+
+	// The victim is NOT locked out: it can still post 2 more DISTINCT new offers
+	// (budget 3, one already spent on rest1).
+	for i := 0; i < 2; i++ {
+		n := signed(t, victim, func(o *seqobv1.Offer) { o.OfferId = fmt.Sprintf("new%d", i) })
+		if err := v.ValidateOffer(ctx, n, ""); err != nil {
+			t.Fatalf("distinct new offer %d should pass: %v", i, err)
+		}
+		book.put(n)
+	}
+
+	// N distinct new offers DO exhaust the budget: the 4th distinct offer_id is
+	// rate-limited (budget was spent by genuine new offers, never by replays).
+	overflow := signed(t, victim, func(o *seqobv1.Offer) { o.OfferId = "new-overflow" })
+	if err := v.ValidateOffer(ctx, overflow, ""); err == nil || errors.Is(err, ErrReplay) {
+		t.Fatalf("4th distinct offer must be rate-limited, got %v", err)
+	}
+}
+
+// TestEditConsumesBudget proves a genuine offer_edit (same offer_id, CHANGED and
+// re-signed terms) is NOT treated as a replay: it has a different maker_sig, so it
+// falls through and consumes budget (and would be stored by the api layer).
+func TestEditConsumesBudget(t *testing.T) {
+	c := cfg()
+	c.MaxOffersPerMinPerPubkey = 2
+	c.MaxOffersPerMinPerIP = 0
+	v := New(c, nil)
+	book := newFakeBook()
+	v.SetBook(book)
+	maker := key(t)
+	ctx := context.Background()
+
+	o := signed(t, maker, func(o *seqobv1.Offer) { o.OfferId = "edit-me" })
+	if err := v.ValidateOffer(ctx, o, ""); err != nil {
+		t.Fatalf("initial offer should pass: %v", err)
+	}
+	book.put(o)
+
+	// A genuine edit re-signs changed terms under the SAME offer_id: different
+	// maker_sig => not a replay => budget is charged.
+	edit := signed(t, maker, func(e *seqobv1.Offer) {
+		e.OfferId = "edit-me"
+		e.WantAmount = 90 // changed price -> new signature
+	})
+	if err := v.ValidateOffer(ctx, edit, ""); err != nil {
+		t.Fatalf("genuine edit should pass and consume budget: %v", err)
+	}
+	book.put(edit)
+
+	// Budget (2) is now spent by the original + the edit; the next NEW offer is
+	// rejected, confirming the edit really did consume a unit (not a free replay).
+	next := signed(t, maker, func(o *seqobv1.Offer) { o.OfferId = "another" })
+	if err := v.ValidateOffer(ctx, next, ""); err == nil {
+		t.Fatalf("expected rate-limit: edit must have consumed budget")
 	}
 }
 

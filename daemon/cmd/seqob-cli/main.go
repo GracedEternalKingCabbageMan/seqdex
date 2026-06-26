@@ -128,6 +128,16 @@ func cmdBook(args []string) {
 	}
 	fmt.Printf("order book %s/%s (%d offers)\n", *base, *quote, len(book.GetOffers()))
 	for _, o := range book.GetOffers() {
+		// SECURITY (ITEM B): the relay is untrusted and serves this list WITHOUT
+		// proving the maker signed each row, so a malicious relay can inject
+		// fabricated offers. Verify the maker's signature over every offer before
+		// displaying it as genuine; flag and skip any that fail (don't render a
+		// forged row as if it were a real resting offer).
+		if err := offer.VerifyOffer(o); err != nil {
+			fmt.Printf("  [UNVERIFIED: bad/missing maker_sig, skipping] id=%s maker=%s: %v\n",
+				o.GetOfferId(), short(o.GetMakerPubkey()), err)
+			continue
+		}
 		fmt.Printf("  %s  dir=%s base=%d  give %d %s  want %d %s  maker=%s\n",
 			o.GetOfferId(), shortDir(o.GetTradeDir()), o.GetBaseAmount(),
 			o.GetOfferAmount(), o.GetOfferAsset(), o.GetWantAmount(), o.GetWantAsset(),
@@ -177,6 +187,12 @@ func cmdLift(args []string) {
 	if target == nil {
 		fatal("offer %s by %s not found in %s/%s", *offerID, short(*makerPub), *base, *quote)
 	}
+	// SECURITY (unverified offers): the relay is untrusted, so verify the maker's
+	// signature over the served offer before acting on it. This rejects forged or
+	// tampered offers and makes target.MakerPubkey trustworthy for the E2E key.
+	if err := offer.VerifyOffer(target); err != nil {
+		fatal("offer %s failed maker signature verification (refusing to lift): %v", *offerID, err)
+	}
 	take := *amount
 	if take == 0 {
 		take = target.GetBaseAmount()
@@ -212,16 +228,22 @@ func cmdLift(args []string) {
 	sessionID := la.GetLiftAccepted().GetSessionId()
 	fmt.Printf("lift session %s opened for offer %s\n", sessionID, *offerID)
 
-	// The relay returns the maker's session pubkey (its offer key); seal the swap
-	// half to it. The maker is notified via From.lift_requested and derives the
-	// same E2E key from this taker's session pubkey.
-	peerPub := la.GetLiftAccepted().GetMakerSessionPubkey()
-	if len(peerPub) == 0 {
-		fatal("relay did not return a maker session pubkey")
-	}
-	pk, err := btcec.ParsePubKey(peerPub)
+	// SECURITY (relay MITM / CT leak): derive the E2E key from the maker pubkey in
+	// the SIGNED, VERIFIED offer (the maker's offer key doubles as its session
+	// key), NOT the relay's lift_accepted echo. A malicious relay could substitute
+	// MakerSessionPubkey with its own key and decrypt the confidential swap; the
+	// authentic value is already known from the offer, so the echo is only
+	// cross-checked, never trusted.
+	makerOfferPub, err := hex.DecodeString(target.GetMakerPubkey())
 	if err != nil {
-		fatal("parse maker pubkey: %v", err)
+		fatal("decode maker pubkey from offer: %v", err)
+	}
+	pk, err := btcec.ParsePubKey(makerOfferPub)
+	if err != nil {
+		fatal("parse maker pubkey from offer: %v", err)
+	}
+	if echo := la.GetLiftAccepted().GetMakerSessionPubkey(); len(echo) > 0 && !bytes.Equal(echo, makerOfferPub) {
+		fatal("relay MakerSessionPubkey echo does not match the signed offer's maker pubkey (possible MITM); aborting")
 	}
 	crypter, err := client.NewCrypter(takerKey, pk)
 	if err != nil {
