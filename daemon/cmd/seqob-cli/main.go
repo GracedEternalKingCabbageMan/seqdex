@@ -285,7 +285,7 @@ func buildTakerWallet(esploraURL, netName, takerPriv, takerBlinding string, conf
 		return &client.StubWallet{Name: "taker"}
 	}
 	net := selectNet(netName)
-	svc, err := esplora.NewService(esploraURL, 15)
+	svc, err := esplora.NewService(esploraURL, 15000) // esplora request timeout is in MILLISECONDS (15s)
 	if err != nil {
 		fatal("esplora: %v", err)
 	}
