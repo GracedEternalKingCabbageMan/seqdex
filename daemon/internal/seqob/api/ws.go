@@ -248,26 +248,38 @@ func (s *Server) wsOfferCancel(c *wsConn, cancel *seqobv1.OfferCancel) {
 }
 
 func (s *Server) wsStartLift(c *wsConn, sl *seqobv1.StartLift) {
+	// openLift -> Router.StartLift fires the notifyMaker hook, which binds the
+	// maker connection and delivers From.lift_requested (with the taker's session
+	// pubkey) BEFORE we reply to the taker. Bind the taker here so it can receive
+	// the maker's couriered reply.
 	sess, err := s.openLift(sl)
 	if err != nil {
 		c.sendErr(409, err.Error())
 		return
 	}
-	// Bind the taker (this connection) and pump frames destined for it.
 	s.attach(c, sess, session.RoleTaker)
 	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_LiftAccepted{LiftAccepted: &seqobv1.LiftAccepted{
-		SessionId: sess.ID, MakerSessionPubkey: sess.MakerSessionPubkey,
+		SessionId: sess.ID, MakerSessionPubkey: makerPubkeyBytes(sl.GetMakerPubkey()),
 	}}})
+}
 
-	// If the maker is online, bind it too and notify it of the new session.
-	// PHASE-1 LIMITATION: the From envelope has no dedicated "lift requested"
-	// variant carrying taker_session_pubkey, so a fully live maker handshake needs
-	// that added field; here we notify the maker via lift_accepted(session_id) and
-	// courier the (opaque) frames once both peers are attached.
-	if mc, ok := s.makerConns.get(sl.GetMakerPubkey()); ok && mc != c {
-		s.attach(mc, sess, session.RoleMaker)
-		_ = mc.send(&seqobv1.From{Msg: &seqobv1.From_LiftAccepted{LiftAccepted: &seqobv1.LiftAccepted{SessionId: sess.ID}}})
+// notifyMaker is the session.Router hook: when a taker lifts an offer, deliver a
+// From.lift_requested to the maker's live connection (if any) carrying the
+// taker's session pubkey, and bind the maker so it receives couriered frames.
+// The relay never decrypts; it only routes.
+func (s *Server) notifyMaker(sess *session.Session) {
+	mc, ok := s.makerConns.get(sess.MakerPubkey)
+	if !ok {
+		return
 	}
+	s.attach(mc, sess, session.RoleMaker)
+	_ = mc.send(&seqobv1.From{Msg: &seqobv1.From_LiftRequested{LiftRequested: &seqobv1.LiftRequested{
+		SessionId:          sess.ID,
+		OfferId:            sess.OfferID,
+		MakerPubkey:        sess.MakerPubkey,
+		TakeAmount:         sess.TakeAmount,
+		TakerSessionPubkey: sess.TakerSessionPubkey,
+	}}})
 }
 
 // attach records the connection's role in a session and starts a pump that

@@ -17,6 +17,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -50,7 +51,7 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Server{
+	srv := &Server{
 		store:     store,
 		validator: v,
 		sessions:  sessions,
@@ -62,6 +63,10 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 		},
 		makerConns: newConnRegistry(),
 	}
+	// The relay notifies an online maker (via From.lift_requested) whenever a taker
+	// lifts one of its offers, so the maker can derive the E2E key and co-sign.
+	sessions.SetNotifyMaker(srv.notifyMaker)
+	return srv
 }
 
 var jsonMarshal = protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
@@ -193,8 +198,19 @@ func (s *Server) handleLift(w http.ResponseWriter, r *http.Request) {
 	}
 	writeProto(w, &seqobv1.LiftAccepted{
 		SessionId:          sess.ID,
-		MakerSessionPubkey: sess.MakerSessionPubkey,
+		MakerSessionPubkey: makerPubkeyBytes(sl.GetMakerPubkey()),
 	})
+}
+
+// makerPubkeyBytes decodes a hex maker pubkey to the 33-byte compressed key the
+// taker seals its E2E payload to (the maker's offer key doubles as its session
+// key). Returns nil on a malformed key.
+func makerPubkeyBytes(hexPub string) []byte {
+	b, err := hex.DecodeString(hexPub)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // openLift validates the referenced offer is live and opens a session.

@@ -49,6 +49,30 @@ func TestStartLiftAndCourier(t *testing.T) {
 	}
 }
 
+func TestNotifyMakerHookFires(t *testing.T) {
+	r := newTestRouter(nil, nil, nil)
+	notified := make(chan *Session, 1)
+	r.SetNotifyMaker(func(s *Session) { notified <- s })
+	s, err := r.StartLift(OpenReq{
+		OfferID: "aaaa", MakerPubkey: "02pub", TakeAmount: 50,
+		TakerSessionPubkey: []byte{7, 7, 7},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-notified:
+		if got.ID != s.ID || got.OfferID != "aaaa" || got.TakeAmount != 50 {
+			t.Fatalf("notify carried wrong session: %+v", got)
+		}
+		if string(got.TakerSessionPubkey) != string([]byte{7, 7, 7}) {
+			t.Fatalf("notify missing taker session pubkey")
+		}
+	default:
+		t.Fatalf("expected notifyMaker to fire on StartLift")
+	}
+}
+
 func TestSendUnknownSession(t *testing.T) {
 	r := newTestRouter(nil, nil, nil)
 	if err := r.Send("nope", RoleTaker, []byte("x")); err == nil {

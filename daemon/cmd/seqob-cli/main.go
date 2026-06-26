@@ -197,16 +197,12 @@ func cmdLift(args []string) {
 	sessionID := la.GetLiftAccepted().GetSessionId()
 	fmt.Printf("lift session %s opened for offer %s\n", sessionID, *offerID)
 
-	// Resolve the peer key for E2E: the maker's ephemeral session key if provided,
-	// else fall back to the maker's static offer key (still relay-opaque).
+	// The relay returns the maker's session pubkey (its offer key); seal the swap
+	// half to it. The maker is notified via From.lift_requested and derives the
+	// same E2E key from this taker's session pubkey.
 	peerPub := la.GetLiftAccepted().GetMakerSessionPubkey()
 	if len(peerPub) == 0 {
-		pb, err := hex.DecodeString(*makerPub)
-		if err != nil {
-			fatal("bad maker pubkey: %v", err)
-		}
-		peerPub = pb
-		fmt.Println("(no live maker session key; sealing to the maker's offer key)")
+		fatal("relay did not return a maker session pubkey")
 	}
 	pk, err := btcec.ParsePubKey(peerPub)
 	if err != nil {

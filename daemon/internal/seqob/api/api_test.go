@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/client"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/session"
@@ -147,9 +148,9 @@ func TestWSSnapshotAndDelta(t *testing.T) {
 	}
 }
 
-func TestWSOpaqueCourier(t *testing.T) {
+func TestWSOpaqueCourierWithLiftNotification(t *testing.T) {
 	ts, _ := newServer(t)
-	mk := key(t)
+	mk := key(t) // maker's offer key doubles as its E2E session key
 	o := mkSignedOffer(t, mk, "aaaa")
 
 	// Maker connects via WS and submits the offer (registers as reachable).
@@ -160,34 +161,63 @@ func TestWSOpaqueCourier(t *testing.T) {
 		t.Fatalf("expected order_status after maker submit, got %+v", st)
 	}
 
-	// Taker connects and lifts the offer.
+	// Taker connects and lifts the offer with its ephemeral session pubkey.
+	tk := key(t)
 	takerConn := dialWS(t, ts)
 	defer takerConn.Close()
 	sendTo(t, takerConn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId: "aaaa", MakerPubkey: o.GetMakerPubkey(), TakeAmount: 50,
-		TakerSessionPubkey: []byte{9, 9, 9},
+		TakerSessionPubkey: tk.PubKey().SerializeCompressed(),
 	}}})
+
+	// Maker is notified via lift_requested carrying the TAKER's session pubkey.
+	mn := readFrom(t, makerConn)
+	lr := mn.GetLiftRequested()
+	if lr == nil {
+		t.Fatalf("expected lift_requested at maker, got %+v", mn)
+	}
+	if !bytes.Equal(lr.GetTakerSessionPubkey(), tk.PubKey().SerializeCompressed()) {
+		t.Fatalf("lift_requested did not carry the taker session pubkey")
+	}
+	sessionID := lr.GetSessionId()
+
+	// Taker gets lift_accepted carrying the maker's (offer) session pubkey.
 	la := readFrom(t, takerConn)
-	if la.GetLiftAccepted() == nil {
+	if la.GetLiftAccepted() == nil || la.GetLiftAccepted().GetSessionId() != sessionID {
 		t.Fatalf("expected lift_accepted, got %+v", la)
 	}
-	sessionID := la.GetLiftAccepted().GetSessionId()
-
-	// Maker should be notified of the new session.
-	mn := readFrom(t, makerConn)
-	if mn.GetLiftAccepted() == nil || mn.GetLiftAccepted().GetSessionId() != sessionID {
-		t.Fatalf("expected maker lift notification, got %+v", mn)
+	if !bytes.Equal(la.GetLiftAccepted().GetMakerSessionPubkey(), mk.PubKey().SerializeCompressed()) {
+		t.Fatalf("lift_accepted did not carry the maker offer pubkey as session key")
 	}
 
-	// Taker couriers an opaque ciphertext; maker must receive it verbatim.
-	cipher := []byte("opaque-sealed-swap-request")
-	sendTo(t, takerConn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sessionID, Ciphertext: cipher}}})
+	// Real E2E: taker seals to the maker's offer key; the relay couriers opaque
+	// bytes; the maker opens with its offer key + the taker's session pubkey.
+	makerPub, _ := btcec.ParsePubKey(la.GetLiftAccepted().GetMakerSessionPubkey())
+	takerCrypter, _ := client.NewCrypter(tk, makerPub)
+	takerPub, _ := btcec.ParsePubKey(lr.GetTakerSessionPubkey())
+	makerCrypter, _ := client.NewCrypter(mk, takerPub)
+
+	plaintext := []byte("confidential SwapRequest plaintext")
+	sealed, err := takerCrypter.Seal(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendTo(t, takerConn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sessionID, Ciphertext: sealed}}})
+
 	relayed := readFrom(t, makerConn)
-	if relayed.GetSwapMsg() == nil || !bytes.Equal(relayed.GetSwapMsg().GetCiphertext(), cipher) {
-		t.Fatalf("maker did not receive the opaque ciphertext, got %+v", relayed)
+	if relayed.GetSwapMsg() == nil || relayed.GetSwapMsg().GetSessionId() != sessionID {
+		t.Fatalf("maker did not receive the courier frame, got %+v", relayed)
 	}
-	if relayed.GetSwapMsg().GetSessionId() != sessionID {
-		t.Fatalf("courier session id mismatch")
+	// Relay carried only ciphertext (it never saw the plaintext).
+	if bytes.Equal(relayed.GetSwapMsg().GetCiphertext(), plaintext) {
+		t.Fatalf("relay must courier ciphertext, not plaintext")
+	}
+	opened, err := makerCrypter.Open(relayed.GetSwapMsg().GetCiphertext())
+	if err != nil {
+		t.Fatalf("maker could not open the couriered payload: %v", err)
+	}
+	if !bytes.Equal(opened, plaintext) {
+		t.Fatalf("E2E round-trip mismatch: %q", opened)
 	}
 }
 
