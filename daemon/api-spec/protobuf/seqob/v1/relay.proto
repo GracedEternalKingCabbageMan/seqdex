@@ -44,10 +44,23 @@ message StartLift {
 }
 
 // Relay confirms a lift session is open and binds the two peers. Carries the
-// maker's ephemeral session pubkey so both sides can derive the E2E key.
+// maker's session pubkey (the maker's offer key, which the taker already knows)
+// so the taker can derive the E2E key and seal its swap half to it.
 message LiftAccepted {
   string session_id          = 1;
   bytes  maker_session_pubkey = 2;
+}
+
+// Relay -> maker: a taker has lifted one of the maker's resting offers. Carries
+// the taker's session pubkey so the maker can derive the E2E key (ECDH with the
+// maker's offer key) and open the taker's sealed SwapRequest, plus the lift
+// terms. The relay only notifies; it never decrypts or holds anything.
+message LiftRequested {
+  string session_id          = 1;
+  string offer_id            = 2;
+  string maker_pubkey        = 3;
+  uint64 take_amount         = 4;
+  bytes  taker_session_pubkey = 5;
 }
 
 // Opaque end-to-end-encrypted swap-session payload (review B1). The relay routes
@@ -106,6 +119,7 @@ message From {
     Offer        public_order_created = 106; // delta
     OfferRef     public_order_removed = 107; // delta
     LiftAccepted lift_accepted        = 142;
+    LiftRequested lift_requested      = 143; // relay -> maker: a taker lifted your offer
     SwapMsg      swap_msg             = 131; // opaque courier passthrough
     OrderStatus  order_status         = 160;
     GenericError error                = 200;

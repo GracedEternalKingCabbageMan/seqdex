@@ -84,15 +84,22 @@ func (s *Session) SettleTxid() string {
 
 // Router owns all live lift sessions.
 type Router struct {
-	mu       sync.Mutex
-	sessions map[string]*Session
-	deadline time.Duration
-	reorg    ReorgWatcher
-	onReopen func(*Session) // re-open the order (reorg orphan / abort / deadline)
-	now      func() time.Time
-	idFn     func() string
-	inboxBuf int
+	mu          sync.Mutex
+	sessions    map[string]*Session
+	deadline    time.Duration
+	reorg       ReorgWatcher
+	onReopen    func(*Session) // re-open the order (reorg orphan / abort / deadline)
+	notifyMaker func(*Session) // notify the maker a taker lifted its offer
+	now         func() time.Time
+	idFn        func() string
+	inboxBuf    int
 }
+
+// SetNotifyMaker installs the hook StartLift calls to notify the maker (over its
+// live transport) that a taker has lifted one of its offers. The api layer wires
+// this to deliver a From.lift_requested to the maker's WS connection. Set once at
+// startup, before serving.
+func (r *Router) SetNotifyMaker(fn func(*Session)) { r.notifyMaker = fn }
 
 // Options configures a Router.
 type Options struct {
@@ -162,6 +169,11 @@ func (r *Router) StartLift(req OpenReq) (*Session, error) {
 	r.mu.Lock()
 	r.sessions[s.ID] = s
 	r.mu.Unlock()
+	// Notify the maker (if online) so it can derive the E2E key from the taker's
+	// session pubkey and co-sign. The relay only notifies; it never decrypts.
+	if r.notifyMaker != nil {
+		r.notifyMaker(s)
+	}
 	return s, nil
 }
 
