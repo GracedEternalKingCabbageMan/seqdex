@@ -92,6 +92,10 @@ const (
 	XchainWalletKey = "XCHAIN_WALLET"
 	// XchainSeqAssetKey: the SEQ-side asset id (hex) the maker offers.
 	XchainSeqAssetKey = "XCHAIN_SEQ_ASSET"
+	// XchainMarketsKey: optional JSON array of BTC<->asset markets the maker
+	// offers, e.g. [{"seq_asset":"<hex>","name":"BTC/GOLD","price_seq_per_btc":27.2,"fee_bps":50}].
+	// When set it takes precedence over the single XCHAIN_SEQ_ASSET market.
+	XchainMarketsKey = "XCHAIN_MARKETS"
 	// XchainPriceSeqPerBtcKey: SEQ atoms given per BTC atom (maker ask).
 	XchainPriceSeqPerBtcKey = "XCHAIN_PRICE_SEQ_PER_BTC"
 	// XchainFeeBpsKey: maker fee in basis points charged on the BTC leg.
