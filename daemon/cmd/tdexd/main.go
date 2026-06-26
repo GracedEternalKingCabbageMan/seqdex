@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -52,7 +53,7 @@ var (
 
 	// Cross-chain (XchainService) maker; nil unless XCHAIN_PARENT_RPC is set.
 	xchainSvc                                                   *xchainmaker.Service
-	xchainParentRPC, xchainSeqRPC, xchainWallet, xchainSeqAsset string
+	xchainParentRPC, xchainSeqRPC, xchainWallet, xchainSeqAsset, xchainMarkets string
 	xchainParentKind, xchainParentChain                         string
 	xchainPriceSeqPerBtc                                        float64
 	xchainFeeBps, xchainSpendFee                                uint64
@@ -181,6 +182,7 @@ func loadConfig() error {
 	xchainSeqRPC = config.GetString(config.XchainSeqRPCKey)
 	xchainWallet = config.GetString(config.XchainWalletKey)
 	xchainSeqAsset = config.GetString(config.XchainSeqAssetKey)
+	xchainMarkets = config.GetString(config.XchainMarketsKey)
 	xchainPriceSeqPerBtc = config.GetFloat(config.XchainPriceSeqPerBtcKey)
 	xchainFeeBps = uint64(config.GetInt(config.XchainFeeBpsKey))
 	xchainSpendFee = uint64(config.GetInt(config.XchainSpendFeeKey))
@@ -215,8 +217,8 @@ func newXchainService() (*xchainmaker.Service, error) {
 	if xchainSeqRPC == "" {
 		return nil, fmt.Errorf("%s is set but %s is missing", config.XchainParentRPCKey, config.XchainSeqRPCKey)
 	}
-	if xchainSeqAsset == "" {
-		return nil, fmt.Errorf("%s is set but %s is missing (the SEQ-side asset the maker offers)", config.XchainParentRPCKey, config.XchainSeqAssetKey)
+	if xchainSeqAsset == "" && xchainMarkets == "" {
+		return nil, fmt.Errorf("%s is set but neither %s nor %s is provided (the SEQ-side asset(s) the maker offers)", config.XchainParentRPCKey, config.XchainSeqAssetKey, config.XchainMarketsKey)
 	}
 
 	btcRPC, err := rpcFromURL(xchainParentRPC)
@@ -229,15 +231,48 @@ func newXchainService() (*xchainmaker.Service, error) {
 	}
 	seq := xchain.NewChain(seqRPC, xchainWallet)
 
-	cfg := xchainmaker.Config{
-		SEQ:         seq,
-		CoinDivisor: 1e8,
-		Markets: []xchainmaker.Market{{
+	// Build the maker's market list: a JSON XCHAIN_MARKETS array (BTC<->many assets)
+	// takes precedence; otherwise the single XCHAIN_SEQ_ASSET market (back-compat).
+	var markets []xchainmaker.Market
+	if xchainMarkets != "" {
+		var defs []struct {
+			SeqAsset       string  `json:"seq_asset"`
+			Name           string  `json:"name"`
+			PriceSeqPerBtc float64 `json:"price_seq_per_btc"`
+			FeeBps         uint64  `json:"fee_bps"`
+		}
+		if jerr := json.Unmarshal([]byte(xchainMarkets), &defs); jerr != nil {
+			return nil, fmt.Errorf("%s: invalid JSON: %w", config.XchainMarketsKey, jerr)
+		}
+		for _, d := range defs {
+			if d.SeqAsset == "" || d.PriceSeqPerBtc <= 0 {
+				return nil, fmt.Errorf("%s: each entry needs seq_asset and a positive price_seq_per_btc", config.XchainMarketsKey)
+			}
+			fee := d.FeeBps
+			if fee == 0 {
+				fee = xchainFeeBps
+			}
+			name := d.Name
+			if name == "" {
+				name = "BTC/" + d.SeqAsset[:8]
+			}
+			markets = append(markets, xchainmaker.Market{
+				SeqAsset: d.SeqAsset, Name: name, PriceSeqPerBtc: d.PriceSeqPerBtc, FeeBps: fee,
+			})
+		}
+	} else {
+		markets = []xchainmaker.Market{{
 			SeqAsset:       xchainSeqAsset,
 			Name:           "BTC/SEQ-ASSET",
 			PriceSeqPerBtc: xchainPriceSeqPerBtc,
 			FeeBps:         xchainFeeBps,
-		}},
+		}}
+	}
+
+	cfg := xchainmaker.Config{
+		SEQ:              seq,
+		CoinDivisor:      1e8,
+		Markets:          markets,
 		QuoteTTL:         2 * time.Minute,
 		BtcLocktimeDelta: xchainBtcLocktimeDelta,
 		SeqLocktimeDelta: xchainSeqLocktimeDelta,
