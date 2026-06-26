@@ -75,6 +75,11 @@ func (c *rpcClient) call(
 	if err != nil {
 		return nil, err
 	}
+	// A 200 response can still carry a JSON-RPC error (result null, error set);
+	// surface it so callers never type-assert a nil result into a string/map.
+	if resp.Err != nil {
+		return nil, fmt.Errorf("method %s returned error: %v", method, resp.Err)
+	}
 	var out interface{}
 	err = json.Unmarshal(resp.Result, &out)
 	if err != nil {
@@ -114,11 +119,28 @@ func (c *rpcClient) handleRPCRequest(
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
+		// The node does not always return a JSON {"error":{"message":...}} body on
+		// a non-200 response: under load Elements/Sequentia replies with a plain
+		// "Work queue depth exceeded" (HTTP 500), and proxies/timeouts can yield
+		// other non-JSON bodies. Extract the message defensively and fall back to
+		// the raw body, never asserting on a possibly-nil field. The previous
+		// out["error"]["message"].(string) panicked on those bodies and crashed the
+		// whole wallet, which systemd then restarted into a fresh full re-scan,
+		// re-overloading the node in a crash loop.
+		msg := strings.TrimSpace(string(data))
 		out := map[string]map[string]interface{}{}
-		json.Unmarshal(data, &out)
+		if json.Unmarshal(data, &out) == nil {
+			if e, ok := out["error"]; ok {
+				if m, ok := e["message"].(string); ok && m != "" {
+					msg = m
+				}
+			}
+		}
+		if msg == "" {
+			msg = resp.Status
+		}
 		err = fmt.Errorf(
-			"method %s failed with error: %s",
-			method, out["error"]["message"].(string),
+			"method %s failed with status %d: %s", method, resp.StatusCode, msg,
 		)
 		status = resp.StatusCode
 		return
