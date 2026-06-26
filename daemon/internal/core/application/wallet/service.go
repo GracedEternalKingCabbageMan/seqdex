@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sync"
 
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
@@ -272,6 +273,35 @@ func (s *Service) CompleteSwap(
 		})
 	}
 
+	// Open fee market (taker-funded network fee): detect an explicit, empty-script
+	// Elements fee output the taker added to the swap PSET, in any asset. When
+	// present the maker validates it below and adds NO fee output of its own.
+	// Exactly one is allowed (more would under-state the fee); a fee in the
+	// received asset (assetR) is rejected — it would inflate the assetR sum the
+	// price/amount checks compare to amount_r and let the taker skim the maker.
+	takerFeeAsset := ""
+	var takerFeeValue uint64
+	emptyScriptOuts := 0
+	for _, out := range ptx.Outputs {
+		if len(out.Script) == 0 {
+			emptyScriptOuts++
+			takerFeeAsset = hex.EncodeToString(elementsutil.ReverseBytes(out.Asset))
+			takerFeeValue = out.Value
+		}
+	}
+	if emptyScriptOuts > 1 {
+		return "", nil, -1, fmt.Errorf(
+			"swap request carries %d fee outputs; at most one is allowed",
+			emptyScriptOuts,
+		)
+	}
+	takerFundsFee := emptyScriptOuts == 1
+	if takerFundsFee && takerFeeAsset == swapRequest.GetAssetR() {
+		return "", nil, -1, fmt.Errorf(
+			"swap fee output cannot be denominated in the received asset",
+		)
+	}
+
 	amountR := swapRequest.GetAmountR()
 	if swapRequest.GetFeeAsset() == swapRequest.GetAssetR() && !feesToAdd {
 		amountR -= swapRequest.GetFeeAmount()
@@ -325,87 +355,142 @@ func (s *Service) CompleteSwap(
 
 	allInputs := append(existingInputs, inputs...)
 	allOutputs := append(existingOutputs, outputs...)
-	dummyFeeAmount, err := txManager.EstimateFees(
-		ctx, allInputs, allOutputs, msatsPerByte,
-	)
-	if err != nil {
-		return "", nil, -1, err
-	}
 
-	// 150 is an over estimation of an extra confidential output (change).
-	dummyFeeAmount += 150
+	// feeUtxos are the maker's fee-funding UTXOs in the maker-funded path; they
+	// stay nil in the taker-funded path (the taker supplied the fee input +
+	// output itself) so the append at the end of CompleteSwap is a no-op.
+	var feeUtxos []ports.Utxo
 
-	// Open fee market: pay the network fee in the asset already being
-	// transacted (assetR), valued native-equivalent, rather than always
-	// subsidising it in the native asset from the fee account. No asset is
-	// privileged. If assetR isn't fee-eligible (not on the node's whitelist, or
-	// no node RPC configured), fall back to the native asset + fee account so
-	// swaps never break.
-	nativeAsset := s.staticInfo.GetNativeAsset()
-	feeAssetNet := swapRequest.GetAssetR()
-	feeRate, eligible := s.feeExchangeRate(feeAssetNet)
-	feeFundAccount := account
-	if !eligible {
-		feeAssetNet = nativeAsset
-		feeRate = exchangeRateScale
-		feeFundAccount = domain.FeeAccount
-	} else if feeAssetNet == nativeAsset {
-		// Preserve today's behavior: the native fee is funded from the
-		// dedicated fee account, not the market account.
-		feeFundAccount = domain.FeeAccount
-	}
-
-	// Convert the required native-equivalent fee into feeAssetNet (round UP).
-	dummyFeeInAsset := feeInAsset(dummyFeeAmount, feeRate)
-	feeUtxos, change, _, err := txManager.SelectUtxos(
-		ctx, feeFundAccount, feeAssetNet, dummyFeeInAsset,
-	)
-	if err != nil {
-		return "", nil, -1, err
-	}
-
-	for _, u := range feeUtxos {
-		txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
-		inputs = append(inputs, input{txid, u.GetIndex(), u.GetScript(), 0, 0})
-	}
-	feeAmount := dummyFeeAmount     // native-equivalent fee (atoms)
-	feeNetAmount := dummyFeeInAsset // fee vout value, denominated in feeAssetNet
-	if change > 0 {
-		addresses, err := accountManager.DeriveChangeAddresses(
-			ctx, feeFundAccount, 1,
-		)
-		if err != nil {
-			return "", nil, -1, err
+	if takerFundsFee {
+		// Taker-funded network fee: the explicit fee output is already in the swap
+		// PSET (it's in existingOutputs/allOutputs). Validate the fee asset is
+		// fee-eligible and its node-floor native-equivalent covers the size-based
+		// fee for the FINAL transaction, then add no maker fee input/output.
+		rate, eligible := s.feeExchangeRate(takerFeeAsset)
+		if !eligible {
+			return "", nil, -1, fmt.Errorf(
+				"taker network-fee asset %s is not fee-eligible", takerFeeAsset,
+			)
 		}
-		info, _ := seqnet.FromConfidential(addresses[0], &net)
-		outputs = append(outputs, output{
-			feeAssetNet, change, hex.EncodeToString(info.Script),
-			outBlindKey(info.BlindingKey),
-		})
-
-		allInputs := append(existingInputs, inputs...)
-		allOutputs := append(existingOutputs, outputs...)
-		feeAmount, err = txManager.EstimateFees(
+		// Every taker input must be revealed: BlindPset is the last blinder and
+		// cannot balance a confidential input whose secrets it does not have.
+		revealed := make(map[uint32]bool)
+		for _, ui := range swapRequest.GetUnblindedInputs() {
+			revealed[ui.GetIndex()] = true
+		}
+		for i := range existingInputs {
+			if !revealed[uint32(i)] {
+				return "", nil, -1, fmt.Errorf(
+					"taker input %d missing from unblinded_inputs", i,
+				)
+			}
+		}
+		requiredFee, err := txManager.EstimateFees(
 			ctx, allInputs, allOutputs, msatsPerByte,
 		)
 		if err != nil {
 			return "", nil, -1, err
 		}
-		feeNetAmount = feeInAsset(feeAmount, feeRate)
-
-		changeOut := outputs[len(outputs)-1]
-		changeOutScript := changeOut.(output).script
-		changeOutBlindKey := changeOut.(output).blindKey
-		// Refund the over-estimation (in feeAssetNet) back to the change output.
-		diff := dummyFeeInAsset - feeNetAmount
-		amount := changeOut.GetAmount() + diff
-		outputs[len(outputs)-1] = output{
-			changeOut.GetAsset(), amount, changeOutScript, changeOutBlindKey,
+		// Node-floor valuation, matching the network's
+		// native_equivalent = value * rate / exchange_rate_scale (integer floor):
+		// require takerFeeValue*rate >= requiredFee*exchangeRateScale. big.Int
+		// keeps the multiplication overflow-safe.
+		haveFee := new(big.Int).Mul(
+			new(big.Int).SetUint64(takerFeeValue), new(big.Int).SetUint64(rate),
+		)
+		needFee := new(big.Int).Mul(
+			new(big.Int).SetUint64(requiredFee), big.NewInt(exchangeRateScale),
+		)
+		if haveFee.Cmp(needFee) < 0 {
+			return "", nil, -1, fmt.Errorf(
+				"taker network fee too low: %d atoms of %s do not cover the %d-atom native fee",
+				takerFeeValue, takerFeeAsset, requiredFee,
+			)
 		}
-	}
+	} else {
+		dummyFeeAmount, err := txManager.EstimateFees(
+			ctx, allInputs, allOutputs, msatsPerByte,
+		)
+		if err != nil {
+			return "", nil, -1, err
+		}
 
-	// Exactly one explicit/unblinded Elements fee output, in feeAssetNet.
-	outputs = append(outputs, output{feeAssetNet, feeNetAmount, "", ""})
+		// 150 is an over estimation of an extra confidential output (change).
+		dummyFeeAmount += 150
+
+		// Open fee market: pay the network fee in the asset already being
+		// transacted (assetR), valued native-equivalent, rather than always
+		// subsidising it in the native asset from the fee account. No asset is
+		// privileged. If assetR isn't fee-eligible (not on the node's whitelist, or
+		// no node RPC configured), fall back to the native asset + fee account so
+		// swaps never break.
+		nativeAsset := s.staticInfo.GetNativeAsset()
+		feeAssetNet := swapRequest.GetAssetR()
+		feeRate, eligible := s.feeExchangeRate(feeAssetNet)
+		feeFundAccount := account
+		if !eligible {
+			feeAssetNet = nativeAsset
+			feeRate = exchangeRateScale
+			feeFundAccount = domain.FeeAccount
+		} else if feeAssetNet == nativeAsset {
+			// Preserve today's behavior: the native fee is funded from the
+			// dedicated fee account, not the market account.
+			feeFundAccount = domain.FeeAccount
+		}
+
+		// Convert the required native-equivalent fee into feeAssetNet (round UP).
+		dummyFeeInAsset := feeInAsset(dummyFeeAmount, feeRate)
+		var change uint64
+		feeUtxos, change, _, err = txManager.SelectUtxos(
+			ctx, feeFundAccount, feeAssetNet, dummyFeeInAsset,
+		)
+		if err != nil {
+			return "", nil, -1, err
+		}
+
+		for _, u := range feeUtxos {
+			txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
+			inputs = append(inputs, input{txid, u.GetIndex(), u.GetScript(), 0, 0})
+		}
+		feeAmount := dummyFeeAmount     // native-equivalent fee (atoms)
+		feeNetAmount := dummyFeeInAsset // fee vout value, denominated in feeAssetNet
+		if change > 0 {
+			addresses, err := accountManager.DeriveChangeAddresses(
+				ctx, feeFundAccount, 1,
+			)
+			if err != nil {
+				return "", nil, -1, err
+			}
+			info, _ := seqnet.FromConfidential(addresses[0], &net)
+			outputs = append(outputs, output{
+				feeAssetNet, change, hex.EncodeToString(info.Script),
+				outBlindKey(info.BlindingKey),
+			})
+
+			allInputs := append(existingInputs, inputs...)
+			allOutputs := append(existingOutputs, outputs...)
+			feeAmount, err = txManager.EstimateFees(
+				ctx, allInputs, allOutputs, msatsPerByte,
+			)
+			if err != nil {
+				return "", nil, -1, err
+			}
+			feeNetAmount = feeInAsset(feeAmount, feeRate)
+
+			changeOut := outputs[len(outputs)-1]
+			changeOutScript := changeOut.(output).script
+			changeOutBlindKey := changeOut.(output).blindKey
+			// Refund the over-estimation (in feeAssetNet) back to the change output.
+			diff := dummyFeeInAsset - feeNetAmount
+			amount := changeOut.GetAmount() + diff
+			outputs[len(outputs)-1] = output{
+				changeOut.GetAsset(), amount, changeOutScript, changeOutBlindKey,
+			}
+		}
+
+		// Exactly one explicit/unblinded Elements fee output, in feeAssetNet.
+		outputs = append(outputs, output{feeAssetNet, feeNetAmount, "", ""})
+	}
 
 	pset, err := txManager.UpdatePset(
 		ctx, swapRequest.GetTransaction(), inputs, outputs,
