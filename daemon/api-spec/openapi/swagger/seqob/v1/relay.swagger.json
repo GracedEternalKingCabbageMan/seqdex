@@ -1,0 +1,45 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "seqob/v1/relay.proto",
+    "description": "SeqOB relay wire protocol. The relay is a non-custodial matchmaker + message\ncourier: it stores signed offers, serves the per-pair book (snapshot + deltas),\nand pipes opaque, end-to-end-encrypted swap-session messages between two peers.\nIt never holds keys, never signs, never blinds, never holds a spendable PSET,\nnever broadcasts user funds, and never decrypts the courier payload.",
+    "version": "version not set"
+  },
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {},
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    }
+  }
+}

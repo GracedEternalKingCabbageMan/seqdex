@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+// SeqOB relay wire protocol. The relay is a non-custodial matchmaker + message
+// courier: it stores signed offers, serves the per-pair book (snapshot + deltas),
+// and pipes opaque, end-to-end-encrypted swap-session messages between two peers.
+// It never holds keys, never signs, never blinds, never holds a spendable PSET,
+// never broadcasts user funds, and never decrypts the courier payload.
+package seqob.v1;
+
+import "seqob/v1/offer.proto";
+
+message Empty {}
+
+message OfferRef {
+  string offer_id     = 1;
+  string maker_pubkey = 2;
+}
+
+message Market {
+  AssetPair pair       = 1;
+  double best_bid      = 2;
+  double best_ask      = 3;
+  double last_price    = 4;
+  uint64 n_orders      = 5;
+}
+
+message MarketList { repeated Market markets = 1; }
+
+// Per-pair order book.
+message PublicBook {
+  AssetPair pair        = 1;
+  repeated Offer offers = 2; // signed; any client can verify independently
+}
+
+// A taker lifts a chosen resting offer. taker_session_pubkey is the ephemeral key
+// the maker encrypts the swap-session payload to (and vice versa), so the relay
+// only ever couriers ciphertext.
+message StartLift {
+  string offer_id            = 1;
+  string maker_pubkey        = 2;
+  uint64 take_amount         = 3; // base atoms; <= base_amount (partial if allow_partial)
+  string taker_fee_asset     = 4; // open fee market (Principle 4)
+  bytes  taker_session_pubkey = 5;
+}
+
+// Relay confirms a lift session is open and binds the two peers. Carries the
+// maker's ephemeral session pubkey so both sides can derive the E2E key.
+message LiftAccepted {
+  string session_id          = 1;
+  bytes  maker_session_pubkey = 2;
+}
+
+// Opaque end-to-end-encrypted swap-session payload (review B1). The relay routes
+// ciphertext by session_id between the two peers; it does NOT decrypt, parse, or
+// introspect it, so confidential amounts and blinders never reach the relay.
+// The plaintext is an inner seqdex swap.proto message (SwapRequest / SwapAccept /
+// SwapComplete) for same-chain, or HTLC leg notices for cross-chain.
+message SwapMsg {
+  string session_id = 1;
+  bytes  ciphertext = 2;
+}
+
+enum OfferStatus {
+  OFFER_STATUS_UNSPECIFIED      = 0;
+  OFFER_STATUS_OPEN             = 1;
+  OFFER_STATUS_PARTIAL          = 2;
+  OFFER_STATUS_FILLED           = 3; // only after the settling tx reaches min_anchor_depth Bitcoin confs
+  OFFER_STATUS_CANCELLED        = 4;
+  OFFER_STATUS_EXPIRED          = 5;
+  OFFER_STATUS_UTXO_INVALIDATED = 6; // maker could not co-sign (coins moved); dropped, no on-chain cost
+}
+
+message OrderStatus {
+  string offer_id      = 1;
+  string maker_pubkey  = 2;
+  OfferStatus status   = 3;
+  uint64 active_amount = 4; // remaining base atoms after partials
+  string settle_txid   = 5; // set when settling; FILLED only after anchor depth
+  uint32 anchor_confs  = 6; // Bitcoin-anchor confirmations of settle_txid so far
+}
+
+message GenericError {
+  uint32 code = 1;
+  string message = 2;
+}
+
+// client -> relay
+message To {
+  oneof msg {
+    AssetPair   market_subscribe   = 100;
+    AssetPair   market_unsubscribe = 101;
+    Offer       offer_submit       = 102;
+    Offer       offer_edit         = 103; // re-signed, same offer_id
+    OfferCancel offer_cancel       = 104;
+    StartLift   start_lift         = 113;
+    SwapMsg     swap_msg           = 130; // opaque courier passthrough
+    Empty       list_markets       = 150;
+  }
+}
+
+// relay -> client
+message From {
+  oneof msg {
+    MarketList   market_list          = 150;
+    PublicBook   public_book          = 105; // snapshot
+    Offer        public_order_created = 106; // delta
+    OfferRef     public_order_removed = 107; // delta
+    LiftAccepted lift_accepted        = 142;
+    SwapMsg      swap_msg             = 131; // opaque courier passthrough
+    OrderStatus  order_status         = 160;
+    GenericError error                = 200;
+  }
+}

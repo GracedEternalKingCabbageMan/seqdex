@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+// SeqOB — the Sequentia peer-to-peer order-book DEX wire schema.
+//
+// A resting offer is a SIGNED price/size/expiry intent, never a PSET and never
+// named UTXOs (online orders). The settlement transaction (same-chain) or HTLC
+// legs (cross-chain / Lightning) are built only at lift time, so the joint
+// confidential blinding can use both parties' data. The non-custodial relay
+// stores and serves these signed offers; it never holds funds.
+package seqob.v1;
+
+message AssetPair {
+  string base_asset  = 1; // hex asset id; for cross-chain/LN one side is the BTC sentinel id
+  string quote_asset = 2;
+}
+
+enum TradeDir {
+  TRADE_DIR_UNSPECIFIED = 0;
+  TRADE_DIR_SELL = 1; // maker sells base
+  TRADE_DIR_BUY  = 2; // maker buys base
+}
+
+// Offer is the signed, self-contained intent. The authoritative exchange ratio
+// is want_amount/offer_amount (integers); there is deliberately no float price
+// field in the signed bytes (clients derive a display price). Offers are keyed
+// by (maker_pubkey, offer_id), so offer_id need only be unique per maker.
+message Offer {
+  string offer_id        = 1;
+  uint32 schema_version  = 2;  // = 1
+  AssetPair pair         = 3;
+  TradeDir trade_dir     = 4;
+
+  uint64 base_amount     = 5;  // total size in base atoms
+  uint64 offer_amount    = 6;  // exact atoms the maker gives
+  string offer_asset     = 7;  // hex (= base or quote per trade_dir)
+  uint64 want_amount     = 8;  // exact atoms the maker wants in return
+  string want_asset      = 9;  // hex
+  bool   allow_partial   = 10;
+  uint64 min_fill        = 11; // min base atoms per lift (anti-dust)
+
+  uint64 created_at_unix = 12;
+  uint64 expires_at_unix = 13; // mandatory; a suppressed cancel self-heals when this passes
+
+  string maker_pubkey    = 14; // 33-byte compressed hex; offer identity + signing key
+  string fee_asset_hint  = 15; // open fee market: hint only, never privileged (Principle 4)
+
+  // Anchor-depth finality (shared by cross-chain + Lightning settlement): the
+  // Bitcoin-anchor confirmations the MAKER wants on a settling tx before the order
+  // is marked FILLED. Per-offer, MAKER-controlled, DEFAULT 0 — the DEX is
+  // 0-conf-tolerant and does NOT enforce a floor (users self-protect; exchanges /
+  // PoS set their own depth, ~3 anchor confs). Principle 1 still holds (a Sequentia
+  // tx is only as final as its Bitcoin anchor): the DEX surfaces that HONESTLY
+  // (anchor-aware finality, never "final" at 0-conf) and re-opens an order if its
+  // settling tx's anchor is later orphaned (book consistency, not a wait). Makers
+  // raise this for their own cross-chain atomicity safety.
+  uint32 min_anchor_depth = 16;
+
+  // Reserved for Lightning (unset/ignored before LN phases): the maker's LN
+  // endpoint. Declared now so adding LN is additive, not a schema migration.
+  string maker_ln_node_pubkey = 17;
+  repeated string ln_connect_hints = 18;
+
+  // Settlement variant. Reserved field numbers keep future variants additive.
+  oneof settlement {
+    SameChainTerms  same_chain  = 20;
+    CrossChainTerms cross_chain = 21;
+    LightningTerms  lightning   = 22; // reserved; not implemented before LN phases
+  }
+
+  // secp256k1 signature by maker_pubkey over the canonical serialization of all
+  // fields above INCLUDING the whole settlement oneof, so every (current and
+  // future) settlement variant is authenticated by construction.
+  bytes maker_sig = 31;
+}
+
+message SameChainTerms {
+  string maker_recv_address = 1; // confidential address where the taker pays want_asset
+  string maker_blinding_pub = 2; // lets the taker blind the maker's output
+}
+
+message CrossChainTerms {
+  string btc_sentinel       = 1; // which leg is BTC
+  string maker_claim_pub    = 2;
+  string maker_refund_pub   = 3;
+  uint32 maker_leg_locktime = 4; // maker's CLTV (longer leg if maker funds BTC)
+  string maker_recv_address = 5;
+  uint32 direction          = 6; // 0 = BTC_TO_ASSET, 1 = ASSET_TO_BTC
+}
+
+// Reserved for the LN/submarine-swap phases. Defined now for additive evolution;
+// no relay or settlement code consumes it in the on-chain phases.
+message LightningTerms {
+  uint32 ln_direction              = 1; // 0 = ASSET_ONCHAIN_FOR_BTC_LN, 1 = BTC_LN_FOR_ASSET_ONCHAIN
+  bytes  maker_claim_pub           = 2;
+  bytes  maker_refund_pub          = 3;
+  uint32 onchain_cltv              = 4; // CLTV on the asset HTLC (shorter leg)
+  bool   maker_issues_hold_invoice = 5;
+  uint64 max_0conf_amount          = 6; // per-offer 0-conf cap for the on-chain leg
+}
+
+// A signed cancel. nonce defeats replay against a re-posted same offer_id.
+message OfferCancel {
+  string offer_id     = 1;
+  string maker_pubkey = 2;
+  uint64 nonce        = 3;
+  bytes  sig          = 4; // by maker_pubkey over {offer_id, maker_pubkey, nonce}
+}
