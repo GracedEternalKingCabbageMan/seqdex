@@ -95,7 +95,7 @@ func (s *Service) TradePropose(
 	}
 
 	signedPset, selectedUtxos, tradeExpiryTime, err := s.wallet.CompleteSwap(
-		mkt.Name, swapRequest, s.milliSatsPerByte, feesToAdd,
+		mkt.Name, swapRequest, s.milliSatsPerByte, feesToAdd, true,
 	)
 	if err != nil {
 		log.WithError(err).Warn("failed to complete swap request")

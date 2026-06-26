@@ -226,9 +226,19 @@ func (s *Service) SendToMany(
 
 func (s *Service) CompleteSwap(
 	account string, swapRequest ports.SwapRequest, msatsPerByte uint64,
-	feesToAdd bool,
+	feesToAdd bool, blind bool,
 ) (string, []ports.Utxo, int64, error) {
 	ctx := context.Background()
+	// Confidential is opt-in in Sequentia: blind=false finalizes an EXPLICIT
+	// swap (the maker's own outputs carry no blinding key and BlindPset is
+	// skipped). blind=true reproduces today's fully-confidential behavior
+	// byte-for-byte; the Elements network fee output is always explicit.
+	outBlindKey := func(bk []byte) string {
+		if !blind {
+			return ""
+		}
+		return hex.EncodeToString(bk)
+	}
 	net := s.Network()
 	txManager := s.wallet.Transaction()
 	accountManager := s.wallet.Account()
@@ -298,7 +308,7 @@ func (s *Service) CompleteSwap(
 	outputs := []ports.TxOutput{
 		output{
 			swapRequest.GetAssetP(), amountP,
-			hex.EncodeToString(info.Script), hex.EncodeToString(info.BlindingKey),
+			hex.EncodeToString(info.Script), outBlindKey(info.BlindingKey),
 		},
 	}
 	if change > 0 {
@@ -309,7 +319,7 @@ func (s *Service) CompleteSwap(
 		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
 			swapRequest.GetAssetR(), change, hex.EncodeToString(info.Script),
-			hex.EncodeToString(info.BlindingKey),
+			outBlindKey(info.BlindingKey),
 		})
 	}
 
@@ -370,7 +380,7 @@ func (s *Service) CompleteSwap(
 		info, _ := seqnet.FromConfidential(addresses[0], &net)
 		outputs = append(outputs, output{
 			feeAssetNet, change, hex.EncodeToString(info.Script),
-			hex.EncodeToString(info.BlindingKey),
+			outBlindKey(info.BlindingKey),
 		})
 
 		allInputs := append(existingInputs, inputs...)
@@ -404,11 +414,16 @@ func (s *Service) CompleteSwap(
 		return "", nil, -1, err
 	}
 
-	blindedPset, err := txManager.BlindPset(
-		ctx, pset, swapRequest.GetUnblindedInputs(),
-	)
-	if err != nil {
-		return "", nil, -1, err
+	// Skip blinding entirely for an explicit swap; otherwise blind exactly as
+	// before, using the proposer's revealed unblinded inputs.
+	blindedPset := pset
+	if blind {
+		blindedPset, err = txManager.BlindPset(
+			ctx, pset, swapRequest.GetUnblindedInputs(),
+		)
+		if err != nil {
+			return "", nil, -1, err
+		}
 	}
 
 	signedPset, err := txManager.SignPset(ctx, blindedPset, false)
