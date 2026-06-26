@@ -19,6 +19,7 @@ package api
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -66,6 +67,9 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 	// The relay notifies an online maker (via From.lift_requested) whenever a taker
 	// lifts one of its offers, so the maker can derive the E2E key and co-sign.
 	sessions.SetNotifyMaker(srv.notifyMaker)
+	// Wire the book into the validator so a byte-identical replay of a resting offer
+	// is recognized and declined the victim maker's per-pubkey rate budget (ITEM A).
+	v.SetBook(store)
 	return srv
 }
 
@@ -102,6 +106,17 @@ func (s *Server) handleOfferSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.validator.ValidateOffer(r.Context(), &o, clientIP(r)); err != nil {
+		if errors.Is(err, validator.ErrReplay) {
+			// ITEM A: byte-identical replay of an already-resting offer; a no-op that
+			// consumed no rate budget. Echo the live status rather than re-submitting
+			// (the store would reject the duplicate key anyway).
+			st, ok := s.store.OrderStatusOf(offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()})
+			if !ok {
+				st = &seqobv1.OrderStatus{OfferId: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey(), Status: seqobv1.OfferStatus_OFFER_STATUS_OPEN, ActiveAmount: o.GetBaseAmount()}
+			}
+			writeProto(w, st)
+			return
+		}
 		httpErr(w, http.StatusBadRequest, "invalid offer: "+err.Error())
 		return
 	}

@@ -68,6 +68,22 @@ func (c *Crypter) Open(sealed []byte) ([]byte, error) {
 // offer private key (its key doubles as its session key) and the taker's session
 // pubkey, as delivered in From.lift_requested. The maker then drives the existing
 // Maker.HandleRequest to open the taker's sealed SwapRequest and seal its accept.
+//
+// ITEM C (relay-MITM re-attack: VERIFIED FALSE POSITIVE; DoS only, NOT a CT leak).
+// The taker side already derives its key from the SIGNED, VERIFIED offer's maker
+// pubkey (round-1 fix in cmd/seqob-cli), not from the relay echo, so the taker
+// leg is leak-proof. The remaining concern raised was that the maker still trusts
+// the relay-supplied takerSessionPubkey here. That is denial-of-service, not a
+// confidentiality leak, for a structural reason: a Crypter holds ONE symmetric
+// key per peer used for BOTH Open and Seal (see Crypter above). The taker sealed
+// its SwapRequest under the key derived from the REAL maker+taker pubkeys, so the
+// maker must OPEN that ciphertext under the matching key BEFORE it ever produces a
+// SwapAccept (see Maker.HandleRequest). If a malicious relay substitutes its own
+// pubkey for takerSessionPubkey, the maker derives the WRONG key, the AES-GCM Open
+// fails, and NO SwapAccept is ever sealed; so there is nothing to leak. The relay
+// also holds no private key, so it cannot itself decrypt the taker->maker leg to
+// mount a man-in-the-middle. Net effect of substitution: the lift simply fails.
+// No functional change is required for this item.
 func NewMakerCrypterFromLift(makerOfferPriv *btcec.PrivateKey, takerSessionPubkey []byte) (*Crypter, error) {
 	if makerOfferPriv == nil {
 		return nil, errors.New("nil maker key")

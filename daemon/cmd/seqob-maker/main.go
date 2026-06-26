@@ -108,7 +108,12 @@ func main() {
 		}
 		return signedPSET, utxosToSwapUnblinded(utxos), nil
 	}
-	maker := &client.Maker{Wallet: &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential}}
+	maker := &client.Maker{
+		Wallet: &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential},
+		// Bind every co-sign to this signed offer (asset legs, price floor,
+		// remaining size) so a malicious taker cannot drain the maker.
+		Offer: o,
+	}
 
 	// Connect, submit the offer (this registers the conn for live lifts), then
 	// serve lifts until killed.

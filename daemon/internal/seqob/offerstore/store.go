@@ -192,6 +192,35 @@ func (s *Store) Get(k Key) (*Entry, bool) {
 	return e, ok
 }
 
+// RestingMakerSig returns the maker_sig of the offer currently resting under
+// (makerPubkey, offerID), or ok=false if none rests. It lets the validator tell
+// a byte-identical replay (same signed content => same signature) from a genuine
+// new/edited offer WITHOUT charging the per-maker_pubkey rate budget (the relay
+// replay-griefing defense; see internal/seqob/validator). The maker_sig is a
+// deterministic, collision-resistant function of the entire signed offer, so an
+// equal signature means equal signed content.
+func (s *Store) RestingMakerSig(makerPubkey, offerID string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[Key{MakerPubkey: makerPubkey, OfferID: offerID}]
+	if !ok {
+		return nil, false
+	}
+	return e.Offer.GetMakerSig(), true
+}
+
+// OrderStatusOf returns the live OrderStatus for a resting key, if present. Used
+// to re-ack a no-op replay without re-inserting the offer.
+func (s *Store) OrderStatusOf(k Key) (*seqobv1.OrderStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[k]
+	if !ok {
+		return nil, false
+	}
+	return e.orderStatus(k), true
+}
+
 // SnapshotPair returns all live offers for a pair.
 func (s *Store) SnapshotPair(p *seqobv1.AssetPair) []*seqobv1.Offer {
 	s.mu.RLock()

@@ -64,11 +64,28 @@ func (t *Taker) Finalize(sealedAccept []byte, c *Crypter) (sealedComplete []byte
 // the existing CompleteSwap path, and seals the SwapAccept back.
 type Maker struct {
 	Wallet Wallet
+	// Offer is the maker's OWN signed resting offer. When set, HandleRequest binds
+	// every co-sign to it (asset legs, price floor, remaining size) so a malicious
+	// taker cannot drain the maker at an arbitrary price. Left nil only in unit
+	// tests that exercise the raw message flow.
+	Offer *seqobv1.Offer
 }
 
 // HandleRequest opens a sealed SwapRequest, runs ResponderComplete, and returns
 // the sealed SwapAccept.
+//
+// ITEM C (relay-MITM re-attack: VERIFIED FALSE POSITIVE; DoS only, NOT a CT leak).
+// The Crypter c may have been derived from a relay-supplied taker session pubkey
+// (see NewMakerCrypterFromLift). That is safe by ORDERING: this method's FIRST act
+// is c.Open(sealedReq), and only on success does it go on to Seal a SwapAccept.
+// The taker sealed sealedReq under the key from the real maker+taker pubkeys, so a
+// relay that substituted its own pubkey yields a mismatched key, c.Open below
+// fails, and the method returns before any SwapAccept exists, leaving nothing the
+// relay can decrypt. Key substitution is therefore a denial-of-service (the lift
+// fails), never a confidentiality leak.
 func (m *Maker) HandleRequest(sealedReq []byte, c *Crypter) (sealedAccept []byte, err error) {
+	// Open-before-Seal (see the ITEM C note above): a wrong/substituted key makes
+	// this fail, so no SwapAccept is ever produced or leaked.
 	pt, err := c.Open(sealedReq)
 	if err != nil {
 		return nil, fmt.Errorf("open request: %w", err)
@@ -76,6 +93,14 @@ func (m *Maker) HandleRequest(sealedReq []byte, c *Crypter) (sealedAccept []byte
 	var req seqdexv1.SwapRequest
 	if err := proto.Unmarshal(pt, &req); err != nil {
 		return nil, fmt.Errorf("unmarshal request: %w", err)
+	}
+	// SECURITY (maker drain): bind the co-sign to the maker's own offer before
+	// touching the wallet, so the decrypted request cannot move funds at a price
+	// or in assets the maker never offered.
+	if m.Offer != nil {
+		if err := ValidateRequestAgainstOffer(&req, m.Offer); err != nil {
+			return nil, fmt.Errorf("request does not match offer: %w", err)
+		}
 	}
 	acc, err := m.Wallet.ResponderComplete(&req)
 	if err != nil {
