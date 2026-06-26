@@ -276,8 +276,12 @@ func (m *Market) Preview(
 	if asset != m.BaseAsset && asset != m.QuoteAsset {
 		return nil, fmt.Errorf("asset must be either base or quote asset")
 	}
-	if feeAsset != m.BaseAsset && feeAsset != m.QuoteAsset {
-		return nil, fmt.Errorf("fee asset must be either base or quote asset")
+	// Open fee market: the on-chain NETWORK fee may be paid in any valid asset
+	// (it lives in the swap PSET, validated by the wallet's CompleteSwap, not
+	// here). The market COMMISSION, by contrast, can only be charged in a market
+	// asset — so a fee asset outside {base, quote} simply means zero commission.
+	if !isValidAsset(feeAsset) {
+		return nil, fmt.Errorf("invalid fee asset")
 	}
 
 	isBaseAsset := asset == m.BaseAsset
@@ -324,10 +328,17 @@ func (m *Market) Preview(
 		asset:        amount,
 		previewAsset: previewAmountInSats,
 	}
-	amountForFees := amountsByAsset[feeAsset]
-	previewFeeAmount, err := m.previewFees(amountForFees, feeAsset, isBuy)
-	if err != nil {
-		return nil, err
+	// Commission applies only when the fee asset is a market (leg) asset. For any
+	// other fee asset the commission is zero (the network fee is taker-funded in
+	// the PSET); computing previewFees would otherwise charge base's fixed fee in
+	// the wrong asset.
+	var previewFeeAmount uint64
+	if feeAsset == m.BaseAsset || feeAsset == m.QuoteAsset {
+		amountForFees := amountsByAsset[feeAsset]
+		previewFeeAmount, err = m.previewFees(amountForFees, feeAsset, isBuy)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &PreviewInfo{
