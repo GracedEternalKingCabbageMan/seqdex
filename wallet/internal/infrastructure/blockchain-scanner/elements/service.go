@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
+	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/vulpemventures/go-elements/address"
 	"github.com/vulpemventures/go-elements/elementsutil"
@@ -14,9 +17,6 @@ import (
 	"github.com/vulpemventures/go-elements/transaction"
 	"github.com/vulpemventures/neutrino-elements/pkg/blockservice"
 	"github.com/vulpemventures/neutrino-elements/pkg/repository"
-	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
-	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
-	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
 )
 
 type service struct {
@@ -201,33 +201,27 @@ func (s *service) GetUtxos(utxoList []domain.Utxo) ([]domain.Utxo, error) {
 	utxos := make([]domain.Utxo, 0, len(utxoList))
 	for _, u := range utxoList {
 		key := u.UtxoKey
-		addr := addressFromScript(u.Script, s.args.network())
-		// rescan=false. importaddress defaults rescan=true, which rescans the WHOLE
-		// chain from genesis for the address — minutes on a long, anchor-validated
-		// chain, long enough that TradePropose's GetUtxos call times out (the maker
-		// then reports "service is unavailable, retry later"). It's also needless: the
-		// scanner already imported these addresses (with a rescan) and detected these
-		// very UTXOs when the deposits landed, so the txs are already in the node
-		// wallet. Re-importing here only needs to (re)assert the watch, not re-scan
-		// history, so gettransaction below still resolves immediately.
-		if _, err := s.rpcClient.call(
-			"importaddress", []interface{}{addr, "", false},
-		); err != nil {
-			return nil, err
+		// Fetch the prevout tx via the node-level getrawtransaction (the node runs
+		// txindex), NOT importaddress+gettransaction. Those are wallet-level RPCs that
+		// (a) fail with -19 "Wallet file not specified" once the node has more than one
+		// wallet loaded, and (b) cannot resolve a tx the node wallet never tracked
+		// (the scanner uses block filters, not node-wallet imports, so the address was
+		// never imported with history). getrawtransaction needs no wallet context and
+		// resolves any txid (mempool or txindexed).
+		resp, err := s.rpcClient.call("getrawtransaction", []interface{}{key.TxID, true})
+		if err != nil {
+			return nil, fmt.Errorf("getrawtransaction %s: %w", key.TxID, err)
+		}
+		m, ok := resp.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("getrawtransaction %s: unexpected response", key.TxID)
 		}
 
-		var m map[string]interface{}
-		for {
-			resp, err := s.rpcClient.call("gettransaction", []interface{}{key.TxID})
-			if err != nil {
-				continue
-			}
-			m = resp.(map[string]interface{})
-			break
+		txHex, _ := m["hex"].(string)
+		tx, err := transaction.NewTxFromHex(txHex)
+		if err != nil {
+			return nil, fmt.Errorf("parse prevout tx %s: %w", key.TxID, err)
 		}
-
-		txHex := m["hex"].(string)
-		tx, _ := transaction.NewTxFromHex(txHex)
 
 		out := tx.Outputs[key.VOut]
 		utxo := domain.Utxo{
@@ -244,14 +238,24 @@ func (s *service) GetUtxos(utxoList []domain.Utxo) ([]domain.Utxo, error) {
 			utxo.Asset = elementsutil.AssetHashFromBytes(out.Asset)
 			utxo.Value, _ = elementsutil.ValueFromBytes(out.Value)
 		}
-		confirmations := m["confirmations"].(float64)
-		if confirmations > 0 {
-			blockHeight := uint64(m["blockheight"].(float64))
-			blockTimestamp := int64(m["blocktime"].(float64))
-			blockHash := m["blockhash"].(string)
+		// getrawtransaction reports confirmations + blockhash/blocktime but not the
+		// height; derive it from the (node-level) block header when confirmed.
+		if conf, _ := m["confirmations"].(float64); conf > 0 {
+			blockHash, _ := m["blockhash"].(string)
+			blockTimestamp, _ := m["blocktime"].(float64)
+			var blockHeight uint64
+			if blockHash != "" {
+				if hdr, herr := s.rpcClient.call("getblockheader", []interface{}{blockHash}); herr == nil {
+					if hm, ok := hdr.(map[string]interface{}); ok {
+						if h, ok := hm["height"].(float64); ok {
+							blockHeight = uint64(h)
+						}
+					}
+				}
+			}
 			utxo.ConfirmedStatus = domain.UtxoStatus{
 				BlockHeight: blockHeight,
-				BlockTime:   blockTimestamp,
+				BlockTime:   int64(blockTimestamp),
 				BlockHash:   blockHash,
 			}
 		}
