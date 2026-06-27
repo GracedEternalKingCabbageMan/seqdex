@@ -406,13 +406,16 @@ func (c *Chain) BlockAnchorHeight(blockHash string) (int64, error) {
 	return hdr.AnchorHeight, nil
 }
 
-// BlockHashOfTx returns the block hash that confirmed a wallet tx (the SEQ-leg
-// block whose anchorheight the orchestrator verifies).
+// BlockHashOfTx returns the block hash that confirmed a tx (the SEQ-leg block
+// whose anchorheight the orchestrator verifies). Uses getrawtransaction so it works
+// for txs the local wallet did NOT create — e.g. the taker-funded SEQ leg the reverse
+// maker must verify; gettransaction errors -5 ("Invalid or non-wallet transaction id")
+// on a non-wallet txid. Relies on the node's txindex (the DEX node has it).
 func (c *Chain) BlockHashOfTx(txid string) (string, error) {
 	var tx struct {
 		BlockHash string `json:"blockhash"`
 	}
-	if err := c.rpc.Call(&tx, "gettransaction", txid); err != nil {
+	if err := c.rpc.Call(&tx, "getrawtransaction", txid, true); err != nil {
 		return "", err
 	}
 	if tx.BlockHash == "" {
