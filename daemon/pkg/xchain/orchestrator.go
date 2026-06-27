@@ -1,6 +1,9 @@
 package xchain
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Direction documents which way value flows. We implement and document ONE
 // direction: the secret-holder (Alice) holds BTC and wants the SEQ asset; the
@@ -119,10 +122,20 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 	// Best-effort local confirmation for the regtest harness; on a live network
 	// blocks are staker-produced (generatetoaddress is unavailable) and the SEQ leg
 	// confirms naturally, so a Mine failure must NOT fail the lock.
-	_ = s.seq.Mine(1) // only ~1 conf needed thanks to anchoring
-	blockHash, err := s.seq.BlockHashOfTx(funded.TxID)
-	if err != nil {
-		return nil, "", err
+	_ = s.seq.Mine(1) // best-effort local confirmation (regtest harness only)
+	// Wait for the SEQ funding tx to confirm so we can report its anchored block.
+	// On a live network this is the next staker block (seconds to a couple minutes);
+	// under the regtest harness the Mine above already confirmed it. Without this the
+	// caller fails with "not confirmed (no blockhash)" the instant the leg is funded.
+	var blockHash string
+	for i := 0; i < 90; i++ { // up to ~3 min at 2s
+		if blockHash, err = s.seq.BlockHashOfTx(funded.TxID); err == nil && blockHash != "" {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if blockHash == "" {
+		return nil, "", fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", funded.TxID, err)
 	}
 	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, blockHash, nil
 }
