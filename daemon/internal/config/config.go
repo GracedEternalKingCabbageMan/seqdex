@@ -108,6 +108,11 @@ const (
 	XchainMinBtcConfKey = "XCHAIN_MIN_BTC_CONF"
 	// XchainSpendFeeKey: explicit fee (atoms) for the maker's spends.
 	XchainSpendFeeKey = "XCHAIN_SPEND_FEE"
+	// XchainQuoteTtlSecsKey: how long a cross-chain quote is honoured (seconds).
+	// A FORWARD (BTC->asset) taker must lock its BTC leg and reach XCHAIN_MIN_BTC_CONF
+	// confirmations before proposing; on a ~10-min, erratic testnet4 that is far longer
+	// than a same-chain quote needs, so this defaults well above the 2-min same-chain TTL.
+	XchainQuoteTtlSecsKey = "XCHAIN_QUOTE_TTL_SECS"
 
 	DbLocation        = "db"
 	TLSLocation       = "tls"
@@ -150,6 +155,7 @@ func InitConfig() error {
 	vip.SetDefault(XchainSeqLocktimeDeltaKey, 50)
 	vip.SetDefault(XchainMinBtcConfKey, 1)
 	vip.SetDefault(XchainSpendFeeKey, 1000)
+	vip.SetDefault(XchainQuoteTtlSecsKey, 3600) // 60 min: covers a testnet4 BTC-leg lock + confirmation
 
 	if err := validate(); err != nil {
 		return fmt.Errorf("error while validating config: %s", err)
