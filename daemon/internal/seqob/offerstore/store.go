@@ -444,6 +444,36 @@ func (s *Store) SweepExpired() int {
 	return len(expired)
 }
 
+// RemoveByMaker drops every resting offer for makerPubkey, emitting a removal event per
+// offer. Called when a maker's websocket disconnects: in this interactive book the maker
+// must be online to co-sign a lift, so once it is gone its offers are unliftable and must
+// not linger in the book until their TTL (they otherwise show as un-fillable "ghost"
+// duplicates after a maker restart/crash). Returns the number removed.
+func (s *Store) RemoveByMaker(makerPubkey string) int {
+	s.mu.Lock()
+	victims := make([]Key, 0)
+	for k := range s.entries {
+		if k.MakerPubkey == makerPubkey {
+			victims = append(victims, k)
+		}
+	}
+	type ev struct {
+		pair *seqobv1.AssetPair
+		ref  *seqobv1.OfferRef
+	}
+	evs := make([]ev, 0, len(victims))
+	for _, k := range victims {
+		e := s.entries[k]
+		evs = append(evs, ev{pair: e.Offer.GetPair(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.remove(k)
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
+	}
+	return len(victims)
+}
+
 // RunExpirySweeper sweeps every interval until ctx-like stop channel closes.
 func (s *Store) RunExpirySweeper(interval time.Duration, stop <-chan struct{}) {
 	t := time.NewTicker(interval)
