@@ -116,9 +116,10 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 	if err != nil {
 		return nil, "", err
 	}
-	if err := s.seq.Mine(1); err != nil { // only ~1 conf needed thanks to anchoring
-		return nil, "", err
-	}
+	// Best-effort local confirmation for the regtest harness; on a live network
+	// blocks are staker-produced (generatetoaddress is unavailable) and the SEQ leg
+	// confirms naturally, so a Mine failure must NOT fail the lock.
+	_ = s.seq.Mine(1) // only ~1 conf needed thanks to anchoring
 	blockHash, err := s.seq.BlockHashOfTx(funded.TxID)
 	if err != nil {
 		return nil, "", err
@@ -187,9 +188,10 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 	if err != nil {
 		return "", err
 	}
-	if err := s.seq.Mine(1); err != nil {
-		return "", err
-	}
+	// Best-effort local confirmation for the regtest harness; on a live network the
+	// staker confirms the already-broadcast claim above, so a Mine failure must NOT
+	// fail the claim (otherwise the reveal stalls and the secret is never surfaced).
+	_ = s.seq.Mine(1)
 	return txid, nil
 }
 
