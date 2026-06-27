@@ -122,6 +122,32 @@ func TestRESTRejectsBadSignature(t *testing.T) {
 	}
 }
 
+// TestRESTReplayIsNoOp is the ITEM A integration regression: replaying a genuine,
+// byte-identical offer must be a no-op (HTTP 200, not a 409 conflict) and must not
+// duplicate the book entry; proving api.New wired the book into the validator so
+// a replay never reaches store.Submit (and never charged the maker's budget).
+func TestRESTReplayIsNoOp(t *testing.T) {
+	ts, store := newServer(t)
+	k := key(t)
+	o := mkSignedOffer(t, k, "aaaa")
+
+	resp := postProto(t, ts.URL+"/v1/offers", o)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first submit = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = postProto(t, ts.URL+"/v1/offers", o)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replay submit = %d, want 200 (no-op, not a conflict)", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if got := len(store.SnapshotMaker(o.GetMakerPubkey())); got != 1 {
+		t.Fatalf("book holds %d offers after replay, want exactly 1", got)
+	}
+}
+
 func TestWSSnapshotAndDelta(t *testing.T) {
 	ts, _ := newServer(t)
 	k := key(t)

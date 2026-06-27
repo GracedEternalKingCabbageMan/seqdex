@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 
@@ -10,6 +11,7 @@ import (
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/session"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/validator"
 )
 
 // wsConn wraps a websocket connection with a single-writer lock and its
@@ -60,14 +62,19 @@ func (r *connRegistry) get(pubkey string) (*wsConn, bool) {
 	return c, ok
 }
 
-func (r *connRegistry) drop(c *wsConn) {
+// drop unregisters the connection and returns the maker pubkey(s) it was serving, so
+// the caller can evict their now-unreachable offers.
+func (r *connRegistry) drop(c *wsConn) []string {
 	r.mu.Lock()
+	dropped := make([]string, 0)
 	for k, v := range r.m {
 		if v == c {
 			delete(r.m, k)
+			dropped = append(dropped, k)
 		}
 	}
 	r.mu.Unlock()
+	return dropped
 }
 
 // handleWS upgrades to a websocket and serves the To/From envelope.
@@ -104,7 +111,12 @@ func (s *Server) closeConn(c *wsConn) {
 	}
 	c.subs = map[string]func(){}
 	c.mu.Unlock()
-	s.makerConns.drop(c)
+	// Evict this maker's resting offers: in an interactive book the maker must be online
+	// to co-sign a lift, so once its connection drops its offers are unliftable and would
+	// otherwise linger as un-fillable "ghosts" until their TTL.
+	for _, pubkey := range s.makerConns.drop(c) {
+		s.store.RemoveByMaker(pubkey)
+	}
 	c.conn.Close()
 }
 
@@ -197,6 +209,14 @@ func (s *Server) wsUnsubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 
 func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 	if err := s.validator.ValidateOffer(context.Background(), o, ip); err != nil {
+		if errors.Is(err, validator.ErrReplay) {
+			// ITEM A: byte-identical replay of an already-resting offer. It cost the
+			// maker no rate budget; do not re-submit (the store would reject the
+			// duplicate key). Re-register reachability and re-ack the live status.
+			s.registerMaker(c, o.GetMakerPubkey())
+			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
+			return
+		}
 		c.sendErr(400, "invalid offer: "+err.Error())
 		return
 	}
@@ -206,10 +226,7 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 		return
 	}
 	// Register this connection as the maker's reachable endpoint for live lifts.
-	c.mu.Lock()
-	c.makerPubkey = o.GetMakerPubkey()
-	c.mu.Unlock()
-	s.makerConns.set(o.GetMakerPubkey(), c)
+	s.registerMaker(c, o.GetMakerPubkey())
 
 	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: &seqobv1.OrderStatus{
 		OfferId: k.OfferID, MakerPubkey: k.MakerPubkey,
@@ -219,6 +236,12 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 
 func (s *Server) wsOfferEdit(c *wsConn, o *seqobv1.Offer, ip string) {
 	if err := s.validator.ValidateOffer(context.Background(), o, ip); err != nil {
+		if errors.Is(err, validator.ErrReplay) {
+			// No-op edit identical to the resting offer (ITEM A): no budget charged,
+			// nothing to change; re-ack the live status.
+			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
+			return
+		}
 		c.sendErr(400, "invalid offer: "+err.Error())
 		return
 	}
@@ -230,6 +253,27 @@ func (s *Server) wsOfferEdit(c *wsConn, o *seqobv1.Offer, ip string) {
 		OfferId: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey(),
 		Status: seqobv1.OfferStatus_OFFER_STATUS_OPEN, ActiveAmount: o.GetBaseAmount(),
 	}}})
+}
+
+// registerMaker binds this connection as the reachable endpoint for makerPubkey
+// so a lift can be routed to it.
+func (s *Server) registerMaker(c *wsConn, makerPubkey string) {
+	c.mu.Lock()
+	c.makerPubkey = makerPubkey
+	c.mu.Unlock()
+	s.makerConns.set(makerPubkey, c)
+}
+
+// restingStatus returns the live OrderStatus for o's key, falling back to a fresh
+// OPEN status if the offer raced out of the book between validate and lookup.
+func (s *Server) restingStatus(o *seqobv1.Offer) *seqobv1.OrderStatus {
+	if st, ok := s.store.OrderStatusOf(offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()}); ok {
+		return st
+	}
+	return &seqobv1.OrderStatus{
+		OfferId: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey(),
+		Status: seqobv1.OfferStatus_OFFER_STATUS_OPEN, ActiveAmount: o.GetBaseAmount(),
+	}
 }
 
 func (s *Server) wsOfferCancel(c *wsConn, cancel *seqobv1.OfferCancel) {
