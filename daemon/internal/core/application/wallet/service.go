@@ -247,7 +247,13 @@ func (s *Service) CompleteSwap(
 	existingInputs := make([]ports.TxInput, 0)
 	existingOutputs := make([]ports.TxOutput, 0)
 
-	ptx, _ := psetv2.NewPsetFromBase64(swapRequest.GetTransaction())
+	ptx, err := psetv2.NewPsetFromBase64(swapRequest.GetTransaction())
+	if err != nil {
+		return "", nil, 0, fmt.Errorf("parse swap request PSET: %w", err)
+	}
+	if ptx == nil {
+		return "", nil, 0, fmt.Errorf("swap request carried no transaction")
+	}
 	for _, in := range ptx.Inputs {
 		var scriptSigSize, witnessSize int
 		if len(in.RedeemScript) > 0 {
