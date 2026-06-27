@@ -273,7 +273,7 @@ func newXchainService() (*xchainmaker.Service, error) {
 		SEQ:              seq,
 		CoinDivisor:      1e8,
 		Markets:          markets,
-		QuoteTTL:         2 * time.Minute,
+		QuoteTTL:         time.Duration(config.GetInt(config.XchainQuoteTtlSecsKey)) * time.Second,
 		BtcLocktimeDelta: xchainBtcLocktimeDelta,
 		SeqLocktimeDelta: xchainSeqLocktimeDelta,
 		MinBTCConf:       xchainMinBtcConf,
