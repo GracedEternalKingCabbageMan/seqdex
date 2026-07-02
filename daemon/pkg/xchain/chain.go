@@ -435,6 +435,27 @@ func (c *Chain) BlockAnchorHeight(blockHash string) (int64, error) {
 	return hdr.AnchorHeight, nil
 }
 
+// BlockCertification reports whether a Sequentia block is quorum-certified
+// (immediately final): its committee countersignatures reached the quorum. This
+// is stronger than anchoring — anchoring binds the leg to Bitcoin, quorum
+// certification means the committee finalized it. `present` is false against a
+// node predating the getblockheader poscertified field, so the caller can keep
+// anchor-only behavior during a rolling upgrade rather than break.
+func (c *Chain) BlockCertification(blockHash string) (certified, present bool, err error) {
+	var hdr struct {
+		PosCertified   *bool `json:"poscertified"`
+		PosCountersigs *int  `json:"poscountersigs"`
+		PosQuorum      *int  `json:"posquorum"`
+	}
+	if e := c.rpc.Call(&hdr, "getblockheader", blockHash, true); e != nil {
+		return false, false, e
+	}
+	if hdr.PosCertified == nil {
+		return false, false, nil // node without the field: caller falls back to anchor-only
+	}
+	return *hdr.PosCertified, true, nil
+}
+
 // BlockHashOfTx returns the block hash that confirmed a tx (the SEQ-leg block
 // whose anchorheight the orchestrator verifies). Uses getrawtransaction so it works
 // for txs the local wallet did NOT create — e.g. the taker-funded SEQ leg the reverse
