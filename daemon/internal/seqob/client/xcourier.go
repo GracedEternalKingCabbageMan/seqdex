@@ -24,8 +24,11 @@ import (
 //	  maker  : watches the SEQ claim, extracts s, ClaimBTCLeg
 //
 //	REVERSE  (offer.direction = ASSET_TO_BTC; taker sells the asset, secret holder = MAKER)
-//	  taker -> XcTermsRequest{taker_seq_refund_pub}
-//	  maker -> XcBtcLegLocked{hash_h, leg(BTC), maker_seq_claim_pub, maker_refund_pub (btc), seq locktime}
+//	  taker -> XcTermsRequest{taker_seq_refund_pub, taker_btc_claim_pub}
+//	           (the BTC HTLC's claim branch pays the taker, so its key must reach
+//	           the maker BEFORE the maker funds that leg)
+//	  maker -> XcBtcLegLocked{hash_h, leg(BTC), maker_seq_claim_pub, maker_refund_pub (btc),
+//	           seq locktime, btc/seq amounts (the terms ride in this message)}
 //	  taker  : verify the BTC leg, await its confirmation, fund the SEQ leg
 //	  taker -> XcSeqLegFunded{leg(SEQ, with block_hash+anchor_height)}
 //	  maker  : VerifySeqLegSafe then ClaimSEQLeg -> reveals s
@@ -79,6 +82,7 @@ type XcMsg struct {
 	TakerSeqClaimPub  string `json:"taker_seq_claim_pub,omitempty"` // forward: taker claims SEQ with s
 	TakerBtcRefundPub string `json:"taker_btc_refund_pub,omitempty"`// forward: taker refunds BTC after T_btc
 	TakerSeqRefundPub string `json:"taker_seq_refund_pub,omitempty"`// reverse: taker refunds SEQ after T_seq
+	TakerBtcClaimPub  string `json:"taker_btc_claim_pub,omitempty"` // reverse: taker claims BTC with s
 
 	Leg *XcLeg `json:"leg,omitempty"` // the leg this message conveys
 
