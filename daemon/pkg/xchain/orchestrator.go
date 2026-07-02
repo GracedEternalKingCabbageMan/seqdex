@@ -151,6 +151,8 @@ type AnchorEvidence struct {
 	SeqBlockAnchor   int64
 	AnchorStatus     string
 	NodeAnchorHeight int64
+	Certified        bool // the SEQ block is quorum-certified (immediately final)
+	CertPresent      bool // the node reported certification (false = pre-upgrade node)
 	OK               bool
 }
 
@@ -168,17 +170,28 @@ func (s *Swap) VerifySeqLegSafe(seqBlockHash string, btcLegHeight int64) (*Ancho
 	if err != nil {
 		return nil, err
 	}
+	// Quorum certification, IN ADDITION to anchoring (Alberto 2026-07-02): a leg's
+	// block must be immediately-final (committee quorum), not merely anchored.
+	// NOTE: this does NOT add any min-anchor-DEPTH wait — that would defeat
+	// Sequentia's real-time anchoring (kept 0-conf on the anchor axis on purpose).
+	// Feature-detected: a node predating the poscertified field keeps anchor-only.
+	certified, certPresent, cerr := s.seq.BlockCertification(seqBlockHash)
+	if cerr != nil {
+		return nil, cerr
+	}
 	ev := &AnchorEvidence{
 		BTCLegHeight:     btcLegHeight,
 		SeqBlockHash:     seqBlockHash,
 		SeqBlockAnchor:   anchor,
 		AnchorStatus:     status.AnchorStatus,
 		NodeAnchorHeight: status.AnchorHeight,
-		OK:               anchor >= btcLegHeight && status.AnchorStatus == "ok",
+		Certified:        certified,
+		CertPresent:      certPresent,
+		OK:               anchor >= btcLegHeight && status.AnchorStatus == "ok" && (!certPresent || certified),
 	}
 	if !ev.OK {
-		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, anchorstatus=%q)",
-			ErrAnchorOrdering, seqBlockHash, anchor, btcLegHeight, status.AnchorStatus)
+		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, anchorstatus=%q, quorum-certified=%v)",
+			ErrAnchorOrdering, seqBlockHash, anchor, btcLegHeight, status.AnchorStatus, certified)
 	}
 	return ev, nil
 }
