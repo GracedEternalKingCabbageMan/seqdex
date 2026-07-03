@@ -1,6 +1,7 @@
 package xchain
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -219,11 +220,17 @@ func (c *lnRPC) call(out interface{}, method string, params interface{}) error {
 		"method":  method,
 		"params":  params,
 	}
-	body, err := json.Marshal(req)
-	if err != nil {
+	// Encode WITHOUT Go's default HTML escaping: it turns <, >, & into \uXXXX
+	// escapes, and CLN's JSON parser rejects \u escapes in string params
+	// (e.g. a description containing "->"). A JSON-RPC client must send literal
+	// <>&.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(req); err != nil {
 		return err
 	}
-	if _, err := conn.Write(body); err != nil {
+	if _, err := conn.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("%s: write: %w", method, err)
 	}
 
