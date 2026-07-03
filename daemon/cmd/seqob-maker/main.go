@@ -109,6 +109,7 @@ func main() {
 			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet, lnSocket: *lnSocket,
 			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
 			spendFee: *spendFee,
+			reverse:  strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
 		})
 		return
 	}
@@ -982,24 +983,24 @@ type xmakerSessionState struct {
 	SeqClaimPrivHex    string `json:"seq_claim_priv_hex,omitempty"`    // reverse: claims taker SEQ
 	BtcRefundPrivHex   string `json:"btc_refund_priv_hex,omitempty"`   // reverse: refunds our BTC leg
 	BtcRefundTx        string `json:"btc_refund_tx,omitempty"`         // reverse
-	BtcLocktime      uint32 `json:"btc_locktime,omitempty"`
-	SeqLocktime      uint32 `json:"seq_locktime,omitempty"`
-	BtcLegTxid       string `json:"btc_leg_txid,omitempty"`
-	BtcLegVout       uint32 `json:"btc_leg_vout"`
-	BtcLegAmount     uint64 `json:"btc_leg_amount,omitempty"`
-	BtcLegScriptHex  string `json:"btc_leg_script_hex,omitempty"`
-	SeqLegTxid       string `json:"seq_leg_txid,omitempty"`
-	SeqLegVout       uint32 `json:"seq_leg_vout"`
-	SeqLegAmount     uint64 `json:"seq_leg_amount,omitempty"`
-	SeqLegAsset      string `json:"seq_leg_asset,omitempty"`
-	SeqLegScriptHex  string `json:"seq_leg_script_hex,omitempty"`
-	SeqBlockHash     string `json:"seq_block_hash,omitempty"`
-	SecretHex        string `json:"secret_hex,omitempty"`
-	BtcClaimTxid     string `json:"btc_claim_txid,omitempty"`  // forward: maker claimed the taker's BTC
-	SeqRefundTx      string `json:"seq_refund_tx,omitempty"`   // forward: maker refunded its SEQ leg
-	SeqClaimTxid     string `json:"seq_claim_txid,omitempty"`  // reverse: maker claimed the taker's SEQ
-	Settled          bool   `json:"settled"`
-	UpdatedAt        string `json:"updated_at"`
+	BtcLocktime        uint32 `json:"btc_locktime,omitempty"`
+	SeqLocktime        uint32 `json:"seq_locktime,omitempty"`
+	BtcLegTxid         string `json:"btc_leg_txid,omitempty"`
+	BtcLegVout         uint32 `json:"btc_leg_vout"`
+	BtcLegAmount       uint64 `json:"btc_leg_amount,omitempty"`
+	BtcLegScriptHex    string `json:"btc_leg_script_hex,omitempty"`
+	SeqLegTxid         string `json:"seq_leg_txid,omitempty"`
+	SeqLegVout         uint32 `json:"seq_leg_vout"`
+	SeqLegAmount       uint64 `json:"seq_leg_amount,omitempty"`
+	SeqLegAsset        string `json:"seq_leg_asset,omitempty"`
+	SeqLegScriptHex    string `json:"seq_leg_script_hex,omitempty"`
+	SeqBlockHash       string `json:"seq_block_hash,omitempty"`
+	SecretHex          string `json:"secret_hex,omitempty"`
+	BtcClaimTxid       string `json:"btc_claim_txid,omitempty"` // forward: maker claimed the taker's BTC
+	SeqRefundTx        string `json:"seq_refund_tx,omitempty"`  // forward: maker refunded its SEQ leg
+	SeqClaimTxid       string `json:"seq_claim_txid,omitempty"` // reverse: maker claimed the taker's SEQ
+	Settled            bool   `json:"settled"`
+	UpdatedAt          string `json:"updated_at"`
 }
 
 func persistXSession(dir, sid, offerID string, r *client.MakerForwardResult) {

@@ -1,0 +1,232 @@
+package main
+
+// xsubbuy.go: the REVERSE submarine-swap taker — BUY a Sequentia asset with BTC
+// over Lightning. The maker (a SELL Lightning offer, maker-secret mode) generates
+// P, locks the asset HTLC (claim=taker), and issues a plain invoice on H. The
+// taker verifies the HTLC, runs the anchor-depth gate BEFORE paying (a plain
+// invoice is irreversible once paid), pays the invoice (learning P), and claims
+// the asset. It drives internal/seqob/client.RunTakerReverseSubmarine over the
+// relay courier.
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"strings"
+	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/gorilla/websocket"
+
+	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/client"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
+)
+
+type xsubbuyState struct {
+	CreatedAt       string `json:"created_at"`
+	Relay           string `json:"relay"`
+	SessionID       string `json:"session_id,omitempty"`
+	OfferID         string `json:"offer_id"`
+	MakerPubkey     string `json:"maker_pubkey"`
+	Asset           string `json:"asset"`
+	SeqAmount       uint64 `json:"seq_amount"`
+	InvoiceMsat     uint64 `json:"invoice_msat"`
+	SeqClaimPrivHex string `json:"seq_claim_priv_hex"`
+	// Filled once the invoice is paid (irreversible): the ONLY key to the asset.
+	PreimageHex     string `json:"preimage_hex,omitempty"`
+	SeqLegTxid      string `json:"seq_leg_txid,omitempty"`
+	SeqLegVout      uint32 `json:"seq_leg_vout,omitempty"`
+	SeqLegScriptHex string `json:"seq_leg_script_hex,omitempty"`
+	Status          string `json:"status"`
+}
+
+func (st *xsubbuyState) save(path string) {
+	b, _ := json.MarshalIndent(st, "", "  ")
+	if err := ioutil.WriteFile(path, b, 0o600); err != nil {
+		fmt.Printf("WARN: could not save state to %s: %v\n", path, err)
+	}
+}
+
+func cmdXSubBuy(args []string) {
+	fs := newFlagSet("xsubbuy")
+	relay := fs.String("relay", "http://127.0.0.1:9955", "relay base URL")
+	asset := fs.String("asset", "", "Sequentia asset id (hex) to buy with BTC-LN (required)")
+	offerID := fs.String("offer-id", "", "offer id to lift (empty: first verified REVERSE lightning offer for -asset)")
+	makerPub := fs.String("maker-pubkey", "", "maker pubkey of the offer (with -offer-id)")
+	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
+	seqRPCURL := fs.String("seq-rpc", "", "Sequentia node RPC URL http://user:pass@host:port (required)")
+	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
+	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (pays the invoice) (required)")
+	minAnchor := fs.Int64("min-anchor-depth", 3, "Bitcoin-anchor depth required on the maker's asset HTLC before we pay (>=2; the taker's cross-leg gate)")
+	spendFee := fs.Uint64("spend-fee", 1000, "asset-claim fee target in atoms")
+	anchorWait := fs.Duration("anchor-wait", 20*time.Minute, "max wait for the asset HTLC to bury before paying")
+	stateFile := fs.String("state-file", "xsubbuy-session.json", "session persistence (holds P after paying)")
+	_ = fs.Parse(args)
+
+	if *asset == "" {
+		fatal("xsubbuy requires -asset (the hex asset id; the pair is <asset>/BTC)")
+	}
+	if *seqRPCURL == "" || *lnSocket == "" {
+		fatal("xsubbuy requires -seq-rpc and -ln-socket")
+	}
+
+	// 1. Find + verify a REVERSE lightning offer (ln_direction = LnBTCForAsset,
+	// trade_dir = SELL): the maker sells the asset for BTC-LN.
+	var book seqobv1.PublicBook
+	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, offer.BTCSentinel), &book); err != nil {
+		fatal("get book: %v", err)
+	}
+	var target *seqobv1.Offer
+	for _, o := range book.GetOffers() {
+		if *offerID != "" && (o.GetOfferId() != *offerID || o.GetMakerPubkey() != *makerPub) {
+			continue
+		}
+		lt := o.GetLightning()
+		if lt == nil || lt.GetLnDirection() != offer.LnBTCForAsset {
+			continue
+		}
+		if err := offer.VerifyOffer(o); err != nil {
+			fmt.Printf("skipping unverified offer %s: %v\n", o.GetOfferId(), err)
+			continue
+		}
+		target = o
+		break
+	}
+	if target == nil {
+		fatal("no verified REVERSE lightning offer found for %s/BTC (use `seqob-cli book -base %s -quote BTC`)", *asset, *asset)
+	}
+	expectAsset := target.GetPair().GetBaseAsset()
+	expectSeq := target.GetBaseAmount()         // asset atoms (SELL: offer_amount == base_amount)
+	expectMsat := target.GetWantAmount() * 1000 // BTC sats the maker wants -> msat
+	fmt.Printf("lifting REVERSE lightning offer %s by %s: buy %d %s for %d msat over Lightning\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectMsat)
+
+	// 2. Settlement: the anchored Sequentia node (asset leg) + our LN node.
+	seqRPC, err := xliftRPCFromURL(*seqRPCURL)
+	if err != nil {
+		fatal("-seq-rpc: %v", err)
+	}
+	seqChain := xchain.NewChain(seqRPC, *seqWallet)
+	if _, err := seqChain.BlockCount(); err != nil {
+		fatal("sequentia node unreachable: %v", err)
+	}
+	if _, err := xchain.NewCLNLNLeg(*lnSocket).NodeID(); err != nil {
+		fatal("lightning-rpc %s unreachable: %v", *lnSocket, err)
+	}
+
+	// 3. Fresh claim key, persisted BEFORE we pay.
+	seqClaimKey, err := xchain.NewKey()
+	if err != nil {
+		fatal("key: %v", err)
+	}
+	if raw, err := ioutil.ReadFile(*stateFile); err == nil {
+		var old xsubbuyState
+		if json.Unmarshal(raw, &old) == nil && old.PreimageHex != "" && old.Status != "settled" {
+			fatal("state file %s holds a PAID-but-unclaimed session (preimage present); claim it or pass a different -state-file", *stateFile)
+		}
+	}
+	st := &xsubbuyState{
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), Relay: *relay,
+		OfferID: target.GetOfferId(), MakerPubkey: target.GetMakerPubkey(),
+		Asset: expectAsset, SeqAmount: expectSeq, InvoiceMsat: expectMsat,
+		SeqClaimPrivHex: hex.EncodeToString(seqClaimKey.Bytes()),
+		Status:          "created",
+	}
+	st.save(*stateFile)
+	fmt.Printf("session state -> %s\n", *stateFile)
+
+	// 4. Open the lift session.
+	takerKey := loadOrGenKey(*priv)
+	wsURL := "ws" + strings.TrimPrefix(*relay, "http") + "/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		fatal("dial ws: %v", err)
+	}
+	defer conn.Close()
+	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
+		OfferId:            target.GetOfferId(),
+		MakerPubkey:        target.GetMakerPubkey(),
+		TakeAmount:         target.GetBaseAmount(),
+		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
+	}}})
+	la := readWS(conn)
+	if la.GetLiftAccepted() == nil {
+		fatal("expected lift_accepted, got %s", la.String())
+	}
+	sid := la.GetLiftAccepted().GetSessionId()
+	st.SessionID = sid
+	st.Status = "session_open"
+	st.save(*stateFile)
+	fmt.Printf("reverse submarine lift session %s opened\n", sid)
+
+	makerOfferPub, err := hex.DecodeString(target.GetMakerPubkey())
+	if err != nil {
+		fatal("decode maker pubkey: %v", err)
+	}
+	pk, err := btcec.ParsePubKey(makerOfferPub)
+	if err != nil {
+		fatal("parse maker pubkey: %v", err)
+	}
+	crypter, err := client.NewCrypter(takerKey, pk)
+	if err != nil {
+		fatal("crypter: %v", err)
+	}
+
+	// 5. Run the reverse taker driver over the WS courier.
+	send := func(sealed []byte) error {
+		b, err := jsonMarshal.Marshal(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
+		if err != nil {
+			return err
+		}
+		return conn.WriteMessage(websocket.TextMessage, b)
+	}
+	recv := func(timeout time.Duration) ([]byte, error) {
+		from, err := readWSUntilSwap(conn, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return from.GetSwapMsg().GetCiphertext(), nil
+	}
+	res, err := client.RunTakerReverseSubmarine(client.TakerReverseSubmarineParams{
+		NewTakerOps: func(hashH []byte) client.SubReverseTakerOps {
+			return &client.LiveSubReverseTakerOps{Sub: xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(*lnSocket), xchain.NewHashLockFromHash(hashH))}
+		},
+		Crypter:           crypter,
+		SeqClaimKey:       seqClaimKey,
+		ExpectAsset:       expectAsset,
+		ExpectSeqAmount:   expectSeq,
+		ExpectInvoiceMsat: expectMsat,
+		MinAnchorDepth:    *minAnchor,
+		SpendFeeAtoms:     *spendFee,
+		Timing:            client.XcTiming{AnchorWait: *anchorWait},
+		Log:               func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
+		// Persist P the instant it is learned (BEFORE the claim): a crash after
+		// paying must leave the asset claimable.
+		OnPaid: func(preimage []byte, leg *xchain.LegLock) {
+			st.PreimageHex = hex.EncodeToString(preimage)
+			if leg != nil && leg.Funded != nil {
+				st.SeqLegTxid = leg.Funded.TxID
+				st.SeqLegVout = leg.Funded.Vout
+				st.SeqLegScriptHex = hex.EncodeToString(leg.Script)
+			}
+			st.Status = "paid"
+			st.save(*stateFile)
+		},
+	}, send, recv)
+	if err != nil {
+		st.Status = "aborted"
+		st.save(*stateFile)
+		fmt.Printf("reverse submarine lift ended: %v\n", err)
+		if st.PreimageHex != "" {
+			fmt.Printf("PAID but not claimed — the asset HTLC %s:%d is claimable with the persisted preimage in %s (retry)\n",
+				st.SeqLegTxid, st.SeqLegVout, *stateFile)
+		}
+		return
+	}
+	st.Status = "settled"
+	st.save(*stateFile)
+	fmt.Printf("REVERSE SUBMARINE SWAP SETTLED: paid %d msat over Lightning, claimed the asset in %s\n", expectMsat, res.SeqClaimTxid)
+}
