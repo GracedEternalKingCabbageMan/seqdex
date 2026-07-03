@@ -54,8 +54,8 @@ type XcLeg struct {
 	Txid         string `json:"txid"`
 	Vout         uint32 `json:"vout"`
 	Amount       uint64 `json:"amount"`
-	Asset        string `json:"asset,omitempty"`         // SEQ leg only (asset id hex)
-	RedeemScript string `json:"redeem_script"`           // hex
+	Asset        string `json:"asset,omitempty"` // SEQ leg only (asset id hex)
+	RedeemScript string `json:"redeem_script"`   // hex
 	Locktime     uint32 `json:"locktime"`
 	Height       int64  `json:"height,omitempty"`        // confirmed height (BTC leg, for anchor ordering)
 	BlockHash    string `json:"block_hash,omitempty"`    // SEQ leg, for the anchor gate
@@ -78,13 +78,19 @@ type XcMsg struct {
 	FeeBtc           uint64 `json:"fee_btc,omitempty"`
 
 	// Secret hash + taker pubkeys.
-	HashH             string `json:"hash_h,omitempty"`              // sha256(secret), hex
-	TakerSeqClaimPub  string `json:"taker_seq_claim_pub,omitempty"` // forward: taker claims SEQ with s
-	TakerBtcRefundPub string `json:"taker_btc_refund_pub,omitempty"`// forward: taker refunds BTC after T_btc
-	TakerSeqRefundPub string `json:"taker_seq_refund_pub,omitempty"`// reverse: taker refunds SEQ after T_seq
-	TakerBtcClaimPub  string `json:"taker_btc_claim_pub,omitempty"` // reverse: taker claims BTC with s
+	HashH             string `json:"hash_h,omitempty"`               // sha256(secret), hex
+	TakerSeqClaimPub  string `json:"taker_seq_claim_pub,omitempty"`  // forward: taker claims SEQ with s
+	TakerBtcRefundPub string `json:"taker_btc_refund_pub,omitempty"` // forward: taker refunds BTC after T_btc
+	TakerSeqRefundPub string `json:"taker_seq_refund_pub,omitempty"` // reverse: taker refunds SEQ after T_seq
+	TakerBtcClaimPub  string `json:"taker_btc_claim_pub,omitempty"`  // reverse: taker claims BTC with s
 
 	Leg *XcLeg `json:"leg,omitempty"` // the leg this message conveys
+
+	// Submarine-swap (Lightning) fields. The BTC leg is a BOLT11 payment, not an
+	// on-chain HTLC, so these carry it instead of an XcLeg. See xcourier_submarine.go.
+	Bolt11         string `json:"bolt11,omitempty"`           // submarine: the invoice bound to H
+	MinAnchorDepth uint32 `json:"min_anchor_depth,omitempty"` // submarine: the gate depth (transparency)
+	SettleTxid     string `json:"settle_txid,omitempty"`      // submarine: the on-chain asset-claim txid (informational)
 
 	Preimage string `json:"preimage,omitempty"` // XcSecretRevealed
 	Code     string `json:"code,omitempty"`     // XcFail
