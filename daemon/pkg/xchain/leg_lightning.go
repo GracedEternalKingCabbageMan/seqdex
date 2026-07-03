@@ -2,6 +2,7 @@ package xchain
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -65,6 +66,22 @@ type LNLeg interface {
 
 	// CancelHold fails the held invoice back to the payer (timeout / refund path).
 	CancelHold(paymentHash []byte) error
+
+	// --- REVERSE (maker-secret / taker-gated) direction: plain invoice ---
+	//
+	// This is the plugin-free reverse mode: the MAKER generates the preimage P,
+	// so a PLAIN invoice suffices (no hold). The taker verifies + anchor-gates the
+	// asset HTLC BEFORE paying; paying reveals P (payer learns the preimage), and
+	// the taker claims the asset with it. See SubmarineSwap.OfferReverseMakerSecret.
+
+	// CreateInvoice creates a plain BOLT11 whose payment_hash = SHA256(preimage)
+	// for amountMsat. The node knows the preimage, so it settles normally on
+	// payment (revealing P to the payer).
+	CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry uint32, label, description string) (bolt11 string, err error)
+
+	// WaitInvoicePaid blocks until the invoice with the given label is paid (or
+	// the deadline / invoice expiry), returning the received amount (msat).
+	WaitInvoicePaid(label string, timeout time.Duration) (paidMsat uint64, err error)
 }
 
 // --- CLN implementation over the lightning-rpc unix socket ------------------
@@ -197,6 +214,53 @@ func (l *clnLNLeg) SettleHold(paymentHash, preimage []byte) error {
 func (l *clnLNLeg) CancelHold(paymentHash []byte) error {
 	return l.rpc.call(nil, "holdinvoicecancel",
 		map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
+}
+
+func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry uint32, label, description string) (string, error) {
+	params := map[string]interface{}{
+		"amount_msat": amountMsat,
+		"label":       label,
+		"description": description,
+		"preimage":    hex.EncodeToString(preimage),
+	}
+	if cltvExpiry != 0 {
+		params["cltv"] = cltvExpiry
+	}
+	var res struct {
+		Bolt11      string `json:"bolt11"`
+		PaymentHash string `json:"payment_hash"`
+	}
+	if err := l.rpc.call(&res, "invoice", params); err != nil {
+		return "", fmt.Errorf("invoice: %w", err)
+	}
+	// The created invoice's hash MUST equal SHA256(P) — otherwise the SEQ leg
+	// (gated on the same H) and the LN leg would not be bound by one secret.
+	want := sha256.Sum256(preimage)
+	if !hexEq(res.PaymentHash, want[:]) {
+		return "", fmt.Errorf("%w: created invoice hash %s != SHA256(P) %x", ErrLNLegInvalid, res.PaymentHash, want[:])
+	}
+	return res.Bolt11, nil
+}
+
+func (l *clnLNLeg) WaitInvoicePaid(label string, timeout time.Duration) (uint64, error) {
+	// waitinvoice blocks server-side until the invoice is paid or expires; use a
+	// dedicated connection whose deadline is the caller's timeout.
+	rpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: timeout}
+	var res struct {
+		Status             string `json:"status"`
+		AmountReceivedMsat uint64 `json:"amount_received_msat"`
+		AmountMsat         uint64 `json:"amount_msat"`
+	}
+	if err := rpc.call(&res, "waitinvoice", map[string]interface{}{"label": label}); err != nil {
+		return 0, fmt.Errorf("waitinvoice: %w", err)
+	}
+	if res.Status != "paid" {
+		return 0, fmt.Errorf("%w: invoice status %q (not paid)", ErrLNLegInvalid, res.Status)
+	}
+	if res.AmountReceivedMsat != 0 {
+		return res.AmountReceivedMsat, nil
+	}
+	return res.AmountMsat, nil
 }
 
 // --- minimal CLN lightning-rpc client (unix socket, JSON-RPC 2.0) -----------

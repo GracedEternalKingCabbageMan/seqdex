@@ -356,3 +356,87 @@ func (m *SubmarineSwap) watchSEQClaimUntil(seqLeg *LegLock, timeout time.Duratio
 func (m *SubmarineSwap) RefundReverseSEQ(seqLeg *LegLock, makerRefundKey *Key, nLockTime uint32, fee uint64) (string, error) {
 	return m.RefundSEQLeg(seqLeg, makerRefundKey, nLockTime, fee)
 }
+
+// --- REVERSE (maker-secret / taker-gated): plugin-free ----------------------
+//
+// The hold-invoice REVERSE (RunReverse) makes the MAKER non-custodial by having
+// the taker generate P and the maker settle the held invoice only after the
+// asset claim is anchor-deep. That needs a hold-invoice plugin on the node.
+//
+// This second REVERSE mode needs NO plugin: the MAKER generates P, locks the
+// asset HTLC (claim=taker), and issues a PLAIN invoice on H. The safety of the
+// cross-leg point moves to the TAKER, who must verify the asset HTLC (correct
+// script/amount/claim key) AND that it is anchor-buried >= min_anchor_depth
+// BEFORE paying — because paying the plain invoice settles the BTC-LN
+// irreversibly and reveals P, which the taker then uses to claim the asset.
+// (The taker uses VerifySeqAnchorBuried for that gate; it is the SAME rule, just
+// enforced pre-payment on the taker side instead of pre-settle on the maker.)
+//
+// Trade-off vs the hold mode: with a plain invoice the taker cannot be refunded
+// on LN if the maker's asset HTLC turns out bad, so the taker MUST do the
+// verify+anchor gate first. In exchange it ships with a stock SeqLN/CLN node.
+
+// ReverseMakerSecretParams is the maker's input for the plugin-free reverse mode.
+// The SubmarineSwap MUST have been built with a full HashLock (NewHashLock(P)) so
+// the maker knows P.
+type ReverseMakerSecretParams struct {
+	TakerSeqClaimPub  []byte // taker's SEQ-leg claim pubkey (taker claims with P)
+	MakerSeqRefundPub []byte // maker's SEQ-leg refund pubkey (reclaim after CLTV)
+	SeqLocktime       uint32 // the SEQ HTLC CLTV height (maker's refund branch)
+	SeqAmountCoins    string // the SEQ asset amount to lock (decimal string)
+	SeqAssetLabel     string // the SEQ asset to lock
+
+	InvoiceMsat  uint64 // the BTC-LN amount to invoice
+	InvoiceCLTV  uint32 // the invoice's min_final_cltv_expiry
+	InvoiceLabel string // a unique label for the invoice (also used to await payment)
+	InvoiceDesc  string // the invoice description
+}
+
+// ReverseMakerSecretOffer is what the maker hands the taker: the invoice to pay
+// and the funded asset HTLC to verify + anchor-gate before paying.
+type ReverseMakerSecretOffer struct {
+	Bolt11    string
+	HashH     []byte
+	SeqLeg    *LegLock
+	SeqBlock  string // the Sequentia block that confirmed the asset HTLC (for the taker's anchor gate)
+	Label     string
+	AmountSat uint64
+}
+
+// OfferReverseMakerSecret performs the maker's side of the plugin-free reverse
+// swap up to the point the taker must act: it locks the asset HTLC (claim=taker)
+// and issues a plain invoice on H = SHA256(P). The maker must know P (the swap
+// was built with NewHashLock(P)). The returned offer carries everything the taker
+// needs to verify the HTLC and run its own anchor-depth gate before paying.
+func (m *SubmarineSwap) OfferReverseMakerSecret(p ReverseMakerSecretParams) (*ReverseMakerSecretOffer, error) {
+	if len(m.hash.Secret) == 0 {
+		return nil, fmt.Errorf("%w: maker-secret reverse requires the maker to know P (build with NewHashLock)", ErrLNLegInvalid)
+	}
+	// Lock the asset HTLC first (claim=taker) so the taker has something to verify.
+	seqLeg, seqBlock, err := m.LockSEQLeg(p.TakerSeqClaimPub, p.MakerSeqRefundPub, p.SeqAmountCoins, p.SeqAssetLabel, p.SeqLocktime)
+	if err != nil {
+		return &ReverseMakerSecretOffer{SeqLeg: seqLeg}, fmt.Errorf("lock SEQ leg: %w", err)
+	}
+	bolt11, err := m.ln.CreateInvoice(m.hash.Secret, p.InvoiceMsat, p.InvoiceCLTV, p.InvoiceLabel, p.InvoiceDesc)
+	if err != nil {
+		// The asset is locked but no invoice exists: the caller reclaims it via
+		// RefundReverseSEQ after SeqLocktime.
+		return &ReverseMakerSecretOffer{SeqLeg: seqLeg, SeqBlock: seqBlock}, fmt.Errorf("create invoice: %w", err)
+	}
+	return &ReverseMakerSecretOffer{
+		Bolt11:    bolt11,
+		HashH:     append([]byte(nil), m.hash.Hash...),
+		SeqLeg:    seqLeg,
+		SeqBlock:  seqBlock,
+		Label:     p.InvoiceLabel,
+		AmountSat: p.InvoiceMsat / 1000,
+	}, nil
+}
+
+// AwaitReversePayment blocks until the taker pays the invoice (label), returning
+// the received amount (msat). After this the taker holds P (learned from paying)
+// and can claim the asset; if it never returns before SeqLocktime the maker
+// reclaims the asset via RefundReverseSEQ.
+func (m *SubmarineSwap) AwaitReversePayment(label string, timeout time.Duration) (uint64, error) {
+	return m.ln.WaitInvoicePaid(label, timeout)
+}
