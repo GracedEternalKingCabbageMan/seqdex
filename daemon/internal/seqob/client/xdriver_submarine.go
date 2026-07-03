@@ -137,6 +137,12 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 	if p.SpendFeeAtoms == 0 {
 		p.SpendFeeAtoms = 1000
 	}
+	if p.AnchorTimeout <= 0 {
+		// The maker must WAIT for the taker's asset funding to bury to
+		// MinAnchorDepth Bitcoin blocks before it pays; a zero timeout would make
+		// the gate fail on the first check. ~1 Bitcoin block/min, several deep.
+		p.AnchorTimeout = 20 * time.Minute
+	}
 	recv := chanRecv(in)
 	res := &MakerSubmarineResult{}
 
@@ -222,7 +228,9 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		InvoiceMsat:       p.InvoiceMsat,
 		MinAnchorDepth:    p.MinAnchorDepth,
 		AnchorTimeout:     p.AnchorTimeout,
-	}, makerSeqClaim, p.SpendFeeAtoms)
+		// Clamp the asset-claim fee to half the leg so the claim output can never
+		// go negative (bad-txns-vout-negative) for a small leg.
+	}, makerSeqClaim, xcSafeFee(p.SpendFeeAtoms, p.SeqAmount))
 	if nr != nil {
 		res.Preimage = nr.Preimage
 		res.SeqClaimTxid = nr.SeqClaimTxID
@@ -401,7 +409,11 @@ func RefundTakerSubmarine(ops SubTakerOps, leg *xchain.LegLock, key *xchain.Key,
 	if uint32(tip) < seqLocktime {
 		return "", fmt.Errorf("%w: seq tip %d < T_seq %d", ErrXcRefundNotDue, tip, seqLocktime)
 	}
-	return ops.RefundSEQLeg(leg, key, seqLocktime, spendFeeAtoms)
+	fee := spendFeeAtoms
+	if leg != nil && leg.Funded != nil {
+		fee = xcSafeFee(spendFeeAtoms, leg.Funded.Amount)
+	}
+	return ops.RefundSEQLeg(leg, key, seqLocktime, fee)
 }
 
 // chanRecv adapts a <-chan []byte to the XcRecv signature used by recvXcType.
