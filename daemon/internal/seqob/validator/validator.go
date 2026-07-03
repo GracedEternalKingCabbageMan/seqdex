@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 // ErrReplay signals that the submitted offer is a byte-identical replay of an
@@ -224,6 +224,64 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 	}
 	if o.GetCrossChain() != nil {
 		return v.checkCrossChain(o)
+	}
+	if o.GetLightning() != nil {
+		return v.checkLightning(o)
+	}
+	return nil
+}
+
+// checkLightning validates a submarine-swap (asset on-chain <-> BTC-over-Lightning)
+// offer's LightningTerms. Like the cross-chain case the resting keys are advisory
+// (the load-bearing SEQ-claim key is minted per-lift and bound by recomputing the
+// redeemScript at settlement); here we only check well-formedness. Convention:
+// base = the SEQ asset, quote = the BTC sentinel.
+func (v *Validator) checkLightning(o *seqobv1.Offer) error {
+	lt := o.GetLightning()
+	if lt == nil {
+		return fmt.Errorf("lightning offer missing lightning terms")
+	}
+	p := o.GetPair()
+	baseBTC, quoteBTC := offer.IsBTCSentinel(p.GetBaseAsset()), offer.IsBTCSentinel(p.GetQuoteAsset())
+	if baseBTC == quoteBTC {
+		return fmt.Errorf("lightning pair must have exactly one BTC-sentinel side")
+	}
+	if !quoteBTC {
+		return fmt.Errorf("lightning pair must be base=asset, quote=%s", offer.BTCSentinel)
+	}
+	// Advisory HTLC keys are raw compressed pubkey bytes (LightningTerms uses bytes,
+	// unlike CrossChainTerms' hex strings).
+	for _, pk := range []struct {
+		name string
+		b    []byte
+	}{
+		{"maker_claim_pub", lt.GetMakerClaimPub()},
+		{"maker_refund_pub", lt.GetMakerRefundPub()},
+	} {
+		if _, err := btcec.ParsePubKey(pk.b); err != nil {
+			return fmt.Errorf("lightning %s invalid: %v", pk.name, err)
+		}
+	}
+	if lt.GetLnDirection() > 1 {
+		return fmt.Errorf("lightning ln_direction must be 0 (asset->BTC-LN) or 1 (BTC-LN->asset)")
+	}
+	if !offer.LnDirectionConsistent(lt.GetLnDirection(), o.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_SELL) {
+		return fmt.Errorf("lightning ln_direction inconsistent with trade_dir")
+	}
+	// The maker's LN node id is required when the TAKER must pay the maker (the
+	// reverse direction); for the normal direction the maker pays the taker's
+	// invoice, so it is optional. Validate it whenever present.
+	if lt.GetLnDirection() == offer.LnBTCForAsset && o.GetMakerLnNodePubkey() == "" {
+		return fmt.Errorf("lightning reverse offer must advertise maker_ln_node_pubkey")
+	}
+	if npk := o.GetMakerLnNodePubkey(); npk != "" {
+		b, err := hex.DecodeString(npk)
+		if err != nil {
+			return fmt.Errorf("maker_ln_node_pubkey not hex: %v", err)
+		}
+		if _, err := btcec.ParsePubKey(b); err != nil {
+			return fmt.Errorf("maker_ln_node_pubkey invalid: %v", err)
+		}
 	}
 	return nil
 }

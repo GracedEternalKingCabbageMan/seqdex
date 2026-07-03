@@ -1,0 +1,264 @@
+package main
+
+// submarine.go adds the SUBMARINE-SWAP (Sequentia asset on-chain <-> BTC over
+// Lightning) maker mode to seqob-maker. It is the Lightning sibling of the CROSS
+// mode (runCrossMaker): it posts a signed LightningTerms offer and serves each
+// lift with RunMakerSubmarineNormal over the same relay courier. v1 = the NORMAL
+// direction: the maker BUYS the asset for BTC-LN (it pays the taker's BOLT11 and
+// claims the asset); the taker, the secret holder, sells the asset. It needs no
+// hold-invoice plugin and no BTC chain backend — only the Sequentia node (asset
+// leg) and the maker's SeqLN-on-Bitcoin lightning-rpc (BTC-LN leg).
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/thanhpk/randstr"
+
+	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/client"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
+)
+
+type submarineMakerConfig struct {
+	relay       string
+	makerKey    *btcec.PrivateKey
+	makerPubHex string
+	makerPubKey []byte // 33-byte compressed (advisory LightningTerms keys)
+	asset       string // the SEQ asset the maker buys (base)
+	assetAmt    uint64 // asset atoms the maker acquires
+	btcSats     uint64 // BTC-LN sats the maker pays (converted to msat per-lift)
+	feeAsset    string
+	expiry      time.Duration
+	minAnchor   uint32 // offer.min_anchor_depth (finality DISPLAY only)
+	offerID     string
+	seqRPCURL   string
+	seqWallet   string
+	lnSocket    string // the maker's SeqLN-on-Bitcoin lightning-rpc
+	seqDelta    uint32 // T_seq = SEQ tip + this
+	subAnchor   int64  // the submarine cross-leg anchor-depth gate (>=2)
+	onchainCltv uint32 // advisory CLTV in the resting LightningTerms
+	spendFee    uint64 // maker asset-claim fee (atoms)
+}
+
+// buildSubmarineOffer builds a NORMAL Lightning offer: base=asset, quote=the BTC
+// sentinel. In the NORMAL flow the maker PAYS the taker's BOLT11 and CLAIMS the
+// asset, so the maker BUYS the asset for BTC-LN (trade_dir=BUY, ln_direction=
+// LnAssetForBTC). The resting LightningTerms keys are ADVISORY (the load-bearing
+// SEQ-claim key is minted per-lift over the E2E courier); maker_ln_node_pubkey
+// advertises the maker's LN node.
+func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv1.Offer {
+	return &seqobv1.Offer{
+		OfferId:           orDefault(cfg.offerID, randstr.Hex(16)),
+		SchemaVersion:     1,
+		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
+		BaseAmount:        cfg.assetAmt,
+		AllowPartial:      false, // whole-HTLC lifts, one at a time
+		CreatedAtUnix:     uint64(time.Now().Unix()),
+		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
+		FeeAssetHint:      cfg.feeAsset,
+		MinAnchorDepth:    cfg.minAnchor,
+		MakerLnNodePubkey: makerLnNodeID,
+		TradeDir:          seqobv1.TradeDir_TRADE_DIR_BUY, // the maker acquires the asset
+		OfferAsset:        offer.BTCSentinel,
+		OfferAmount:       cfg.btcSats, // BTC-LN the maker pays
+		WantAsset:         cfg.asset,
+		WantAmount:        cfg.assetAmt, // the asset the maker acquires (== base_amount)
+		Settlement: &seqobv1.Offer_Lightning{Lightning: &seqobv1.LightningTerms{
+			LnDirection:            offer.LnAssetForBTC,
+			MakerClaimPub:          cfg.makerPubKey,
+			MakerRefundPub:         cfg.makerPubKey,
+			OnchainCltv:            cfg.onchainCltv,
+			MakerIssuesHoldInvoice: false, // NORMAL: the taker mints the invoice on P
+		}},
+	}
+}
+
+// runSubmarineMaker posts a Lightning offer and serves NORMAL submarine lifts. It
+// needs no Ocean wallet and no bitcoind: the SEQ asset leg is funded from the
+// Sequentia NODE wallet, and the BTC-LN it receives lands in the maker's SeqLN
+// channel balance.
+func runSubmarineMaker(cfg submarineMakerConfig) {
+	if cfg.seqRPCURL == "" {
+		fatal("-mode lightning requires -xseq-rpc (the Sequentia node RPC)")
+	}
+	if cfg.lnSocket == "" {
+		fatal("-mode lightning requires -ln-socket (the maker's SeqLN lightning-rpc)")
+	}
+	seqRPC, err := rpcFromURL(cfg.seqRPCURL)
+	if err != nil {
+		fatal("-xseq-rpc: %v", err)
+	}
+	seqChain := xchain.NewChain(seqRPC, cfg.seqWallet)
+	if _, err := seqChain.BlockCount(); err != nil {
+		fatal("sequentia node unreachable: %v", err)
+	}
+	// Validate the LN node up front and advertise its id in the offer.
+	lnID, err := xchain.NewCLNLNLeg(cfg.lnSocket).NodeID()
+	if err != nil {
+		fatal("lightning-rpc %s unreachable: %v", cfg.lnSocket, err)
+	}
+
+	o := buildSubmarineOffer(cfg, lnID)
+	if err := offer.SignOffer(o, cfg.makerKey); err != nil {
+		fatal("sign offer: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(cfg.relay, "http") + "/v1/ws"
+	ws := &crossWS{}
+	if err := ws.redial(wsURL, o); err != nil {
+		fatal("dial ws %s: %v", wsURL, err)
+	}
+	fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+	fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
+		cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, lnID)
+	fmt.Printf("  taker lifts with: seqob-cli xsublift -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
+
+	serveSubmarine(ws, wsURL, o, cfg, seqChain)
+}
+
+// serveSubmarine is the Lightning-mode event loop: each lift gets its own
+// goroutine running RunMakerSubmarineNormal; the loop routes sealed courier
+// frames to the session's inbox. Same whole-HTLC discipline as serveCross: ONE
+// lift in flight, and the offer is cancelled after its first settlement.
+func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMakerConfig, seqChain *xchain.Chain) {
+	var mu sync.Mutex
+	inboxes := make(map[string]chan []byte)
+	inFlight := 0
+	filled := false
+
+	refuse := func(sid string, cr *client.Crypter, code, msg string) {
+		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
+		if sealed, err := m.Seal(cr); err == nil {
+			_ = ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
+		}
+	}
+
+	for {
+		conn := ws.current()
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			mu.Lock()
+			done := filled && inFlight == 0
+			resubmit := o
+			if filled {
+				resubmit = nil
+			}
+			mu.Unlock()
+			if done {
+				fmt.Println("offer filled and no lift in flight; exiting (restart to re-quote)")
+				return
+			}
+			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue)\n", err)
+			ws.redialLoop(wsURL, resubmit)
+			continue
+		}
+		var from seqobv1.From
+		if err := jsonUnmarshal.Unmarshal(data, &from); err != nil {
+			continue
+		}
+		switch {
+		case from.GetLiftRequested() != nil:
+			lr := from.GetLiftRequested()
+			sid := lr.GetSessionId()
+			cr, err := client.NewMakerCrypterFromLift(cfg.makerKey, lr.GetTakerSessionPubkey())
+			if err != nil {
+				fmt.Printf("lift %s: crypter error: %v\n", sid, err)
+				continue
+			}
+			mu.Lock()
+			busy, done := inFlight > 0, filled
+			var in chan []byte
+			if !busy && !done {
+				inFlight++
+				in = make(chan []byte, 8)
+				inboxes[sid] = in
+			}
+			mu.Unlock()
+			if done {
+				refuse(sid, cr, "offer_filled", "offer already filled; awaiting re-quote")
+				continue
+			}
+			if busy {
+				refuse(sid, cr, "busy", "another lift is in flight (whole-HTLC, one at a time)")
+				continue
+			}
+			fmt.Printf("submarine lift requested: session %s offer %s\n", sid, lr.GetOfferId())
+
+			send := func(sealed []byte) error {
+				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
+			}
+			logf := func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) }
+
+			go func(sid string, in chan []byte) {
+				settled := false
+				defer func() {
+					mu.Lock()
+					inFlight--
+					delete(inboxes, sid)
+					if settled {
+						filled = true
+					}
+					mu.Unlock()
+					if settled {
+						cancelOffer(cfg.relay, o, cfg.makerKey)
+					}
+				}()
+				p := client.MakerSubmarineParams{
+					NewMakerOps: func(hashH []byte) client.SubMakerOps {
+						sub := xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(cfg.lnSocket), xchain.NewHashLockFromHash(hashH))
+						return &client.LiveSubMakerOps{Sub: sub}
+					},
+					Crypter:          cr,
+					SeqTip:           seqChain.BlockCount,
+					AssetHex:         o.GetPair().GetBaseAsset(),
+					SeqAmount:        o.GetWantAmount(),         // the asset the maker acquires
+					InvoiceMsat:      o.GetOfferAmount() * 1000, // BTC sats the maker pays -> msat
+					SeqLocktimeDelta: cfg.seqDelta,
+					MinAnchorDepth:   cfg.subAnchor,
+					SpendFeeAtoms:    cfg.spendFee,
+					Log:              logf,
+				}
+				res, err := client.RunMakerSubmarineNormal(p, in, send)
+				if err != nil {
+					fmt.Printf("session %s: submarine lift ended: %v\n", sid, err)
+					if res != nil && res.SeqClaimTxid != "" {
+						fmt.Printf("session %s: (asset claimed in %s despite error)\n", sid, res.SeqClaimTxid)
+					}
+					return
+				}
+				settled = true
+				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN, claimed the asset in %s\n",
+					sid, res.SeqClaimTxid)
+			}(sid, in)
+
+		case from.GetSwapMsg() != nil:
+			sm := from.GetSwapMsg()
+			mu.Lock()
+			in := inboxes[sm.GetSessionId()]
+			mu.Unlock()
+			if in == nil {
+				fmt.Printf("session %s: swap_msg without a live submarine session; ignoring\n", sm.GetSessionId())
+				continue
+			}
+			select {
+			case in <- sm.GetCiphertext():
+			default:
+				fmt.Printf("session %s: inbox full; dropping frame\n", sm.GetSessionId())
+			}
+
+		case from.GetOrderStatus() != nil:
+			st := from.GetOrderStatus()
+			fmt.Printf("order %s status=%s active=%d txid=%s\n",
+				st.GetOfferId(), st.GetStatus(), st.GetActiveAmount(), st.GetSettleTxid())
+
+		case from.GetError() != nil:
+			e := from.GetError()
+			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+		}
+	}
+}

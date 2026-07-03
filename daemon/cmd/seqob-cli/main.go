@@ -52,6 +52,8 @@ func main() {
 		cmdXSell(os.Args[2:])
 	case "xrefund-seq":
 		cmdXRefundSeq(os.Args[2:])
+	case "xsublift":
+		cmdXSubLift(os.Args[2:])
 	default:
 		usage()
 	}
@@ -69,7 +71,9 @@ commands:
   xrefund recover the BTC leg of an aborted xlift after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)
   xsell   sell the asset for real BTC over a REVERSE cross offer (maker holds the secret, funds BTC first)
           (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -seq-rpc -seq-wallet -state-file)
-  xrefund-seq  recover the asset leg of an aborted xsell after T_seq (flags: -state-file -seq-rpc -seq-wallet -wait)`)
+  xrefund-seq  recover the asset leg of an aborted xsell after T_seq (flags: -state-file -seq-rpc -seq-wallet -wait)
+  xsublift  sell the asset for BTC over LIGHTNING (submarine swap): fund the asset HTLC, receive BTC-LN
+          (flags: -relay -asset -offer-id -maker-pubkey -seq-rpc -seq-wallet -ln-socket -state-file)`)
 	os.Exit(2)
 }
 
