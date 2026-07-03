@@ -3,11 +3,15 @@ package main
 // submarine.go adds the SUBMARINE-SWAP (Sequentia asset on-chain <-> BTC over
 // Lightning) maker mode to seqob-maker. It is the Lightning sibling of the CROSS
 // mode (runCrossMaker): it posts a signed LightningTerms offer and serves each
-// lift with RunMakerSubmarineNormal over the same relay courier. v1 = the NORMAL
-// direction: the maker BUYS the asset for BTC-LN (it pays the taker's BOLT11 and
-// claims the asset); the taker, the secret holder, sells the asset. It needs no
-// hold-invoice plugin and no BTC chain backend — only the Sequentia node (asset
-// leg) and the maker's SeqLN-on-Bitcoin lightning-rpc (BTC-LN leg).
+// lift over the same relay courier. Both plugin-free directions are wired,
+// selected by -side:
+//   - -side buy  (NORMAL): the maker BUYS the asset for BTC-LN — it pays the
+//     taker's BOLT11 and claims the asset (serve -> RunMakerSubmarineNormal).
+//   - -side sell (REVERSE, maker-secret): the maker SELLS the asset — it locks the
+//     asset HTLC (claim=taker) and issues a plain invoice; the taker pays it and
+//     claims the asset (serve -> RunMakerReverseSubmarine).
+// It needs no hold-invoice plugin and no BTC chain backend — only the Sequentia
+// node (asset leg) and the maker's SeqLN-on-Bitcoin lightning-rpc (BTC-LN leg).
 
 import (
 	"fmt"
@@ -43,16 +47,20 @@ type submarineMakerConfig struct {
 	subAnchor   int64  // the submarine cross-leg anchor-depth gate (>=2)
 	onchainCltv uint32 // advisory CLTV in the resting LightningTerms
 	spendFee    uint64 // maker asset-claim fee (atoms)
+	reverse     bool   // true = SELL the asset for BTC-LN (maker-secret REVERSE); false = BUY (NORMAL)
 }
 
-// buildSubmarineOffer builds a NORMAL Lightning offer: base=asset, quote=the BTC
-// sentinel. In the NORMAL flow the maker PAYS the taker's BOLT11 and CLAIMS the
-// asset, so the maker BUYS the asset for BTC-LN (trade_dir=BUY, ln_direction=
-// LnAssetForBTC). The resting LightningTerms keys are ADVISORY (the load-bearing
+// buildSubmarineOffer builds a Lightning offer (base=asset, quote=the BTC
+// sentinel). The resting LightningTerms keys are ADVISORY (the load-bearing
 // SEQ-claim key is minted per-lift over the E2E courier); maker_ln_node_pubkey
-// advertises the maker's LN node.
+// advertises the maker's LN node. Two directions:
+//   - NORMAL (cfg.reverse=false): the maker PAYS the taker's BOLT11 and CLAIMS the
+//     asset, so the maker BUYS the asset (trade_dir=BUY, ln_direction=LnAssetForBTC).
+//   - REVERSE (cfg.reverse=true, maker-secret): the maker LOCKS the asset (claim=
+//     taker) and issues a plain invoice, so the maker SELLS the asset (trade_dir=
+//     SELL, ln_direction=LnBTCForAsset).
 func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv1.Offer {
-	return &seqobv1.Offer{
+	o := &seqobv1.Offer{
 		OfferId:           orDefault(cfg.offerID, randstr.Hex(16)),
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
@@ -63,19 +71,25 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 		FeeAssetHint:      cfg.feeAsset,
 		MinAnchorDepth:    cfg.minAnchor,
 		MakerLnNodePubkey: makerLnNodeID,
-		TradeDir:          seqobv1.TradeDir_TRADE_DIR_BUY, // the maker acquires the asset
-		OfferAsset:        offer.BTCSentinel,
-		OfferAmount:       cfg.btcSats, // BTC-LN the maker pays
-		WantAsset:         cfg.asset,
-		WantAmount:        cfg.assetAmt, // the asset the maker acquires (== base_amount)
 		Settlement: &seqobv1.Offer_Lightning{Lightning: &seqobv1.LightningTerms{
-			LnDirection:            offer.LnAssetForBTC,
 			MakerClaimPub:          cfg.makerPubKey,
 			MakerRefundPub:         cfg.makerPubKey,
 			OnchainCltv:            cfg.onchainCltv,
-			MakerIssuesHoldInvoice: false, // NORMAL: the taker mints the invoice on P
+			MakerIssuesHoldInvoice: false, // both v1 modes are plugin-free
 		}},
 	}
+	if cfg.reverse {
+		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_SELL // the maker gives up the asset
+		o.OfferAsset, o.OfferAmount = cfg.asset, cfg.assetAmt
+		o.WantAsset, o.WantAmount = offer.BTCSentinel, cfg.btcSats
+		o.GetLightning().LnDirection = offer.LnBTCForAsset
+	} else {
+		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_BUY // the maker acquires the asset
+		o.OfferAsset, o.OfferAmount = offer.BTCSentinel, cfg.btcSats
+		o.WantAsset, o.WantAmount = cfg.asset, cfg.assetAmt
+		o.GetLightning().LnDirection = offer.LnAssetForBTC
+	}
+	return o
 }
 
 // runSubmarineMaker posts a Lightning offer and serves NORMAL submarine lifts. It
@@ -113,10 +127,17 @@ func runSubmarineMaker(cfg submarineMakerConfig) {
 	if err := ws.redial(wsURL, o); err != nil {
 		fatal("dial ws %s: %v", wsURL, err)
 	}
-	fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-	fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
-		cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, lnID)
-	fmt.Printf("  taker lifts with: seqob-cli xsublift -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
+	if cfg.reverse {
+		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  taker lifts with: seqob-cli xsubbuy -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
+	} else {
+		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+		fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
+			cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  taker lifts with: seqob-cli xsublift -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
+	}
 
 	serveSubmarine(ws, wsURL, o, cfg, seqChain)
 }
@@ -208,6 +229,38 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 				}()
+				if o.GetLightning().GetLnDirection() == offer.LnBTCForAsset {
+					// REVERSE (maker-secret): the maker locks the asset + issues a
+					// plain invoice; the taker pays it and claims the asset.
+					p := client.MakerReverseSubmarineParams{
+						NewMakerOps: func(secret []byte) client.SubReverseMakerOps {
+							sub := xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(cfg.lnSocket), xchain.NewHashLock(secret))
+							return &client.LiveSubReverseMakerOps{Sub: sub}
+						},
+						Crypter:          cr,
+						SeqTip:           seqChain.BlockCount,
+						AssetHex:         o.GetPair().GetBaseAsset(),
+						SeqAmount:        o.GetOfferAmount(),       // the asset the maker sells
+						InvoiceMsat:      o.GetWantAmount() * 1000, // BTC sats wanted -> msat
+						SeqLocktimeDelta: cfg.seqDelta,
+						Log:              logf,
+					}
+					res, err := client.RunMakerReverseSubmarine(p, in, send)
+					if err != nil {
+						fmt.Printf("session %s: reverse submarine lift ended: %v\n", sid, err)
+						if res != nil && res.SeqLeg != nil {
+							fmt.Printf("session %s: asset %s:%d refundable after T_seq=%d if unpaid\n",
+								sid, res.SeqLeg.Funded.TxID, res.SeqLeg.Funded.Vout, res.SeqLocktime)
+						}
+						return
+					}
+					settled = true
+					fmt.Printf("session %s: REVERSE SUBMARINE SWAP SETTLED: received %d msat over BTC-LN; the taker claimed the asset\n",
+						sid, res.PaidMsat)
+					return
+				}
+				// NORMAL: the taker funds the asset HTLC + hands us a BOLT11; we
+				// pay it (learning P) and claim the asset.
 				p := client.MakerSubmarineParams{
 					NewMakerOps: func(hashH []byte) client.SubMakerOps {
 						sub := xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(cfg.lnSocket), xchain.NewHashLockFromHash(hashH))

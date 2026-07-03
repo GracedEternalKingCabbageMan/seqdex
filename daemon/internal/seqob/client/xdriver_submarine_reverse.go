@@ -239,6 +239,11 @@ type TakerReverseSubmarineParams struct {
 	SpendFeeAtoms  uint64 // asset-claim fee (default 1000)
 	Timing         XcTiming
 	Log            func(format string, args ...interface{})
+
+	// OnPaid is invoked the instant the invoice is paid and P is learned, BEFORE
+	// the asset claim, so the caller persists P + the leg: a crash between paying
+	// (irreversible) and claiming must not lose P (the only key to the asset).
+	OnPaid func(preimage []byte, leg *xchain.LegLock)
 }
 
 type TakerReverseSubmarineResult struct {
@@ -344,6 +349,9 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 		return res, fmt.Errorf("taker reverse pay invoice: %w", err)
 	}
 	res.Preimage = preimage
+	if p.OnPaid != nil {
+		p.OnPaid(preimage, vseq.Leg) // persist P before the claim (crash-safety)
+	}
 
 	// 5. Claim the asset with the learned P.
 	if err := ops.InjectSecret(preimage); err != nil {
