@@ -457,3 +457,11 @@ func (m *SubmarineSwap) MintInvoice(preimage []byte, amountMsat uint64, cltvExpi
 func (m *SubmarineSwap) AwaitInvoicePaid(label string, timeout time.Duration) (uint64, error) {
 	return m.ln.WaitInvoicePaid(label, timeout)
 }
+
+// PayInvoice pays a BOLT11 whose payment_hash MUST equal wantHash and returns the
+// revealed preimage. Used by the REVERSE-direction TAKER, which pays the maker's
+// invoice and thereby LEARNS P (then claims the asset with it). It refuses any
+// invoice not bound to the swap H. Delegates to the LN leg's Pay.
+func (m *SubmarineSwap) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
+	return m.ln.Pay(bolt11, wantHash, amountMsat)
+}
