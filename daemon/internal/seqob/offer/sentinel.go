@@ -18,6 +18,24 @@ const (
 	DirAssetToBTC uint32 = 1
 )
 
+// Lightning (submarine-swap) direction (LightningTerms.ln_direction). The asset
+// leg is always on-chain (Sequentia); the BTC leg is over Lightning. The name is
+// FLOW-oriented (what is exchanged for what); the maker's trade side is the
+// opposite of the party giving the asset:
+//
+//	LnAssetForBTC (NORMAL, on-chain -> LN): the on-chain asset is exchanged for
+//	  BTC-LN. The TAKER holds the secret: it mints a BOLT11 on P, funds the asset
+//	  HTLC (claim=maker), and the maker pays the invoice (learning P) and CLAIMS
+//	  the asset. So the maker acquires the asset -> the maker BUYS (trade_dir=BUY).
+//	LnBTCForAsset (REVERSE, LN -> on-chain): BTC-LN is exchanged for the on-chain
+//	  asset. The maker locks the asset (claim=taker) and the taker pays the maker's
+//	  invoice. The maker gives up the asset -> the maker SELLS (trade_dir=SELL).
+//	  Secret holder depends on maker_issues_hold_invoice.
+const (
+	LnAssetForBTC uint32 = 0
+	LnBTCForAsset uint32 = 1
+)
+
 // IsBTCSentinel reports whether an asset id is the BTC sentinel.
 func IsBTCSentinel(assetID string) bool { return assetID == BTCSentinel }
 
@@ -30,4 +48,16 @@ func DirectionConsistent(direction uint32, isSell bool) bool {
 		return direction == DirBTCToAsset
 	}
 	return direction == DirAssetToBTC
+}
+
+// LnDirectionConsistent checks that a Lightning offer's ln_direction matches its
+// trade direction. Because ln_direction is FLOW-oriented and the maker's side is
+// the opposite of the asset-giver, the mapping is the INVERSE of the cross-chain
+// case: a SELL (maker gives the asset) is the REVERSE flow (BTC-LN -> asset); a
+// BUY (maker acquires the asset) is the NORMAL flow (asset -> BTC-LN).
+func LnDirectionConsistent(lnDirection uint32, isSell bool) bool {
+	if isSell {
+		return lnDirection == LnBTCForAsset
+	}
+	return lnDirection == LnAssetForBTC
 }

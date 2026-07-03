@@ -62,7 +62,7 @@ func main() {
 	confidential := flag.Bool("confidential", true, "post a confidential offer (blinded settlement); false = explicit")
 	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
-	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross (cross = BTC<->asset HTLC over the order book; quote is forced to the BTC sentinel, base is the asset)")
+	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap, base is the asset, quote is the BTC sentinel)")
 	// Cross-mode settlement wiring (pkg/xchain, no Ocean needed): the SEQ leg is
 	// funded from the Sequentia NODE wallet and the BTC leg is claimed into the
 	// bitcoind wallet — the same reserves the RFQ maker uses.
@@ -78,6 +78,9 @@ func main() {
 	btcFeeRate := flag.Float64("btc-fee-rate", 2, "cross: sat/vB fee rate for funding the BTC HTLC leg (explicit, so it never depends on the node's estimatesmartfee/settxfee; 0 = node default)")
 	xstateDir := flag.String("xstate-dir", "xmaker-sessions", "cross: directory for per-lift session state (keys/legs; the recovery material)")
 	resume := flag.Bool("resume", false, "cross: instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund) and exit")
+	lnSocket := flag.String("ln-socket", "", "lightning: the maker's SeqLN-on-Bitcoin lightning-rpc unix socket (required for -mode lightning)")
+	subAnchor := flag.Int64("sub-anchor-depth", 3, "lightning: Bitcoin-anchor depth the maker requires on the taker's asset funding before it pays the invoice (>=2; the submarine cross-leg safety gate)")
+	onchainCltv := flag.Uint("onchain-cltv", 240, "lightning: advisory CLTV (blocks) in the resting LightningTerms (the load-bearing T_seq is minted per-lift)")
 	flag.Parse()
 
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
@@ -88,13 +91,27 @@ func main() {
 	}
 
 	cross := strings.ToLower(*mode) == "cross"
-	if !cross && *account == "" {
+	lightning := strings.ToLower(*mode) == "lightning"
+	if !cross && !lightning && *account == "" {
 		fatal("-account is required (the Ocean account holding the offer asset)")
 	}
 
 	makerKey := loadOrGenKey(*makerPriv)
 	makerPubHex := hex.EncodeToString(makerKey.PubKey().SerializeCompressed())
 	ctx := context.Background()
+
+	if lightning {
+		runSubmarineMaker(submarineMakerConfig{
+			relay: *relay, makerKey: makerKey, makerPubHex: makerPubHex,
+			makerPubKey: makerKey.PubKey().SerializeCompressed(),
+			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
+			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
+			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet, lnSocket: *lnSocket,
+			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
+			spendFee: *spendFee,
+		})
+		return
+	}
 
 	if cross {
 		runCrossMaker(crossMakerConfig{
