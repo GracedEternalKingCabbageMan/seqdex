@@ -96,13 +96,19 @@ func (l *clnLNLeg) NodeID() (string, error) {
 
 func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
 	// Decode first so we never pay an invoice whose hash is not the swap secret,
-	// and to sanity-check the amount.
+	// and to sanity-check the amount. CLN's decoder command is `decode` (the older
+	// `decodepay` is not present on all builds); it takes the invoice as `string`.
 	var dec struct {
+		Type        string `json:"type"`
+		Valid       bool   `json:"valid"`
 		PaymentHash string `json:"payment_hash"`
 		AmountMsat  uint64 `json:"amount_msat"`
 	}
-	if err := l.rpc.call(&dec, "decodepay", map[string]interface{}{"bolt11": bolt11}); err != nil {
-		return nil, fmt.Errorf("decodepay: %w", err)
+	if err := l.rpc.call(&dec, "decode", map[string]interface{}{"string": bolt11}); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if !dec.Valid {
+		return nil, fmt.Errorf("%w: invoice does not decode as valid (%s)", ErrLNLegInvalid, dec.Type)
 	}
 	if !hexEq(dec.PaymentHash, wantHash) {
 		return nil, fmt.Errorf("%w: invoice payment_hash %s != swap hash %x", ErrLNLegInvalid, dec.PaymentHash, wantHash)
@@ -115,7 +121,9 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		PaymentPre   string `json:"payment_preimage"`
 		AmountSentMs uint64 `json:"amount_sent_msat"`
 	}
-	params := map[string]interface{}{"bolt11": bolt11}
+	// `pay` takes the invoice as `invstring` (renamed from `bolt11` to also cover
+	// bolt12); pass `amount_msat` only for an amountless invoice.
+	params := map[string]interface{}{"invstring": bolt11}
 	if amountMsat != 0 && dec.AmountMsat == 0 {
 		params["amount_msat"] = amountMsat // amountless invoice
 	}
