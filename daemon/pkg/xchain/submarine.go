@@ -440,3 +440,20 @@ func (m *SubmarineSwap) OfferReverseMakerSecret(p ReverseMakerSecretParams) (*Re
 func (m *SubmarineSwap) AwaitReversePayment(label string, timeout time.Duration) (uint64, error) {
 	return m.ln.WaitInvoicePaid(label, timeout)
 }
+
+// --- taker-side helpers (NORMAL: taker sells the asset, receives BTC-LN) -----
+
+// MintInvoice creates a plain BOLT11 on THIS node bound to preimage (payment_hash
+// = SHA256(preimage)). Used by the NORMAL-direction TAKER, which chooses P and
+// mints the invoice it wants the maker to pay (paying it delivers the taker's
+// BTC-LN and reveals P to the maker so it can claim the asset). Delegates to the
+// LN leg's CreateInvoice.
+func (m *SubmarineSwap) MintInvoice(preimage []byte, amountMsat uint64, cltvExpiry uint32, label, description string) (string, error) {
+	return m.ln.CreateInvoice(preimage, amountMsat, cltvExpiry, label, description)
+}
+
+// AwaitInvoicePaid blocks until the invoice with the given label is paid on THIS
+// node (or the deadline). Generic sibling of AwaitReversePayment.
+func (m *SubmarineSwap) AwaitInvoicePaid(label string, timeout time.Duration) (uint64, error) {
+	return m.ln.WaitInvoicePaid(label, timeout)
+}
