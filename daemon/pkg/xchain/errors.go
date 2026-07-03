@@ -35,4 +35,13 @@ var (
 	// ErrSEQLegUnconfirmed is the reverse mirror of ErrBTCLegUnconfirmed: the
 	// taker's SEQ asset leg is not yet confirmed to the required depth.
 	ErrSEQLegUnconfirmed = errors.New("xchain: taker SEQ leg not confirmed to required depth")
+
+	// ErrLNLegInvalid means the Lightning leg of a submarine swap does not match
+	// the swap (invoice hash != H, wrong amount, or a revealed preimage that does
+	// not hash to H). The maker MUST NOT proceed.
+	ErrLNLegInvalid = errors.New("xchain: submarine LN leg invalid (does not match swap)")
+
+	// ErrLNLegTimeout means a Lightning-leg wait (e.g. a hold invoice never
+	// reaching "accepted") exceeded its deadline; fall back to the refund path.
+	ErrLNLegTimeout = errors.New("xchain: submarine LN leg timed out")
 )
