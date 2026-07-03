@@ -28,6 +28,14 @@ func (f *fakeLNLeg) WaitHeld([]byte, time.Duration) (uint64, error) {
 }
 func (f *fakeLNLeg) SettleHold([]byte, []byte) error { f.t.Fatal("SettleHold unexpected"); return nil }
 func (f *fakeLNLeg) CancelHold([]byte) error         { f.t.Fatal("CancelHold unexpected"); return nil }
+func (f *fakeLNLeg) CreateInvoice([]byte, uint64, uint32, string, string) (string, error) {
+	f.t.Fatal("CreateInvoice unexpected")
+	return "", nil
+}
+func (f *fakeLNLeg) WaitInvoicePaid(string, time.Duration) (uint64, error) {
+	f.t.Fatal("WaitInvoicePaid unexpected")
+	return 0, nil
+}
 
 var _ LNLeg = (*fakeLNLeg)(nil)
 
