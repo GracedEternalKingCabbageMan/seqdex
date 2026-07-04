@@ -49,6 +49,12 @@ type LNLeg interface {
 	// pays an invoice not tied to the swap secret).
 	Pay(bolt11 string, wantHash []byte, amountMsat uint64) (preimage []byte, err error)
 
+	// PayHash pays a BARE payment_hash (no BOLT11) to destNodeID and returns the
+	// preimage the payee reveals on settle. Used to pay a counterparty's hold leg
+	// in a pure-LN swap, where the payee has registered the hash with a hold
+	// plugin and there is no invoice. Routes in this leg's asset.
+	PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) (preimage []byte, err error)
+
 	// --- REVERSE direction: the maker holds an invoice and settles on P ---
 
 	// CreateHoldInvoice registers a hold invoice on paymentHash H for amountMsat
@@ -91,15 +97,31 @@ type LNLeg interface {
 // --network=testnet4/bitcoin for real BTC.
 type clnLNLeg struct {
 	rpc *lnRPC
+	// assetID is the 32-byte hex Sequentia asset id this leg is denominated in
+	// (as displayed). "" means the policy asset (BTC / L-BTC). When set, Pay and
+	// PayHash route in this asset via SeqLN's Step-1 `asset=` param, so the same
+	// leg abstraction serves both the BTC leg and a Sequentia asset leg.
+	assetID string
 }
 
 // clnLNLeg must satisfy LNLeg.
 var _ LNLeg = (*clnLNLeg)(nil)
 
 // NewCLNLNLeg builds a Lightning leg backed by the CLN node whose lightning-rpc
-// socket is at socketPath (e.g. <lightning-dir>/<network>/lightning-rpc).
+// socket is at socketPath (e.g. <lightning-dir>/<network>/lightning-rpc). It is
+// denominated in the policy asset (BTC on a --network=bitcoin/testnet4 node).
 func NewCLNLNLeg(socketPath string) *clnLNLeg {
 	return &clnLNLeg{rpc: &lnRPC{socketPath: socketPath, timeout: 120 * time.Second}}
+}
+
+// NewCLNAssetLNLeg builds a Lightning leg denominated in a Sequentia issued
+// asset (assetIDHex = the 32-byte hex asset id). Pay/PayHash route only over
+// channels of that asset. This is the asset side of a pure-LN swap.
+func NewCLNAssetLNLeg(socketPath, assetIDHex string) *clnLNLeg {
+	return &clnLNLeg{
+		rpc:     &lnRPC{socketPath: socketPath, timeout: 120 * time.Second},
+		assetID: assetIDHex,
+	}
 }
 
 func (l *clnLNLeg) NodeID() (string, error) {
@@ -145,6 +167,9 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 	if amountMsat != 0 && dec.AmountMsat == 0 {
 		params["amount_msat"] = amountMsat // amountless invoice
 	}
+	if l.assetID != "" {
+		params["asset"] = l.assetID // route in this leg's Sequentia asset (Step 1)
+	}
 	if err := l.rpc.call(&res, "pay", params); err != nil {
 		return nil, fmt.Errorf("pay: %w", err)
 	}
@@ -158,6 +183,78 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 	// Defence in depth: the revealed preimage must actually hash to wantHash.
 	if !hashEqualsPreimage(wantHash, pre) {
 		return nil, fmt.Errorf("%w: revealed preimage does not hash to the swap H", ErrLNLegInvalid)
+	}
+	return pre, nil
+}
+
+// PayHash pays amountMsat to destNodeID for a BARE payment_hash, with NO BOLT11:
+// the payee holds the hash via a hold plugin (there is no invoice on the payee).
+// It routes in this leg's asset (getroute), sends the HTLC (sendpay), blocks
+// until the payee settles (waitsendpay), and returns the revealed preimage.
+//
+// This is the taker's primitive for paying the maker's incoming hold leg in a
+// pure-LN swap. paymentSecret is placed in the final-hop onion TLV; the payee's
+// hold plugin resolves regardless of it, so an agreed-or-arbitrary value works
+// (the maker may convey an expected secret over the courier). finalCltv is the
+// final-hop cltv delta (0 => a small default).
+func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error) {
+	phHex := hex.EncodeToString(paymentHash)
+
+	// 1. Route to the destination in this leg's asset.
+	rparams := map[string]interface{}{
+		"id":          destNodeID,
+		"amount_msat": amountMsat,
+		"riskfactor":  10,
+	}
+	if finalCltv != 0 {
+		rparams["cltv"] = finalCltv
+	}
+	if l.assetID != "" {
+		rparams["asset"] = l.assetID
+	}
+	var route struct {
+		Route []json.RawMessage `json:"route"`
+	}
+	if err := l.rpc.call(&route, "getroute", rparams); err != nil {
+		return nil, fmt.Errorf("getroute: %w", err)
+	}
+	if len(route.Route) == 0 {
+		return nil, fmt.Errorf("%w: no route to %s (asset %q)", ErrLNLegInvalid, destNodeID, l.assetID)
+	}
+
+	// 2. Send the HTLC to the bare hash along that route.
+	sparams := map[string]interface{}{
+		"route":        route.Route,
+		"payment_hash": phHex,
+		"amount_msat":  amountMsat,
+	}
+	if len(paymentSecret) > 0 {
+		sparams["payment_secret"] = hex.EncodeToString(paymentSecret)
+	}
+	if err := l.rpc.call(nil, "sendpay", sparams); err != nil {
+		return nil, fmt.Errorf("sendpay: %w", err)
+	}
+
+	// 3. Block until the payee resolves it (settle => complete, cancel => fail).
+	//    Use a dedicated connection whose deadline is this leg's timeout, since
+	//    the hold can outlast a single RPC round-trip.
+	wrpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: l.rpc.timeout}
+	var res struct {
+		Status     string `json:"status"`
+		PaymentPre string `json:"payment_preimage"`
+	}
+	if err := wrpc.call(&res, "waitsendpay", map[string]interface{}{"payment_hash": phHex}); err != nil {
+		return nil, fmt.Errorf("waitsendpay: %w", err)
+	}
+	if res.Status != "complete" {
+		return nil, fmt.Errorf("%w: sendpay status %q", ErrLNLegInvalid, res.Status)
+	}
+	pre, err := hex.DecodeString(res.PaymentPre)
+	if err != nil {
+		return nil, fmt.Errorf("bad preimage hex: %w", err)
+	}
+	if !hashEqualsPreimage(paymentHash, pre) {
+		return nil, fmt.Errorf("%w: revealed preimage does not hash to paymentHash", ErrLNLegInvalid)
 	}
 	return pre, nil
 }
@@ -207,8 +304,12 @@ func (l *clnLNLeg) SettleHold(paymentHash, preimage []byte) error {
 	if !hashEqualsPreimage(paymentHash, preimage) {
 		return fmt.Errorf("%w: preimage does not hash to the invoice payment_hash", ErrLNLegInvalid)
 	}
-	return l.rpc.call(nil, "holdinvoicesettle",
-		map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
+	// The hold plugin settles by revealing the preimage (the maker does not know
+	// P until it learns it from the outgoing leg), so pass it explicitly.
+	return l.rpc.call(nil, "holdinvoicesettle", map[string]interface{}{
+		"payment_hash": hex.EncodeToString(paymentHash),
+		"preimage":     hex.EncodeToString(preimage),
+	})
 }
 
 func (l *clnLNLeg) CancelHold(paymentHash []byte) error {
