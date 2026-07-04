@@ -1,7 +1,7 @@
 package xchain
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
 	"os"
 	"strconv"
@@ -9,51 +9,52 @@ import (
 	"time"
 )
 
-// TestPureLNBuyLive proves the pure-LN "buy the asset with BTC" swap end to end:
-// two Lightning legs stitched by one shared secret, NO on-chain leg, NO anchor
-// gate. It runs the maker and taker concurrently against two live SeqLN nodes.
+// Pure-LN swap live tests (Step 2, M2/M3). Two live SeqLN nodes; for a
+// self-contained regtest proof the "BTC" leg is a second Sequentia asset (the
+// mechanism is network-agnostic; the real global Bitcoin-LN leg is M5).
 //
-// For a self-contained regtest proof the "BTC" leg is a second Sequentia asset
-// (the mechanism is network-agnostic; the real global Bitcoin-LN leg is M5).
+//	SEQLN_TAKER_SOCK     = taker node lightning-rpc
+//	SEQLN_MAKER_SOCK     = maker node lightning-rpc (MUST have holdinvoice-seq)
+//	SEQLN_ASSET_ID       = 32-byte hex asset id (e.g. GOLD)
+//	SEQLN_BTC_ASSET_ID   = 32-byte hex asset id used as the BTC stand-in
+//	SEQLN_ASSET_AMT_MSAT = asset amount (default 100000000 = 0.001)
+//	SEQLN_BTC_AMT_MSAT   = "BTC" amount (default 200000000 = 0.002; arbitrary rate)
 //
-//	SEQLN_TAKER_SOCK    = taker node lightning-rpc (receives asset, pays BTC)
-//	SEQLN_MAKER_SOCK    = maker node lightning-rpc (pays asset, receives+holds BTC;
-//	                      MUST have the holdinvoice-seq plugin loaded)
-//	SEQLN_ASSET_ID      = 32-byte hex asset id (e.g. GOLD), maker -> taker
-//	SEQLN_BTC_ASSET_ID  = 32-byte hex asset id used as the BTC stand-in, taker -> maker
-//	SEQLN_ASSET_AMT_MSAT = asset amount   (default 100000000 = 0.001)
-//	SEQLN_BTC_AMT_MSAT   = "BTC" amount   (default 200000000 = 0.002; an arbitrary rate)
-//
-//	go test ./pkg/xchain -run TestPureLNBuyLive -v
-func TestPureLNBuyLive(t *testing.T) {
-	takerSock := os.Getenv("SEQLN_TAKER_SOCK")
-	makerSock := os.Getenv("SEQLN_MAKER_SOCK")
-	assetID := os.Getenv("SEQLN_ASSET_ID")
-	btcID := os.Getenv("SEQLN_BTC_ASSET_ID")
-	if takerSock == "" || makerSock == "" || assetID == "" || btcID == "" {
+//	go test ./pkg/xchain -run TestPureLN -v
+func plnEnv(t *testing.T) (taker, maker, asset, btc string, assetAmt, btcAmt uint64) {
+	t.Helper()
+	taker = os.Getenv("SEQLN_TAKER_SOCK")
+	maker = os.Getenv("SEQLN_MAKER_SOCK")
+	asset = os.Getenv("SEQLN_ASSET_ID")
+	btc = os.Getenv("SEQLN_BTC_ASSET_ID")
+	if taker == "" || maker == "" || asset == "" || btc == "" {
 		t.Skip("set SEQLN_TAKER_SOCK, SEQLN_MAKER_SOCK, SEQLN_ASSET_ID, SEQLN_BTC_ASSET_ID")
 	}
-	assetAmt := envU64("SEQLN_ASSET_AMT_MSAT", 100000000)
-	btcAmt := envU64("SEQLN_BTC_AMT_MSAT", 200000000)
+	return taker, maker, asset, btc, envU64("SEQLN_ASSET_AMT_MSAT", 100000000), envU64("SEQLN_BTC_AMT_MSAT", 200000000)
+}
 
-	// The taker's secret P (and its hash H, shared across both legs).
-	var p [32]byte
-	copy(p[:], []byte("pureln-buy-secret-32bytes-exactly")) // copy takes the first 32
-	hExp := sha256.Sum256(p[:])
+func randPreimage(t *testing.T) []byte {
+	t.Helper()
+	p := make([]byte, 32)
+	if _, err := rand.Read(p); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return p
+}
 
-	maker := NewPureLNSwap(NewCLNAssetLNLeg(makerSock, assetID), NewCLNAssetLNLeg(makerSock, btcID))
-	taker := NewPureLNSwap(NewCLNAssetLNLeg(takerSock, assetID), NewCLNAssetLNLeg(takerSock, btcID))
+// TestPureLNBuyLive: taker buys the asset with BTC. Maker holds BTC, pays the
+// asset. NO on-chain leg, NO anchor gate.
+func TestPureLNBuyLive(t *testing.T) {
+	takerSock, makerSock, asset, btc, assetAmt, btcAmt := plnEnv(t)
+	p := randPreimage(t)
 
-	// Taker issues the asset invoice on P; the maker will pay it.
-	assetInv, h, err := taker.PrepareTakerBuy(p[:], assetAmt)
+	maker := NewPureLNSwap(NewCLNAssetLNLeg(makerSock, asset), NewCLNAssetLNLeg(makerSock, btc))
+	taker := NewPureLNSwap(NewCLNAssetLNLeg(takerSock, asset), NewCLNAssetLNLeg(takerSock, btc))
+
+	assetInv, h, err := taker.PrepareTakerBuy(p, assetAmt)
 	if err != nil {
 		t.Fatalf("PrepareTakerBuy: %v", err)
 	}
-	if hex.EncodeToString(h) != hex.EncodeToString(hExp[:]) {
-		t.Fatalf("h mismatch")
-	}
-
-	// Maker registers the incoming BTC hold on H BEFORE the taker pays it.
 	if err := maker.MakerRegisterHold(h, btcAmt); err != nil {
 		t.Fatalf("MakerRegisterHold: %v", err)
 	}
@@ -63,22 +64,10 @@ func TestPureLNBuyLive(t *testing.T) {
 	}
 
 	start := time.Now()
+	makerDone := make(chan result, 1)
+	go func() { mp, e := maker.MakerFulfill(h, assetInv, assetAmt, 60*time.Second); makerDone <- result{mp, e} }()
 
-	// Maker fulfills concurrently (waits for the held BTC, pays the asset, settles).
-	type res struct {
-		p   []byte
-		err error
-	}
-	makerDone := make(chan res, 1)
-	go func() {
-		mp, err := maker.MakerFulfill(h, assetInv, assetAmt, 60*time.Second)
-		makerDone <- res{mp, err}
-	}()
-
-	// Taker pays the maker's BTC hold by hash; blocks until the maker settles.
-	secret := make([]byte, 32)
-	secret[0] = 0x5a
-	takerP, err := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret)
+	takerP, err := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5a))
 	if err != nil {
 		t.Fatalf("RunTakerBuy: %v", err)
 	}
@@ -86,18 +75,99 @@ func TestPureLNBuyLive(t *testing.T) {
 	if mr.err != nil {
 		t.Fatalf("MakerFulfill: %v", mr.err)
 	}
-	elapsed := time.Since(start)
-
-	// Both sides ended on the SAME preimage the taker chose.
-	if hex.EncodeToString(takerP) != hex.EncodeToString(p[:]) {
-		t.Fatalf("taker preimage %x != chosen %x", takerP, p[:])
-	}
-	if hex.EncodeToString(mr.p) != hex.EncodeToString(p[:]) {
-		t.Fatalf("maker preimage %x != chosen %x", mr.p, p[:])
-	}
-	t.Logf("pure-LN buy settled in %s: taker paid %d msat on the BTC leg, received %d msat on the asset leg; one shared preimage, NO on-chain tx / NO anchor wait",
-		elapsed, btcAmt, assetAmt)
+	assertSameP(t, "buy", takerP, mr.p, p)
+	t.Logf("pure-LN BUY settled in %s: taker paid %d msat BTC leg, got %d msat asset leg; one preimage, NO on-chain / NO anchor wait",
+		time.Since(start), btcAmt, assetAmt)
 }
+
+// TestPureLNSellLive: taker sells the asset for BTC. Maker holds the asset, pays
+// BTC. Requires the maker to have BTC-leg outbound to the taker (rebalance the
+// BTC stand-in asset toward the maker first, e.g. taker pays the maker once).
+func TestPureLNSellLive(t *testing.T) {
+	takerSock, makerSock, asset, btc, assetAmt, btcAmt := plnEnv(t)
+	p := randPreimage(t)
+
+	maker := NewPureLNSwap(NewCLNAssetLNLeg(makerSock, asset), NewCLNAssetLNLeg(makerSock, btc))
+	taker := NewPureLNSwap(NewCLNAssetLNLeg(takerSock, asset), NewCLNAssetLNLeg(takerSock, btc))
+
+	btcInv, h, err := taker.PrepareTakerSell(p, btcAmt)
+	if err != nil {
+		t.Fatalf("PrepareTakerSell: %v", err)
+	}
+	if err := maker.MakerRegisterHoldSell(h, assetAmt); err != nil {
+		t.Fatalf("MakerRegisterHoldSell: %v", err)
+	}
+	makerAssetID, err := maker.assetLeg.NodeID()
+	if err != nil {
+		t.Fatalf("maker asset NodeID: %v", err)
+	}
+
+	start := time.Now()
+	makerDone := make(chan result, 1)
+	go func() { mp, e := maker.MakerFulfillSell(h, btcInv, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
+
+	takerP, err := taker.RunTakerSell(h, makerAssetID, assetAmt, 18, secret32(0x5b))
+	if err != nil {
+		t.Fatalf("RunTakerSell: %v", err)
+	}
+	mr := <-makerDone
+	if mr.err != nil {
+		t.Fatalf("MakerFulfillSell: %v", mr.err)
+	}
+	assertSameP(t, "sell", takerP, mr.p, p)
+	t.Logf("pure-LN SELL settled in %s: taker paid %d msat asset leg, got %d msat BTC leg; one preimage, NO on-chain / NO anchor wait",
+		time.Since(start), assetAmt, btcAmt)
+}
+
+// TestPureLNRefundLive: the atomic-refund path. The maker's OUTGOING pay fails
+// (the taker's asset invoice is for far more than the maker can route), so the
+// maker cancels the BTC hold and the taker's BTC is refunded — neither leg
+// completes, no value moves.
+func TestPureLNRefundLive(t *testing.T) {
+	takerSock, makerSock, asset, btc, _, btcAmt := plnEnv(t)
+	p := randPreimage(t)
+	hugeAsset := uint64(10_000_000_000_000) // 100 GOLD: unroutable, forces the outgoing pay to fail
+
+	maker := NewPureLNSwap(NewCLNAssetLNLeg(makerSock, asset), NewCLNAssetLNLeg(makerSock, btc))
+	taker := NewPureLNSwap(NewCLNAssetLNLeg(takerSock, asset), NewCLNAssetLNLeg(takerSock, btc))
+
+	assetInv, h, err := taker.PrepareTakerBuy(p, hugeAsset)
+	if err != nil {
+		t.Fatalf("PrepareTakerBuy: %v", err)
+	}
+	if err := maker.MakerRegisterHold(h, btcAmt); err != nil {
+		t.Fatalf("MakerRegisterHold: %v", err)
+	}
+	makerBTCID, err := maker.btcLeg.NodeID()
+	if err != nil {
+		t.Fatalf("maker btc NodeID: %v", err)
+	}
+
+	makerDone := make(chan result, 1)
+	go func() { mp, e := maker.MakerFulfill(h, assetInv, hugeAsset, 60*time.Second); makerDone <- result{mp, e} }()
+
+	// The taker's BTC hold must be FAILED back (refund), so PayHash returns an error.
+	_, takerErr := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5c))
+	mr := <-makerDone
+
+	if mr.err == nil {
+		t.Fatalf("expected MakerFulfill to fail (outgoing pay unroutable), got success")
+	}
+	if takerErr == nil {
+		t.Fatalf("expected taker BTC to be refunded (PayHash error), got success — atomicity broken!")
+	}
+	t.Logf("pure-LN REFUND OK: maker's outgoing pay failed -> hold cancelled -> taker refunded. maker err=%q taker err=%q",
+		trunc(mr.err.Error()), trunc(takerErr.Error()))
+}
+
+// --- helpers ---
+
+type result struct {
+	p   []byte
+	err error
+}
+
+func secret32(b byte) []byte { s := make([]byte, 32); s[0] = b; return s }
 
 func envU64(key string, def uint64) uint64 {
 	if v := os.Getenv(key); v != "" {
@@ -106,4 +176,21 @@ func envU64(key string, def uint64) uint64 {
 		}
 	}
 	return def
+}
+
+func assertSameP(t *testing.T, dir string, takerP, makerP, chosen []byte) {
+	t.Helper()
+	if hex.EncodeToString(takerP) != hex.EncodeToString(chosen) {
+		t.Fatalf("%s: taker preimage %x != chosen %x", dir, takerP, chosen)
+	}
+	if hex.EncodeToString(makerP) != hex.EncodeToString(chosen) {
+		t.Fatalf("%s: maker preimage %x != chosen %x", dir, makerP, chosen)
+	}
+}
+
+func trunc(s string) string {
+	if len(s) > 80 {
+		return s[:80]
+	}
+	return s
 }
