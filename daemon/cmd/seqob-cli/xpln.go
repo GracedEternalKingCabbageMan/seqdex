@@ -40,6 +40,7 @@ func cmdXPln(args []string) {
 	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg) (required)")
+	btcAsset := fs.String("btc-asset", "", "BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in). MUST match the maker's -btc-asset")
 	finalCltv := fs.Uint("final-cltv", 18, "final-hop cltv delta when paying the maker's hold")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	holdWait := fs.Duration("hold-wait", 2*time.Minute, "max wait for the maker to register its hold after we send the invoice")
@@ -164,9 +165,13 @@ func cmdXPln(args []string) {
 		return from.GetSwapMsg().GetCiphertext(), nil
 	}
 
+	var btcLeg xchain.LNLeg = xchain.NewCLNLNLeg(*lnSocket)
+	if *btcAsset != "" {
+		btcLeg = xchain.NewCLNAssetLNLeg(*lnSocket, *btcAsset)
+	}
 	swap := xchain.NewPureLNSwap(
 		xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
-		xchain.NewCLNLNLeg(*lnSocket),
+		btcLeg,
 	)
 	var ops client.PlnTakerOps
 	if side == "buy" {

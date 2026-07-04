@@ -262,17 +262,19 @@ func (v *Validator) checkLightning(o *seqobv1.Offer) error {
 			return fmt.Errorf("lightning %s invalid: %v", pk.name, err)
 		}
 	}
-	if lt.GetLnDirection() > 1 {
-		return fmt.Errorf("lightning ln_direction must be 0 (asset->BTC-LN) or 1 (BTC-LN->asset)")
+	if lt.GetLnDirection() > 3 {
+		return fmt.Errorf("lightning ln_direction must be 0/1 (submarine: asset<->BTC-LN) or 2/3 (pure-LN: asset-LN<->BTC-LN)")
 	}
 	if !offer.LnDirectionConsistent(lt.GetLnDirection(), o.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_SELL) {
 		return fmt.Errorf("lightning ln_direction inconsistent with trade_dir")
 	}
-	// The maker's LN node id is required when the TAKER must pay the maker (the
-	// reverse direction); for the normal direction the maker pays the taker's
-	// invoice, so it is optional. Validate it whenever present.
-	if lt.GetLnDirection() == offer.LnBTCForAsset && o.GetMakerLnNodePubkey() == "" {
-		return fmt.Errorf("lightning reverse offer must advertise maker_ln_node_pubkey")
+	// The maker's LN node id is required when the TAKER must pay the maker: the
+	// reverse submarine direction, and BOTH pure-LN directions (the taker pays the
+	// maker's hold by bare hash, so it needs the maker's hold-leg node id). For the
+	// normal submarine direction the maker pays the taker's invoice, so it is
+	// optional there. Validate it whenever present.
+	if (lt.GetLnDirection() == offer.LnBTCForAsset || offer.IsPureLN(lt.GetLnDirection())) && o.GetMakerLnNodePubkey() == "" {
+		return fmt.Errorf("lightning reverse/pure-LN offer must advertise maker_ln_node_pubkey")
 	}
 	if npk := o.GetMakerLnNodePubkey(); npk != "" {
 		b, err := hex.DecodeString(npk)

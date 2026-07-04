@@ -82,6 +82,7 @@ func main() {
 	subAnchor := flag.Int64("sub-anchor-depth", 3, "lightning: Bitcoin-anchor depth the maker requires on the taker's asset funding before it pays the invoice (>=2; the submarine cross-leg safety gate)")
 	onchainCltv := flag.Uint("onchain-cltv", 240, "lightning: advisory CLTV (blocks) in the resting LightningTerms (the load-bearing T_seq is minted per-lift)")
 	assetLnSocket := flag.String("asset-ln-socket", "", "pureln: the maker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg; required for -mode pureln)")
+	btcAsset := flag.String("btc-asset", "", "pureln: BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in)")
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
 	flag.Parse()
 
@@ -109,7 +110,7 @@ func main() {
 			makerPubKey: makerKey.PubKey().SerializeCompressed(),
 			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
 			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
-			assetLnSock: *assetLnSocket, btcLnSock: *lnSocket,
+			assetLnSock: *assetLnSocket, btcLnSock: *lnSocket, btcAsset: *btcAsset,
 			holdTimeout: *holdTimeout, onchainCltv: uint32(*onchainCltv),
 			reverse: strings.ToLower(*side) == "sell", // sell = maker gives the asset (holds BTC); buy = maker acquires (holds asset)
 		})
