@@ -47,6 +47,7 @@ type pureLNMakerConfig struct {
 	offerID     string
 	assetLnSock string // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
 	btcLnSock   string // the maker's SeqLN-on-Bitcoin lightning-rpc (BTC leg)
+	btcAsset    string // BTC-leg asset id (hex); empty = the policy asset / a real BTC-LN node. Set to route the "BTC" leg over a 2nd issued asset (regtest stand-in).
 	holdTimeout time.Duration
 	reverse     bool // true = SELL the asset (maker gives asset; holds BTC); false = BUY (maker acquires asset; holds asset)
 	onchainCltv uint32
@@ -158,9 +159,13 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 
 	dir, _ := cfg.plnDirection()
 	newOps := func() client.PlnMakerOps {
+		var btcLeg xchain.LNLeg = xchain.NewCLNLNLeg(cfg.btcLnSock)
+		if cfg.btcAsset != "" {
+			btcLeg = xchain.NewCLNAssetLNLeg(cfg.btcLnSock, cfg.btcAsset)
+		}
 		swap := xchain.NewPureLNSwap(
 			xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset),
-			xchain.NewCLNLNLeg(cfg.btcLnSock),
+			btcLeg,
 		)
 		if dir == client.PlnSell {
 			return &client.LivePlnMakerSellOps{Swap: swap} // maker holds the asset, pays BTC
