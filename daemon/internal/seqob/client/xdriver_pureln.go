@@ -14,64 +14,110 @@ import (
 // opaque relay courier, settling with the proven pkg/xchain PureLNSwap engine.
 // BOTH legs are off-chain Lightning, stitched by one shared secret — there is NO
 // on-chain leg and NO anchor gate, so this is the simplest of the Lightning
-// drivers: the maker holds its incoming leg and pays its outgoing leg (learning
-// P); the taker generates P, invoices its incoming leg, and pays the maker's hold
-// by bare hash. v1 = the BUY direction (taker buys the asset with BTC; maker holds
-// BTC, pays the asset — ln_direction LnBTCLNForAssetLN).
+// drivers. It is direction-parameterized because BUY and SELL are genuinely
+// symmetric: the TAKER always originates the secret P, mints an invoice on its
+// INCOMING leg (the leg it receives value on), and pays into the maker's hold on
+// its OUTGOING leg; the MAKER always holds its incoming leg, then pays the taker's
+// invoice on its outgoing leg (learning P) and settles the hold.
+//
+//	BUY  (LnBTCLNForAssetLN): taker receives asset, pays BTC -> maker holds BTC, pays asset
+//	SELL (LnAssetLNForBTCLN): taker receives BTC, pays asset -> maker holds asset, pays BTC
 
-// PlnMakerOps is the narrow settlement seam the maker driver runs against.
+// PlnDirection selects which leg the maker holds. The neutral driver derives the
+// hold/pay amounts and picks the live ops from this.
+type PlnDirection int
+
+const (
+	PlnBuy  PlnDirection = iota // taker buys the asset with BTC; maker holds BTC, pays the asset
+	PlnSell                     // taker sells the asset for BTC; maker holds the asset, pays BTC
+)
+
+// PlnMakerOps is the narrow settlement seam the maker driver runs against. The
+// method shapes are direction-neutral; the live ops differ per direction.
 type PlnMakerOps interface {
-	// BtcNodeID returns the maker's incoming-leg node id (advertised so the taker
-	// can pay the hold by bare hash).
-	BtcNodeID() (string, error)
-	// RegisterHold registers the incoming BTC hold on h (btcAmtMsat).
-	RegisterHold(h []byte, btcAmtMsat uint64) error
-	// Fulfill waits for the held BTC, pays the taker's asset invoice (learning P),
-	// and settles the hold. Cancels the hold on failure. Returns the preimage.
-	Fulfill(h []byte, assetInvoice string, assetAmtMsat uint64, holdTimeout time.Duration) ([]byte, error)
+	// HoldNodeID returns the maker's incoming (held) leg node id — advertised so
+	// the taker can pay the hold by bare hash.
+	HoldNodeID() (string, error)
+	// RegisterHold registers the incoming hold on h for holdAmtMsat.
+	RegisterHold(h []byte, holdAmtMsat uint64) error
+	// Fulfill waits for the held incoming leg, pays the taker's invoice for
+	// payAmtMsat (learning P), and settles the hold. Cancels on failure. Returns P.
+	Fulfill(h []byte, takerInvoice string, payAmtMsat uint64, holdTimeout time.Duration) ([]byte, error)
 }
 
 // PlnTakerOps is the settlement seam the taker driver runs against.
 type PlnTakerOps interface {
-	// PrepareBuy issues the asset invoice on the taker's preimage p; returns the
-	// invoice and h = SHA256(p).
-	PrepareBuy(p []byte, assetAmtMsat uint64) (assetInvoice string, h []byte, err error)
-	// PayHold pays the maker's BTC hold by bare hash and blocks until the maker
-	// settles, returning the revealed preimage.
-	PayHold(h []byte, makerBtcNodeID string, btcAmtMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error)
+	// PrepareInvoice issues the invoice on the taker's INCOMING leg on preimage p
+	// for invoiceAmtMsat; returns the invoice and h = SHA256(p).
+	PrepareInvoice(p []byte, invoiceAmtMsat uint64) (invoice string, h []byte, err error)
+	// PayHold pays the maker's hold by bare hash for holdAmtMsat and blocks until
+	// the maker settles, returning the revealed preimage.
+	PayHold(h []byte, makerHoldNodeID string, holdAmtMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error)
 }
 
-// Live implementations over a real *xchain.PureLNSwap (M3).
-type LivePlnMakerOps struct{ Swap *xchain.PureLNSwap }
+// --- live ops over a real *xchain.PureLNSwap (M3) ---------------------------
 
-func (o *LivePlnMakerOps) BtcNodeID() (string, error) { return o.Swap.BtcLegNodeID() }
-func (o *LivePlnMakerOps) RegisterHold(h []byte, amt uint64) error {
+// BUY: maker holds the BTC leg and pays the asset leg.
+type LivePlnMakerBuyOps struct{ Swap *xchain.PureLNSwap }
+
+func (o *LivePlnMakerBuyOps) HoldNodeID() (string, error) { return o.Swap.BtcLegNodeID() }
+func (o *LivePlnMakerBuyOps) RegisterHold(h []byte, amt uint64) error {
 	return o.Swap.MakerRegisterHold(h, amt)
 }
-func (o *LivePlnMakerOps) Fulfill(h []byte, inv string, amt uint64, to time.Duration) ([]byte, error) {
+func (o *LivePlnMakerBuyOps) Fulfill(h []byte, inv string, amt uint64, to time.Duration) ([]byte, error) {
 	return o.Swap.MakerFulfill(h, inv, amt, to)
 }
 
-type LivePlnTakerOps struct{ Swap *xchain.PureLNSwap }
+type LivePlnTakerBuyOps struct{ Swap *xchain.PureLNSwap }
 
-func (o *LivePlnTakerOps) PrepareBuy(p []byte, amt uint64) (string, []byte, error) {
+func (o *LivePlnTakerBuyOps) PrepareInvoice(p []byte, amt uint64) (string, []byte, error) {
 	return o.Swap.PrepareTakerBuy(p, amt)
 }
-func (o *LivePlnTakerOps) PayHold(h []byte, id string, amt uint64, cltv uint32, secret []byte) ([]byte, error) {
+func (o *LivePlnTakerBuyOps) PayHold(h []byte, id string, amt uint64, cltv uint32, secret []byte) ([]byte, error) {
 	return o.Swap.RunTakerBuy(h, id, amt, cltv, secret)
 }
 
-// --- BUY maker --------------------------------------------------------------
+// SELL: maker holds the asset leg and pays the BTC leg.
+type LivePlnMakerSellOps struct{ Swap *xchain.PureLNSwap }
 
-// MakerPlnParams configures RunMakerPureLNBuy. Amounts come from the SIGNED offer.
+func (o *LivePlnMakerSellOps) HoldNodeID() (string, error) { return o.Swap.AssetLegNodeID() }
+func (o *LivePlnMakerSellOps) RegisterHold(h []byte, amt uint64) error {
+	return o.Swap.MakerRegisterHoldSell(h, amt)
+}
+func (o *LivePlnMakerSellOps) Fulfill(h []byte, inv string, amt uint64, to time.Duration) ([]byte, error) {
+	return o.Swap.MakerFulfillSell(h, inv, amt, to)
+}
+
+type LivePlnTakerSellOps struct{ Swap *xchain.PureLNSwap }
+
+func (o *LivePlnTakerSellOps) PrepareInvoice(p []byte, amt uint64) (string, []byte, error) {
+	return o.Swap.PrepareTakerSell(p, amt)
+}
+func (o *LivePlnTakerSellOps) PayHold(h []byte, id string, amt uint64, cltv uint32, secret []byte) ([]byte, error) {
+	return o.Swap.RunTakerSell(h, id, amt, cltv, secret)
+}
+
+// holdPayAmts splits the offer's BTC/asset amounts into (holdAmt, payAmt) for a
+// direction: the maker holds what the taker pays in, and pays the taker's invoice.
+func holdPayAmts(dir PlnDirection, btcMsat, seqMsat uint64) (holdAmt, payAmt uint64) {
+	if dir == PlnSell {
+		return seqMsat, btcMsat // maker holds the asset, pays BTC
+	}
+	return btcMsat, seqMsat // BUY: maker holds BTC, pays the asset
+}
+
+// --- maker -----------------------------------------------------------------
+
+// MakerPlnParams configures RunMakerPureLN. Amounts come from the SIGNED offer.
 type MakerPlnParams struct {
-	NewMakerOps  func() PlnMakerOps // binds the settlement engine
-	Crypter      *Crypter
-	AssetAmtMsat uint64        // asset the maker pays (the offer's asset side)
-	BtcAmtMsat   uint64        // BTC the maker receives (the offer's BTC side)
-	HoldTimeout  time.Duration // wait for the taker's BTC hold + fulfill (default 2m)
-	Timing       XcTiming
-	Log          func(format string, args ...interface{})
+	Direction   PlnDirection
+	NewMakerOps func() PlnMakerOps // binds the settlement engine for this direction
+	Crypter     *Crypter
+	BtcAmtMsat  uint64        // the offer's BTC side (advertised in Terms + bound)
+	SeqAmtMsat  uint64        // the offer's asset side (advertised in Terms + bound)
+	HoldTimeout time.Duration // wait for the taker's hold + fulfill (default 2m)
+	Timing      XcTiming
+	Log         func(format string, args ...interface{})
 }
 
 type MakerPlnResult struct {
@@ -86,10 +132,10 @@ func (p *MakerPlnParams) logf(f string, a ...interface{}) {
 	}
 }
 
-// RunMakerPureLNBuy executes the BUY pure-LN handshake as the maker: advertise
-// terms (incl. its BTC-leg node id), receive the taker's asset invoice on H,
-// register the incoming BTC hold, and fulfill (wait held -> pay asset -> settle).
-func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerPlnResult, error) {
+// RunMakerPureLN executes the pure-LN handshake as the maker: advertise terms
+// (incl. its held-leg node id), receive the taker's invoice on H, register the
+// incoming hold, and fulfill (wait held -> pay the taker's invoice -> settle).
+func RunMakerPureLN(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerPlnResult, error) {
 	p.Timing.setDefaults()
 	if p.NewMakerOps == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("pureln maker: NewMakerOps and Crypter are required")
@@ -97,6 +143,7 @@ func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerP
 	if p.HoldTimeout <= 0 {
 		p.HoldTimeout = 2 * time.Minute
 	}
+	holdAmt, payAmt := holdPayAmts(p.Direction, p.BtcAmtMsat, p.SeqAmtMsat)
 	recv := chanRecv(in)
 	res := &MakerPlnResult{}
 
@@ -104,12 +151,12 @@ func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerP
 		return res, err
 	}
 	ops := p.NewMakerOps()
-	btcID, err := ops.BtcNodeID()
+	holdID, err := ops.HoldNodeID()
 	if err != nil {
 		sendXcFail(p.Crypter, send, "maker_node", err.Error())
-		return res, fmt.Errorf("maker btc node id: %w", err)
+		return res, fmt.Errorf("maker hold node id: %w", err)
 	}
-	if err := sendXc(&XcMsg{Type: XcPlnTerms, MakerLNNodeID: btcID, BtcAmount: p.BtcAmtMsat, SeqAmount: p.AssetAmtMsat}, p.Crypter, send); err != nil {
+	if err := sendXc(&XcMsg{Type: XcPlnTerms, MakerLNNodeID: holdID, BtcAmount: p.BtcAmtMsat, SeqAmount: p.SeqAmtMsat}, p.Crypter, send); err != nil {
 		return res, err
 	}
 
@@ -119,12 +166,12 @@ func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerP
 	}
 	hashH, err := hex.DecodeString(inv.HashH)
 	if err != nil || len(hashH) != 32 {
-		sendXcFail(p.Crypter, send, "bad_hash", "asset invoice carried a malformed hash")
+		sendXcFail(p.Crypter, send, "bad_hash", "invoice carried a malformed hash")
 		return res, fmt.Errorf("pureln maker: bad hash_h %q", inv.HashH)
 	}
 	res.HashH = hashH
-	p.logf("pureln maker: registering BTC hold on H=%s", inv.HashH[:12])
-	if err := ops.RegisterHold(hashH, p.BtcAmtMsat); err != nil {
+	p.logf("pureln maker: registering hold on H=%s", inv.HashH[:12])
+	if err := ops.RegisterHold(hashH, holdAmt); err != nil {
 		sendXcFail(p.Crypter, send, "hold", err.Error())
 		return res, fmt.Errorf("register hold: %w", err)
 	}
@@ -132,8 +179,8 @@ func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerP
 		return res, err
 	}
 
-	// Wait for the taker to lock the BTC, pay the asset invoice (learn P), settle.
-	pre, err := ops.Fulfill(hashH, inv.Bolt11, p.AssetAmtMsat, p.HoldTimeout)
+	// Wait for the taker to lock the incoming leg, pay its invoice (learn P), settle.
+	pre, err := ops.Fulfill(hashH, inv.Bolt11, payAmt, p.HoldTimeout)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "fulfill", err.Error())
 		return res, fmt.Errorf("fulfill: %w", err)
@@ -141,17 +188,28 @@ func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerP
 	res.Preimage = pre
 	res.Settled = true
 	_ = sendXc(&XcMsg{Type: XcPlnSettled}, p.Crypter, send)
-	p.logf("pureln maker: settled, took the BTC")
+	p.logf("pureln maker: settled, took the incoming leg")
 	return res, nil
 }
 
-// --- BUY taker --------------------------------------------------------------
+// RunMakerPureLNBuy / RunMakerPureLNSell are the direction-explicit entry points.
+func RunMakerPureLNBuy(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerPlnResult, error) {
+	p.Direction = PlnBuy
+	return RunMakerPureLN(p, in, send)
+}
+func RunMakerPureLNSell(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerPlnResult, error) {
+	p.Direction = PlnSell
+	return RunMakerPureLN(p, in, send)
+}
+
+// --- taker -----------------------------------------------------------------
 
 type TakerPlnParams struct {
+	Direction     PlnDirection
 	Ops           PlnTakerOps
 	Crypter       *Crypter
-	AssetAmtMsat  uint64
 	BtcAmtMsat    uint64
+	SeqAmtMsat    uint64
 	FinalCltv     uint32 // final-hop cltv delta for paying the hold (default 18)
 	PaymentSecret []byte // onion TLV secret; random if nil
 	Timing        XcTiming
@@ -163,10 +221,10 @@ type TakerPlnResult struct {
 	Preimage []byte
 }
 
-// RunTakerPureLNBuy executes the BUY pure-LN handshake as the taker: request
-// terms, issue an asset invoice on a fresh P, hand the maker H + the invoice,
-// then pay the maker's BTC hold by bare hash (blocks until the maker settles).
-func RunTakerPureLNBuy(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult, error) {
+// RunTakerPureLN executes the pure-LN handshake as the taker: request terms, issue
+// an invoice on a fresh P for its incoming leg, hand the maker H + the invoice,
+// then pay the maker's hold by bare hash (blocks until the maker settles).
+func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult, error) {
 	p.Timing.setDefaults()
 	if p.Ops == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("pureln taker: Ops and Crypter are required")
@@ -174,6 +232,10 @@ func RunTakerPureLNBuy(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnRes
 	if p.FinalCltv == 0 {
 		p.FinalCltv = 18
 	}
+	// The taker mints an invoice for its INCOMING leg and pays HOLD into the
+	// maker on its OUTGOING leg. For BUY it receives the asset (invoice=asset) and
+	// pays BTC (hold=BTC); for SELL it is the mirror.
+	holdAmt, invoiceAmt := holdPayAmts(p.Direction, p.BtcAmtMsat, p.SeqAmtMsat)
 	secret := p.PaymentSecret
 	if len(secret) == 0 {
 		secret = make([]byte, 32)
@@ -188,37 +250,37 @@ func RunTakerPureLNBuy(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnRes
 		return nil, err
 	}
 	if terms.MakerLNNodeID == "" {
-		return nil, fmt.Errorf("pureln taker: maker advertised no BTC node id")
+		return nil, fmt.Errorf("pureln taker: maker advertised no hold-leg node id")
 	}
 	if terms.BtcAmount != 0 && terms.BtcAmount != p.BtcAmtMsat {
 		return nil, fmt.Errorf("%w: maker BTC amount %d != expected %d", ErrXcBadTerms, terms.BtcAmount, p.BtcAmtMsat)
 	}
-	if terms.SeqAmount != 0 && terms.SeqAmount != p.AssetAmtMsat {
-		return nil, fmt.Errorf("%w: maker asset amount %d != expected %d", ErrXcBadTerms, terms.SeqAmount, p.AssetAmtMsat)
+	if terms.SeqAmount != 0 && terms.SeqAmount != p.SeqAmtMsat {
+		return nil, fmt.Errorf("%w: maker asset amount %d != expected %d", ErrXcBadTerms, terms.SeqAmount, p.SeqAmtMsat)
 	}
 
-	// Our secret P, and the asset invoice bound to it.
+	// Our secret P, and the invoice on our incoming leg bound to it.
 	pre := make([]byte, 32)
 	if _, err := rand.Read(pre); err != nil {
 		return nil, err
 	}
-	assetInvoice, hashH, err := p.Ops.PrepareBuy(pre, p.AssetAmtMsat)
+	invoice, hashH, err := p.Ops.PrepareInvoice(pre, invoiceAmt)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "invoice", err.Error())
-		return nil, fmt.Errorf("prepare asset invoice: %w", err)
+		return nil, fmt.Errorf("prepare invoice: %w", err)
 	}
-	if err := sendXc(&XcMsg{Type: XcPlnAssetInvoice, HashH: hex.EncodeToString(hashH), Bolt11: assetInvoice}, p.Crypter, send); err != nil {
+	if err := sendXc(&XcMsg{Type: XcPlnAssetInvoice, HashH: hex.EncodeToString(hashH), Bolt11: invoice}, p.Crypter, send); err != nil {
 		return nil, err
 	}
 	if _, err := recvXcType(recv, p.Crypter, XcPlnHoldReady, p.Timing.SeqLockWait); err != nil {
 		return nil, err
 	}
 
-	// Pay the maker's BTC hold by bare hash; blocks until the maker settles.
-	revealed, err := p.Ops.PayHold(hashH, terms.MakerLNNodeID, p.BtcAmtMsat, p.FinalCltv, secret)
+	// Pay the maker's hold by bare hash; blocks until the maker settles.
+	revealed, err := p.Ops.PayHold(hashH, terms.MakerLNNodeID, holdAmt, p.FinalCltv, secret)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_hold", err.Error())
-		return nil, fmt.Errorf("pay BTC hold: %w", err)
+		return nil, fmt.Errorf("pay hold: %w", err)
 	}
 	// The maker settled with our own P; sanity-check the reveal.
 	want := sha256.Sum256(pre)
@@ -226,6 +288,16 @@ func RunTakerPureLNBuy(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnRes
 		return nil, fmt.Errorf("%w: settle revealed a preimage that is not ours", ErrLNPeer)
 	}
 	return &TakerPlnResult{HashH: hashH, Preimage: pre}, nil
+}
+
+// RunTakerPureLNBuy / RunTakerPureLNSell are the direction-explicit entry points.
+func RunTakerPureLNBuy(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult, error) {
+	p.Direction = PlnBuy
+	return RunTakerPureLN(p, send, recv)
+}
+func RunTakerPureLNSell(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult, error) {
+	p.Direction = PlnSell
+	return RunTakerPureLN(p, send, recv)
 }
 
 // ErrLNPeer flags a counterparty protocol violation in a pure-LN swap.
