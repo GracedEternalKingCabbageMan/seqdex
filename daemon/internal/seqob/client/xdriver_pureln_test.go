@@ -33,7 +33,7 @@ type plnState struct {
 // fakePlnMakerOps implements PlnMakerOps.
 type fakePlnMakerOps struct{ st *plnState }
 
-func (o *fakePlnMakerOps) BtcNodeID() (string, error) {
+func (o *fakePlnMakerOps) HoldNodeID() (string, error) {
 	return "02" + hex.EncodeToString(make([]byte, 32)), nil // stable fake node id
 }
 func (o *fakePlnMakerOps) RegisterHold(h []byte, btcAmtMsat uint64) error {
@@ -82,13 +82,13 @@ func (o *fakePlnMakerOps) Fulfill(h []byte, assetInvoice string, assetAmtMsat ui
 // fakePlnTakerOps implements PlnTakerOps.
 type fakePlnTakerOps struct{ st *plnState }
 
-func (o *fakePlnTakerOps) PrepareBuy(p []byte, assetAmtMsat uint64) (string, []byte, error) {
+func (o *fakePlnTakerOps) PrepareInvoice(p []byte, invoiceAmtMsat uint64) (string, []byte, error) {
 	o.st.mu.Lock()
 	defer o.st.mu.Unlock()
 	o.st.secret = append([]byte(nil), p...)
-	o.st.invoiceMsat = assetAmtMsat
+	o.st.invoiceMsat = invoiceAmtMsat
 	h := sha256.Sum256(p)
-	return "lnasset-fake-" + hex.EncodeToString(h[:4]), h[:], nil
+	return "ln-fake-" + hex.EncodeToString(h[:4]), h[:], nil
 }
 func (o *fakePlnTakerOps) PayHold(h []byte, makerBtcNodeID string, btcAmtMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error) {
 	// Lock the BTC into the maker's hold, then block until the maker settles.
@@ -132,21 +132,21 @@ func TestPureLNBuyHandshake(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		makerRes, makerErr = RunMakerPureLNBuy(MakerPlnParams{
-			NewMakerOps:  func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
-			Crypter:      mc,
-			AssetAmtMsat: assetMsat,
-			BtcAmtMsat:   btcMsat,
-			HoldTimeout:  3 * time.Second,
-			Timing:       XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  assetMsat,
+			BtcAmtMsat:  btcMsat,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
 		}, net.toMaker, net.makerSend)
 	}()
 
 	takerRes, takerErr := RunTakerPureLNBuy(TakerPlnParams{
-		Ops:          &fakePlnTakerOps{st: st},
-		Crypter:      tc,
-		AssetAmtMsat: assetMsat,
-		BtcAmtMsat:   btcMsat,
-		Timing:       XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
+		Ops:        &fakePlnTakerOps{st: st},
+		Crypter:    tc,
+		SeqAmtMsat: assetMsat,
+		BtcAmtMsat: btcMsat,
+		Timing:     XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
 	}, net.takerSend, net.takerRecv)
 	wg.Wait()
 
@@ -181,23 +181,79 @@ func TestPureLNBuyTakerRejectsBadAmount(t *testing.T) {
 
 	go func() {
 		_, _ = RunMakerPureLNBuy(MakerPlnParams{
-			NewMakerOps:  func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
-			Crypter:      mc,
-			AssetAmtMsat: assetMsat,
-			BtcAmtMsat:   btcMsat + 999, // != taker's expectation
-			HoldTimeout:  2 * time.Second,
-			Timing:       XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 2 * time.Second},
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  assetMsat,
+			BtcAmtMsat:  btcMsat + 999, // != taker's expectation
+			HoldTimeout: 2 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 2 * time.Second},
 		}, net.toMaker, net.makerSend)
 	}()
 
 	_, err := RunTakerPureLNBuy(TakerPlnParams{
-		Ops:          &fakePlnTakerOps{st: st},
-		Crypter:      tc,
-		AssetAmtMsat: assetMsat,
-		BtcAmtMsat:   btcMsat,
-		Timing:       XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 2 * time.Second},
+		Ops:        &fakePlnTakerOps{st: st},
+		Crypter:    tc,
+		SeqAmtMsat: assetMsat,
+		BtcAmtMsat: btcMsat,
+		Timing:     XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 2 * time.Second},
 	}, net.takerSend, net.takerRecv)
 	if err == nil {
 		t.Fatal("taker must reject a maker quoting the wrong BTC amount")
+	}
+}
+
+// TestPureLNSellHandshake: the mirror direction. The taker sells the asset for
+// BTC — it receives BTC (mints a BTC invoice on P) and pays the asset into the
+// maker's ASSET hold; the maker pays the BTC invoice (learns P) and settles. The
+// same direction-agnostic fake ops serve both directions; only which amount is
+// the hold vs the invoice flips, which the driver derives from the direction.
+func TestPureLNSellHandshake(t *testing.T) {
+	st := &plnState{}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const assetMsat = uint64(1_000_000_000) // asset the taker pays into the hold
+	const btcMsat = uint64(2_000_000)       // BTC the maker pays out
+
+	var makerRes *MakerPlnResult
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, makerErr = RunMakerPureLNSell(MakerPlnParams{
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  assetMsat,
+			BtcAmtMsat:  btcMsat,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerPureLNSell(TakerPlnParams{
+		Ops:        &fakePlnTakerOps{st: st},
+		Crypter:    tc,
+		SeqAmtMsat: assetMsat,
+		BtcAmtMsat: btcMsat,
+		Timing:     XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if makerErr != nil {
+		t.Fatalf("maker: %v", makerErr)
+	}
+	if !makerRes.Settled {
+		t.Fatalf("maker not settled: %+v", makerRes)
+	}
+	if hex.EncodeToString(makerRes.Preimage) != hex.EncodeToString(takerRes.Preimage) {
+		t.Fatalf("preimage mismatch: maker %x taker %x", makerRes.Preimage, takerRes.Preimage)
+	}
+	// The maker paid the BTC invoice, so the recorded invoice amount is the BTC side.
+	if st.invoiceMsat != btcMsat {
+		t.Fatalf("sell: taker should have minted a BTC invoice for %d, got %d", btcMsat, st.invoiceMsat)
 	}
 }
