@@ -34,6 +34,12 @@ func NewPureLNSwap(assetLeg, btcLeg LNLeg) *PureLNSwap {
 	return &PureLNSwap{assetLeg: assetLeg, btcLeg: btcLeg}
 }
 
+// BtcLegNodeID / AssetLegNodeID expose each leg's Lightning node id (the party
+// paying a hold by bare hash needs the holder's node id). Used by the order-book
+// driver, which lives in another package.
+func (s *PureLNSwap) BtcLegNodeID() (string, error)   { return s.btcLeg.NodeID() }
+func (s *PureLNSwap) AssetLegNodeID() (string, error) { return s.assetLeg.NodeID() }
+
 // --- direction-agnostic core (incoming = the maker's held leg) --------------
 
 // takerPrepare issues the invoice on the taker's INCOMING leg on preimage p (the

@@ -88,9 +88,12 @@ type XcMsg struct {
 
 	// Submarine-swap (Lightning) fields. The BTC leg is a BOLT11 payment, not an
 	// on-chain HTLC, so these carry it instead of an XcLeg. See xcourier_submarine.go.
-	Bolt11         string `json:"bolt11,omitempty"`           // submarine: the invoice bound to H
+	Bolt11         string `json:"bolt11,omitempty"`           // submarine: the invoice bound to H; pure-LN: the taker's asset invoice
 	MinAnchorDepth uint32 `json:"min_anchor_depth,omitempty"` // submarine: the gate depth (transparency)
 	SettleTxid     string `json:"settle_txid,omitempty"`      // submarine: the on-chain asset-claim txid (informational)
+
+	// Pure-LN (both legs Lightning) fields. See xcourier_pureln.go.
+	MakerLNNodeID string `json:"maker_ln_node_id,omitempty"` // pure-LN: the maker's incoming-leg node id (the taker pays its hold by bare hash)
 
 	Preimage string `json:"preimage,omitempty"` // XcSecretRevealed
 	Code     string `json:"code,omitempty"`     // XcFail
