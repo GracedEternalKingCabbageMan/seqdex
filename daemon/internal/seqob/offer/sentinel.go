@@ -34,7 +34,22 @@ const (
 const (
 	LnAssetForBTC uint32 = 0
 	LnBTCForAsset uint32 = 1
+	// Pure-LN directions (Step 2): BOTH legs are off-chain Lightning — a Sequentia
+	// asset-LN leg and a BTC-LN leg — stitched by one shared secret, with no
+	// on-chain leg and no anchor gate. Same flow orientation as above:
+	//   LnAssetLNForBTCLN: asset-LN exchanged for BTC-LN; the maker acquires the
+	//     asset -> BUY (the maker holds the incoming asset-LN, pays BTC-LN).
+	//   LnBTCLNForAssetLN: BTC-LN exchanged for asset-LN; the maker gives the asset
+	//     -> SELL (the maker holds the incoming BTC-LN, pays asset-LN).
+	LnAssetLNForBTCLN uint32 = 2
+	LnBTCLNForAssetLN uint32 = 3
 )
+
+// IsPureLN reports whether an ln_direction is a pure-LN (both-legs-Lightning)
+// swap, as opposed to the on-chain-asset submarine directions.
+func IsPureLN(lnDirection uint32) bool {
+	return lnDirection == LnAssetLNForBTCLN || lnDirection == LnBTCLNForAssetLN
+}
 
 // IsBTCSentinel reports whether an asset id is the BTC sentinel.
 func IsBTCSentinel(assetID string) bool { return assetID == BTCSentinel }
@@ -56,8 +71,11 @@ func DirectionConsistent(direction uint32, isSell bool) bool {
 // case: a SELL (maker gives the asset) is the REVERSE flow (BTC-LN -> asset); a
 // BUY (maker acquires the asset) is the NORMAL flow (asset -> BTC-LN).
 func LnDirectionConsistent(lnDirection uint32, isSell bool) bool {
-	if isSell {
-		return lnDirection == LnBTCForAsset
+	switch lnDirection {
+	case LnAssetForBTC, LnAssetLNForBTCLN: // maker acquires the asset -> BUY
+		return !isSell
+	case LnBTCForAsset, LnBTCLNForAssetLN: // maker gives the asset -> SELL
+		return isSell
 	}
-	return lnDirection == LnAssetForBTC
+	return false
 }
