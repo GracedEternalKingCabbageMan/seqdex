@@ -230,6 +230,45 @@ func TestCovenantMatchCarriesTerms(t *testing.T) {
 	}
 }
 
+func TestBothCovenantMatch(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	// Resting covenant SELL: 30 A wanting 90 B (sells A at 3 B/A).
+	rest := sell(t, mk, "covA", 30, 90, true)
+	rest.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid: "aa", CovenantVout: 0,
+		AssetA: "00aa", AssetB: "00bb", RateNum: 3, RateDen: 1,
+		MinLot: 5, MakerProgVer: 1, ExpiryLocktime: 400,
+	}}
+	_ = offer.SignOffer(rest, mk)
+	mustSubmit(t, s, rest)
+
+	// Incoming covenant BUY: buys 30 A giving 90 B (its own covenant sells B).
+	in := buy(t, tk, "covB", 30, 90, true)
+	in.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid: "bb", CovenantVout: 1,
+		AssetA: "00bb", AssetB: "00aa", RateNum: 1, RateDen: 3,
+		MinLot: 5, MakerProgVer: 1, ExpiryLocktime: 400,
+	}}
+	_ = offer.SignOffer(in, tk)
+	mustSubmit(t, s, in)
+
+	got := m.Cross(in)
+	if len(got) != 1 {
+		t.Fatalf("want 1 match, got %d", len(got))
+	}
+	if !got[0].BothCovenant() {
+		t.Fatal("both-covenant case not detected (settler path)")
+	}
+	if got[0].RestingCovenant == nil || got[0].IncomingCovenant == nil {
+		t.Fatal("both covenant terms must be carried for the settler")
+	}
+	if got[0].IncomingCovenant.GetCovenantTxid() != "bb" || got[0].IncomingCovenant.GetCovenantVout() != 1 {
+		t.Fatal("incoming covenant outpoint not carried")
+	}
+}
+
 func TestCovenantMinLotRemainderTrim(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)

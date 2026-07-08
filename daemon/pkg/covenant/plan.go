@@ -72,11 +72,12 @@ func (o Order) PlanFill(locked, filled uint64, k uint32) (*FillPlan, error) {
 // PlanFill(k) already encodes exactly that per-input map, so the joint plan is
 // just the two single-input plans at k=0 and k=1.
 //
-// NOTE: the matcher surfaces this case (matcher.Match.BothCovenant) and this
-// helper builds the recipe, but the end-to-end regtest proof of the joint spend
-// (assembling + broadcasting one tx spending both covenants) is not yet wired —
-// the single-covenant-vs-taker case is the proven path. See the report's
-// "remaining work".
+// NOTE: PlanJointSettlement (settle.go) completes this into a broadcast-ready
+// tx layout (credit + reserved-slot handling, gap outputs, cross-checks) and the
+// always-online settler (cmd/seqob-settler) assembles + broadcasts it. The joint
+// spend is proven end-to-end on regtest by feature_seqob_joint_covenant.py:
+// two covenant-funded orders match and settle against each other in ONE tx with
+// BOTH makers offline.
 type JointFillPlan struct {
 	A *FillPlan // the A-covenant (input 0): credit B at output 0, remainder A at 1
 	B *FillPlan // the B-covenant (input 1): credit A at output 2, remainder B at 3
