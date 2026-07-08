@@ -93,7 +93,8 @@ type MakerSubmarineParams struct {
 
 	SeqLocktimeDelta uint32 // T_seq above the current SEQ tip (default 240)
 	MinAnchorDepth   int64  // the funding anchor-depth gate before paying (default 3, >=2)
-	SpendFeeAtoms    uint64 // fee for the maker's asset-claim spend (default 1000)
+	Max0ConfAmount   uint64 // 0-conf LP-fronting cap (asset atoms); value <= it skips the bury wait
+	SpendFeeAtoms    uint64 // NATIVE-sats target for the maker's asset-claim spend (sized per-asset; default 1000)
 	AnchorTimeout    time.Duration
 	Timing           XcTiming
 	Log              func(format string, args ...interface{})
@@ -227,10 +228,12 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		Bolt11:            funded.Bolt11,
 		InvoiceMsat:       p.InvoiceMsat,
 		MinAnchorDepth:    p.MinAnchorDepth,
+		Max0ConfAmount:    p.Max0ConfAmount,
 		AnchorTimeout:     p.AnchorTimeout,
-		// Clamp the asset-claim fee to half the leg so the claim output can never
-		// go negative (bad-txns-vout-negative) for a small leg.
-	}, makerSeqClaim, xcSafeFee(p.SpendFeeAtoms, p.SeqAmount))
+		// Pass the NATIVE-sats target; SubmarineSwap.ClaimSEQLeg sizes it into the
+		// leg's own asset via the fee market and clamps it to half the leg (so a
+		// valuable asset never trips maxfeerate, nor a small leg go negative).
+	}, makerSeqClaim, p.SpendFeeAtoms)
 	if nr != nil {
 		res.Preimage = nr.Preimage
 		res.SeqClaimTxid = nr.SeqClaimTxID

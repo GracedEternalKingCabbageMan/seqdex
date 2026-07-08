@@ -225,6 +225,32 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 	return txid, nil
 }
 
+// sizeSeqSpendFee converts a native-sats TARGET fee into the leg asset's own atoms
+// via the open-fee-market exchange rate (asset_atoms = ceil(target*1e8/rate)),
+// exactly like the RFQ watcher / order-book driver / wallet, then clamps it to half
+// the leg so the spend output stays positive. Emitting the flat native target as a
+// raw atom count of a VALUABLE asset (e.g. GOLD, rate ~5e12) yields an absurd
+// native-equivalent fee that sendrawtransaction rejects (maxfeerate); sizing keeps the
+// fee's native value inside the node's relay bounds — a valuable asset correctly pays
+// FEWER atoms. Falls back to the flat target when no positive rate is published (the
+// native asset, where atoms == native sats) or the SEQ chain is unavailable (tests).
+func (s *Swap) sizeSeqSpendFee(assetHex string, legAmount, targetNativeFee uint64) uint64 {
+	fee := targetNativeFee
+	if s.seq != nil {
+		if rate, ok := s.seq.FeeExchangeRate(assetHex); ok && rate > 0 {
+			const scale = 100_000_000 // 1e8; matches price_server.py / exchangerates.cpp
+			fee = (targetNativeFee*scale + rate - 1) / rate // ceil
+			if fee == 0 {
+				fee = 1
+			}
+		}
+	}
+	if maxFee := legAmount / 2; fee > maxFee {
+		fee = maxFee
+	}
+	return fee
+}
+
 // ClaimBTCLeg performs step 5: Bob redeems the BTC leg with the now-revealed
 // preimage. Returns the redeem txid. The spend is built in the BTC backend's
 // transaction format (Elements or Bitcoin).

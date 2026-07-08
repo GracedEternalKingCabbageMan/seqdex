@@ -46,7 +46,8 @@ type submarineMakerConfig struct {
 	seqDelta    uint32 // T_seq = SEQ tip + this
 	subAnchor   int64  // the submarine cross-leg anchor-depth gate (>=2)
 	onchainCltv uint32 // advisory CLTV in the resting LightningTerms
-	spendFee    uint64 // maker asset-claim fee (atoms)
+	spendFee    uint64 // maker asset-claim fee target (native sats; sized per-asset)
+	max0conf    uint64 // 0-conf LP-fronting cap (asset atoms): trades <= it settle instantly
 	reverse     bool   // true = SELL the asset for BTC-LN (maker-secret REVERSE); false = BUY (NORMAL)
 }
 
@@ -76,6 +77,7 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 			MakerRefundPub:         cfg.makerPubKey,
 			OnchainCltv:            cfg.onchainCltv,
 			MakerIssuesHoldInvoice: false, // both v1 modes are plugin-free
+			Max_0ConfAmount:        cfg.max0conf, // advertise the 0-conf cap so takers can front small amounts
 		}},
 	}
 	if cfg.reverse {
@@ -129,13 +131,13 @@ func runSubmarineMaker(cfg submarineMakerConfig) {
 	}
 	if cfg.reverse {
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
-			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.seqDelta, cfg.subAnchor, cfg.max0conf, lnID)
 		fmt.Printf("  taker lifts with: seqob-cli xsubbuy -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
 	} else {
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-		fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
-			cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
+			cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, cfg.max0conf, lnID)
 		fmt.Printf("  taker lifts with: seqob-cli xsublift -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
 	}
 
@@ -273,6 +275,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					InvoiceMsat:      o.GetOfferAmount() * 1000, // BTC sats the maker pays -> msat
 					SeqLocktimeDelta: cfg.seqDelta,
 					MinAnchorDepth:   cfg.subAnchor,
+					Max0ConfAmount:   cfg.max0conf,
 					SpendFeeAtoms:    cfg.spendFee,
 					Log:              logf,
 				}
