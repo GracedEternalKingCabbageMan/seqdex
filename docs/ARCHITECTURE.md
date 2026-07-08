@@ -335,7 +335,7 @@ whitelist and exchange rates via `getfeeexchangerates` (env `SEQDEX_NODE_RPC`;
 - The network fee of a swap defaults to **the transacted asset** (the asset the
   proposer receives), converted from the size-based native-equivalent fee at
   the node's rate, rounded up. If that asset is not fee-eligible the daemon
-  falls back to the native asset from the fee account.
+  falls back to the policy asset (tSEQ) from the fee account.
 - A **taker-funded fee** is supported: the proposer may include one explicit
   fee output in any fee-eligible asset; the maker validates that its
   native-equivalent value covers the required fee and every taker input is

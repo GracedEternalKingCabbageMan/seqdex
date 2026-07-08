@@ -32,7 +32,7 @@ Elements code, untouched. What changed:
   bytes); only the confidential (blech32) HRP is Sequentia-specific: `sqb`
   mainnet, `tsqb` testnet. Network names: `sequentia`, `sequentia-testnet`
   (default), `sequentia-regtest`.
-- **Runtime policy asset**: Sequentia's native asset id is genesis-derived, so
+- **Runtime policy asset**: the policy asset (tSEQ) id is genesis-derived, so
   it is not a compile-time constant. `OCEAN_NATIVE_ASSET` is required and read
   from the node (`getsidechaininfo.pegged_asset`).
 - **The `elements` blockchain scanner** reads block and header structure via
