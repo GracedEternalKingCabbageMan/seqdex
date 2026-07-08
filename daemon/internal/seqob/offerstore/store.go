@@ -239,6 +239,23 @@ func (s *Store) snapshotLocked(pk string) []*seqobv1.Offer {
 	return out
 }
 
+// SnapshotPairEntries returns value copies of every live entry for a pair, for
+// the matcher's price-time-priority walk. Copies (not the live *Entry) so the
+// matcher reads a consistent snapshot; the enclosed *Offer is immutable once
+// signed, so sharing its pointer is safe.
+func (s *Store) SnapshotPairEntries(p *seqobv1.AssetPair) []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	set := s.pairs[pairKey(p)]
+	out := make([]Entry, 0, len(set))
+	for k := range set {
+		if e, ok := s.entries[k]; ok {
+			out = append(out, *e)
+		}
+	}
+	return out
+}
+
 // SnapshotMaker returns all live offers posted by a given maker_pubkey.
 func (s *Store) SnapshotMaker(makerPubkey string) []*Entry {
 	s.mu.RLock()
@@ -444,16 +461,20 @@ func (s *Store) SweepExpired() int {
 	return len(expired)
 }
 
-// RemoveByMaker drops every resting offer for makerPubkey, emitting a removal event per
-// offer. Called when a maker's websocket disconnects: in this interactive book the maker
-// must be online to co-sign a lift, so once it is gone its offers are unliftable and must
-// not linger in the book until their TTL (they otherwise show as un-fillable "ghost"
-// duplicates after a maker restart/crash). Returns the number removed.
+// RemoveByMaker drops every resting INTERACTIVE offer for makerPubkey, emitting a
+// removal event per offer. Called when a maker's websocket disconnects: in the
+// interactive book the maker must be online to co-sign a lift, so once it is gone
+// its offers are unliftable and must not linger as un-fillable "ghosts".
+//
+// COVENANT offers are the deliberate exception and are NOT evicted: they are
+// funded on-chain and fillable permissionlessly with the maker OFFLINE (that is
+// the whole point of the passive CLOB), so a covenant order must survive its
+// maker's disconnect. Returns the number removed.
 func (s *Store) RemoveByMaker(makerPubkey string) int {
 	s.mu.Lock()
 	victims := make([]Key, 0)
-	for k := range s.entries {
-		if k.MakerPubkey == makerPubkey {
+	for k, e := range s.entries {
+		if k.MakerPubkey == makerPubkey && e.Offer.GetCovenant() == nil {
 			victims = append(victims, k)
 		}
 	}

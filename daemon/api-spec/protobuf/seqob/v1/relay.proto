@@ -63,6 +63,27 @@ message LiftRequested {
   bytes  taker_session_pubkey = 5;
 }
 
+// Matched generalizes LiftRequested: the relay's continuous matching engine
+// crossed an incoming order against a resting one (price-time priority), so the
+// counterparty can settle. It carries the session id, the recipient's ROLE, and
+// the fill size/price. For a COVENANT resting order the maker is offline and no
+// round-trip is possible: the message additionally carries the covenant fields
+// the counterparty (taker) needs to build + broadcast the permissionless FILL
+// spend itself, so settlement needs nobody online but the taker.
+message Matched {
+  string   session_id       = 1; // match/session id (couriered settlement, if any)
+  string   offer_id         = 2; // the RESTING order that was crossed
+  string   maker_pubkey     = 3; // its maker
+  string   role             = 4; // recipient's role: "taker" or "maker"
+  uint64   fill_base_amount = 5; // base atoms filled by this match
+  uint64   fill_quote_amount = 6; // quote atoms owed for the fill (ceil price)
+  bool     resting_is_covenant = 7; // if true, settle via the covenant FILL spend below
+  // Present iff resting_is_covenant: the resting order's on-chain covenant terms
+  // and this fill's derived recipe (required_b, credit/remainder output indices).
+  CovenantTerms covenant    = 8;
+  uint64   covenant_locked  = 9;  // atoms of A currently locked in the covenant UTXO
+}
+
 // Opaque end-to-end-encrypted swap-session payload (review B1). The relay routes
 // ciphertext by session_id between the two peers; it does NOT decrypt, parse, or
 // introspect it, so confidential amounts and blinders never reach the relay.
@@ -120,6 +141,7 @@ message From {
     OfferRef     public_order_removed = 107; // delta
     LiftAccepted lift_accepted        = 142;
     LiftRequested lift_requested      = 143; // relay -> maker: a taker lifted your offer
+    Matched      matched              = 144; // relay -> peer: the matcher crossed two orders
     SwapMsg      swap_msg             = 131; // opaque courier passthrough
     OrderStatus  order_status         = 160;
     GenericError error                = 200;
