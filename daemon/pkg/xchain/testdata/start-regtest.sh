@@ -4,7 +4,7 @@
 # test/functional/feature_anchor_swap_consistency.py.
 set -euo pipefail
 
-REPO="$HOME/SequentiaByClaude"
+REPO="${SEQUENTIA_REPO:-$HOME/Sequentia}"
 ELD="$REPO/build-linux/src/elementsd"
 ELC="$REPO/build-linux/src/elements-cli"
 BASE="${SEQDEX_XCHAIN_DIR:-/tmp/seqdex-xchain-regtest}"
