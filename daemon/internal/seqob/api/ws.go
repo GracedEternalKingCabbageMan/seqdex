@@ -220,18 +220,21 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 		c.sendErr(400, "invalid offer: "+err.Error())
 		return
 	}
-	k, err := s.store.Submit(o)
-	if err != nil {
+	if _, err := s.store.Submit(o); err != nil {
 		c.sendErr(409, "submit: "+err.Error())
 		return
 	}
 	// Register this connection as the maker's reachable endpoint for live lifts.
 	s.registerMaker(c, o.GetMakerPubkey())
 
-	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: &seqobv1.OrderStatus{
-		OfferId: k.OfferID, MakerPubkey: k.MakerPubkey,
-		Status: seqobv1.OfferStatus_OFFER_STATUS_OPEN, ActiveAmount: o.GetBaseAmount(),
-	}}})
+	// Continuous matching: cross the freshly-rested order against the resting
+	// opposite side, routing From.matched to the counterparties. For a covenant
+	// resting order the offline maker needs no round-trip; the taker (this
+	// connection) is told the covenant terms and settles the FILL spend itself.
+	matches := s.matcher.Cross(o)
+	s.routeMatches(c, matches)
+
+	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 }
 
 func (s *Server) wsOfferEdit(c *wsConn, o *seqobv1.Offer, ip string) {

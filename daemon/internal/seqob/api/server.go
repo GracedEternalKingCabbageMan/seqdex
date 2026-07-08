@@ -31,15 +31,17 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/matcher"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/session"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/validator"
 )
 
-// Server wires the store, validator, and session router behind HTTP.
+// Server wires the store, validator, matcher, and session router behind HTTP.
 type Server struct {
 	store     *offerstore.Store
 	validator *validator.Validator
+	matcher   *matcher.Matcher
 	sessions  *session.Router
 	log       *log.Logger
 	// crossDeadline, when set, replaces the router's default co-sign deadline
@@ -61,6 +63,7 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 	srv := &Server{
 		store:     store,
 		validator: v,
+		matcher:   matcher.New(store),
 		sessions:  sessions,
 		log:       logger,
 		upgrader: websocket.Upgrader{
@@ -131,12 +134,18 @@ func (s *Server) handleOfferSubmit(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusConflict, "submit: "+err.Error())
 		return
 	}
-	writeProto(w, &seqobv1.OrderStatus{
-		OfferId:      k.OfferID,
-		MakerPubkey:  k.MakerPubkey,
-		Status:       seqobv1.OfferStatus_OFFER_STATUS_OPEN,
-		ActiveAmount: o.GetBaseAmount(),
-	})
+	// Cross against the resting opposite side to keep the book consistent. The
+	// REST path has no persistent connection to push From.matched to (WS clients
+	// receive it); the returned status reflects the post-cross active amount.
+	s.routeMatches(nil, s.matcher.Cross(&o))
+	st, ok := s.store.OrderStatusOf(k)
+	if !ok {
+		st = &seqobv1.OrderStatus{
+			OfferId: k.OfferID, MakerPubkey: k.MakerPubkey,
+			Status: seqobv1.OfferStatus_OFFER_STATUS_FILLED, ActiveAmount: 0,
+		}
+	}
+	writeProto(w, st)
 }
 
 func (s *Server) handleOwnOffers(w http.ResponseWriter, r *http.Request) {
