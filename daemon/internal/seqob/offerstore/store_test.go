@@ -230,3 +230,124 @@ func recv(t *testing.T, ch <-chan Event) Event {
 		return Event{}
 	}
 }
+
+// mkCovOffer builds a signed covenant SELL offer resting at outpoint txid:vout.
+func mkCovOffer(t *testing.T, k *btcec.PrivateKey, id, txid string, vout uint32, base uint64) *seqobv1.Offer {
+	t.Helper()
+	b32 := func(f byte) []byte {
+		o := make([]byte, 32)
+		for i := range o {
+			o[i] = f
+		}
+		return o
+	}
+	o := &seqobv1.Offer{
+		OfferId:       id,
+		SchemaVersion: 1,
+		Pair:          &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"},
+		TradeDir:      seqobv1.TradeDir_TRADE_DIR_SELL,
+		BaseAmount:    base,
+		OfferAmount:   base,
+		OfferAsset:    "gold",
+		WantAmount:    base / 3,
+		WantAsset:     "usdx",
+		AllowPartial:  true,
+		CreatedAtUnix: 1750000000,
+		ExpiresAtUnix: 1750003600,
+		Settlement: &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+			CovenantTxid: txid, CovenantVout: vout,
+			AssetA: hexOf(b32(0xa1)), AssetB: hexOf(b32(0xb2)),
+			RateNum: 1, RateDen: 3, MakerProg: b32(0xc3), MakerProgVer: 1,
+			MinLot: 5, ExpiryLocktime: 500, MakerX: b32(0xd4), InternalKey: b32(0xee),
+		}},
+	}
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return o
+}
+
+func hexOf(b []byte) string {
+	const h = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, c := range b {
+		out[i*2] = h[c>>4]
+		out[i*2+1] = h[c&0xf]
+	}
+	return string(out)
+}
+
+func TestCovenantReconcile(t *testing.T) {
+	s := New(nil)
+	k := key(t)
+	o := mkCovOffer(t, k, "cov1", "aabb", 0, 90)
+	if _, err := s.Submit(o); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	// SnapshotCovenants sees it.
+	covs := s.SnapshotCovenants()
+	if len(covs) != 1 || covs[0].Terms.GetCovenantTxid() != "aabb" {
+		t.Fatalf("snapshot covenants: %+v", covs)
+	}
+	kk := Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "cov1"}
+
+	// Optimistic decrement then LIVE reconcile back to on-chain value re-opens it.
+	if err := s.ApplyPartialFill(kk, 30, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get(kk); e.ActiveAmount != 60 {
+		t.Fatalf("after optimistic fill active=%d want 60", e.ActiveAmount)
+	}
+	if err := s.ReconcileCovenantActive(kk, 90); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get(kk); e.ActiveAmount != 90 || e.Status != seqobv1.OfferStatus_OFFER_STATUS_OPEN {
+		t.Fatalf("live reconcile: active=%d status=%v", e.ActiveAmount, e.Status)
+	}
+
+	// Hold for an unconfirmed spend: active drops to 0 (hidden from matcher).
+	if err := s.HoldCovenantForSpend(kk, "spendtx"); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get(kk); e.ActiveAmount != 0 || e.SettleTxid != "spendtx" {
+		t.Fatalf("hold: active=%d settle=%s", e.ActiveAmount, e.SettleTxid)
+	}
+
+	// Re-rest the remainder at a NEW outpoint with reduced size.
+	if err := s.RerestCovenantRemainder(kk, "ccdd", 1, 60); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get(kk)
+	if !ok || e.ActiveAmount != 60 || e.Offer.GetCovenant().GetCovenantTxid() != "ccdd" || e.Offer.GetCovenant().GetCovenantVout() != 1 {
+		t.Fatalf("re-rest: %+v", e)
+	}
+	// Original submitted offer pointer must be untouched (clone-on-write).
+	if o.GetCovenant().GetCovenantTxid() != "aabb" {
+		t.Fatalf("re-rest mutated the original offer pointer")
+	}
+
+	// Full fill removes it.
+	if err := s.RemoveCovenantFilled(kk, "filltx"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get(kk); ok {
+		t.Fatalf("filled covenant should be removed")
+	}
+}
+
+func TestCovenantSurvivesMakerDisconnect(t *testing.T) {
+	// RemoveByMaker must NOT evict a covenant (the watcher owns covenant removal).
+	s := New(nil)
+	k := key(t)
+	o := mkCovOffer(t, k, "cov1", "aabb", 0, 90)
+	if _, err := s.Submit(o); err != nil {
+		t.Fatal(err)
+	}
+	n := s.RemoveByMaker(o.GetMakerPubkey())
+	if n != 0 {
+		t.Fatalf("RemoveByMaker evicted %d covenant offers; must be 0", n)
+	}
+	if _, ok := s.Get(Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "cov1"}); !ok {
+		t.Fatalf("covenant offer must survive maker disconnect")
+	}
+}

@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
@@ -493,6 +495,152 @@ func (s *Store) RemoveByMaker(makerPubkey string) int {
 		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
 	}
 	return len(victims)
+}
+
+// --- covenant chain-watcher reconciliation (internal/seqob/watcher) ----------
+//
+// These mutate a resting COVENANT order to match on-chain reality. They are the
+// only book operations the chain watcher needs, and they are DISTINCT from
+// RemoveByMaker (which deliberately never evicts a covenant on a maker
+// disconnect): the watcher removes or resizes a covenant strictly on CHAIN
+// evidence (spent / partially filled / funding gone at the tip). None of them
+// touch interactive offers.
+
+// CovenantEntry is a resting covenant offer's key + terms + active size, for the
+// watcher to reconcile. The returned *CovenantTerms is the live pointer; the
+// watcher only reads it.
+type CovenantEntry struct {
+	Key    Key
+	Terms  *seqobv1.CovenantTerms
+	Active uint64
+}
+
+// SnapshotCovenants returns every resting offer that settles via a covenant.
+func (s *Store) SnapshotCovenants() []CovenantEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]CovenantEntry, 0)
+	for k, e := range s.entries {
+		if cov := e.Offer.GetCovenant(); cov != nil {
+			out = append(out, CovenantEntry{Key: k, Terms: cov, Active: e.ActiveAmount})
+		}
+	}
+	return out
+}
+
+// ReconcileCovenantActive sets a resting covenant order's active size to its
+// on-chain UTXO value. Idempotent. It also RE-OPENS an order whose optimistic
+// match-time decrement never settled (the fill was never confirmed, so the
+// covenant still holds its full value at the tip). No-op for a non-covenant or
+// missing entry.
+func (s *Store) ReconcileCovenantActive(k Key, active uint64) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	if active > e.Offer.GetBaseAmount() {
+		active = e.Offer.GetBaseAmount()
+	}
+	changed := e.ActiveAmount != active || e.SettleTxid != ""
+	e.ActiveAmount = active
+	e.SettleTxid = ""
+	if active >= e.Offer.GetBaseAmount() {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_OPEN
+	} else {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	}
+	pair := e.Offer.GetPair()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	}
+	return nil
+}
+
+// RerestCovenantRemainder points a covenant order at the remainder outpoint a
+// partial fill re-created (new txid:vout) and sets the reduced active size, so
+// the rest of the order stays fillable. The covenant PROGRAM is unchanged (same
+// scriptPubKey), so the maker's signed terms still describe it; only the
+// chain-observable outpoint moves. The stored Offer is cloned before mutation so
+// concurrent matcher reads of the old pointer stay consistent.
+func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size uint64) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	// Clone + swap so the previously-shared *Offer pointer is never mutated.
+	no := proto.Clone(e.Offer).(*seqobv1.Offer)
+	no.GetCovenant().CovenantTxid = txid
+	no.GetCovenant().CovenantVout = vout
+	e.Offer = no
+	if size > no.GetBaseAmount() {
+		size = no.GetBaseAmount()
+	}
+	e.ActiveAmount = size
+	e.SettleTxid = ""
+	if size >= no.GetBaseAmount() {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_OPEN
+	} else {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	}
+	pair := no.GetPair()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	// Emit created (subscribers re-learn the new outpoint) then status.
+	s.broadcast(Event{Type: EventCreated, Pair: pair, Offer: no})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	return nil
+}
+
+// HoldCovenantForSpend hides a covenant order from matching while its spend is
+// unconfirmed (fill in the mempool): active drops to 0 (the matcher skips
+// zero-active entries) and the settling txid is recorded. A later reconcile
+// pass restores it (ReconcileCovenantActive) if the spend drops, or removes /
+// re-rests it once the spend confirms.
+func (s *Store) HoldCovenantForSpend(k Key, spenderTxid string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	changed := e.ActiveAmount != 0 || e.SettleTxid != spenderTxid
+	e.ActiveAmount = 0
+	e.SettleTxid = spenderTxid
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	pair := e.Offer.GetPair()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	}
+	return nil
+}
+
+// RemoveCovenantFilled removes a fully-filled covenant order, recording the
+// settling txid and emitting FILLED. No-op for a non-covenant or missing entry.
+func (s *Store) RemoveCovenantFilled(k Key, settleTxid string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_FILLED
+	e.SettleTxid = settleTxid
+	e.ActiveAmount = 0
+	pair := e.Offer.GetPair()
+	st := e.orderStatus(k)
+	s.remove(k)
+	s.mu.Unlock()
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	return nil
 }
 
 // RunExpirySweeper sweeps every interval until ctx-like stop channel closes.
