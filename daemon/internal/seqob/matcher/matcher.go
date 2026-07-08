@@ -58,11 +58,73 @@ type Match struct {
 	// IncomingCovenant is non-nil iff the INCOMING order is also a covenant: both
 	// makers are offline and an always-online settler must build the joint spend.
 	IncomingCovenant *seqobv1.CovenantTerms
+
+	// RestingLightning / IncomingLightning are non-nil iff that side chose the
+	// Lightning rail (its owner settles the cross off-chain, not with an on-chain
+	// covenant FILL or same-chain co-sign). They are the cross-rail dual of the
+	// covenant fields: when EXACTLY ONE side is a covenant and the OTHER is
+	// Lightning, this Match is a CROSS-RAIL cross (CrossRail) that no same-rail
+	// path can settle — the two owners each rest on a different rail. It is bridged
+	// by the silent settlement BRIDGE (cmd/seqob-bridge), which fills the on-chain
+	// covenant and settles the Lightning leg atomically under one preimage so the
+	// two orders cross invisibly to their owners.
+	RestingLightning  *seqobv1.LightningTerms
+	IncomingLightning *seqobv1.LightningTerms
 }
 
 // BothCovenant reports the two-covenant / both-offline case.
 func (m *Match) BothCovenant() bool {
 	return m.RestingCovenant != nil && m.IncomingCovenant != nil
+}
+
+// CrossRail reports the cross-rail case the bridge settles: exactly one side
+// rests on-chain as a covenant and the other rests on Lightning. This is the
+// only match kind neither the covenant FILL (single or joint) nor the same-chain
+// co-sign path can settle by itself, because the two owners chose different
+// rails; the bridge crosses them by moving value between the rails under one
+// shared preimage. A same-rail match (both covenant, both same-chain, both
+// Lightning) is NOT cross-rail and keeps its existing settlement path.
+func (m *Match) CrossRail() bool {
+	covs, lns := 0, 0
+	if m.RestingCovenant != nil {
+		covs++
+	}
+	if m.IncomingCovenant != nil {
+		covs++
+	}
+	if m.RestingLightning != nil {
+		lns++
+	}
+	if m.IncomingLightning != nil {
+		lns++
+	}
+	return covs == 1 && lns == 1
+}
+
+// BridgeCovenant returns the covenant (on-chain) side's terms and whether it is
+// the RESTING side, for a CrossRail match. The bridge fills this covenant. It
+// returns (nil, false) when the match is not cross-rail.
+func (m *Match) BridgeCovenant() (terms *seqobv1.CovenantTerms, resting bool) {
+	if !m.CrossRail() {
+		return nil, false
+	}
+	if m.RestingCovenant != nil {
+		return m.RestingCovenant, true
+	}
+	return m.IncomingCovenant, false
+}
+
+// BridgeLightning returns the Lightning side's terms for a CrossRail match (the
+// leg the bridge settles off-chain via the submarine/pure-LN orchestrator), or
+// nil when the match is not cross-rail.
+func (m *Match) BridgeLightning() *seqobv1.LightningTerms {
+	if !m.CrossRail() {
+		return nil
+	}
+	if m.RestingLightning != nil {
+		return m.RestingLightning
+	}
+	return m.IncomingLightning
 }
 
 // Matcher crosses incoming orders against a Book.
@@ -180,6 +242,15 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 		}
 		if cov := incoming.GetCovenant(); cov != nil {
 			mt.IncomingCovenant = cov
+		}
+		// Surface the Lightning rail on either side so a covenant-vs-Lightning cross
+		// classifies as CrossRail (the bridge's job). Same-rail Lightning matches
+		// (both sides Lightning) still carry these but are not CrossRail.
+		if ln := p.e.Offer.GetLightning(); ln != nil {
+			mt.RestingLightning = ln
+		}
+		if ln := incoming.GetLightning(); ln != nil {
+			mt.IncomingLightning = ln
 		}
 		out = append(out, mt)
 	}

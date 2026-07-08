@@ -292,6 +292,68 @@ func TestCovenantMinLotRemainderTrim(t *testing.T) {
 	}
 }
 
+func TestCrossRailBridgeMatch(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	// Resting covenant SELL of X (asset A) wanting Y (asset B), 30 X for 90 B.
+	rest := sell(t, mk, "covA", 30, 90, true)
+	rest.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid: "aa", CovenantVout: 0,
+		AssetA: "00aa", AssetB: "00bb", RateNum: 3, RateDen: 1,
+		MinLot: 5, MakerProgVer: 1, ExpiryLocktime: 400,
+	}}
+	_ = offer.SignOffer(rest, mk)
+	mustSubmit(t, s, rest)
+
+	// Incoming LIGHTNING BUY of 30 X giving 100 B (its owner chose the LN rail).
+	in := buy(t, tk, "lnB", 30, 100, true)
+	in.Settlement = &seqobv1.Offer_Lightning{Lightning: &seqobv1.LightningTerms{
+		LnDirection: 1, Max_0ConfAmount: 50,
+	}}
+	_ = offer.SignOffer(in, tk)
+	mustSubmit(t, s, in)
+
+	got := m.Cross(in)
+	if len(got) != 1 {
+		t.Fatalf("want 1 match, got %d", len(got))
+	}
+	if !got[0].CrossRail() {
+		t.Fatal("covenant vs Lightning cross not classified CrossRail (bridge path)")
+	}
+	if got[0].BothCovenant() {
+		t.Fatal("a cross-rail match must NOT be BothCovenant")
+	}
+	terms, resting := got[0].BridgeCovenant()
+	if terms == nil || !resting || terms.GetCovenantTxid() != "aa" {
+		t.Fatalf("bridge covenant side wrong: terms=%v resting=%v", terms, resting)
+	}
+	ln := got[0].BridgeLightning()
+	if ln == nil || ln.GetMax_0ConfAmount() != 50 {
+		t.Fatalf("bridge Lightning side not carried: %v", ln)
+	}
+}
+
+func TestSameRailNotCrossRail(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	// Two plain same-chain orders: a same-rail cross, never a bridge job.
+	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true))
+	in := buy(t, tk, "b1", 100, 50, true)
+	mustSubmit(t, s, in)
+	got := m.Cross(in)
+	if len(got) != 1 {
+		t.Fatalf("want 1 match, got %d", len(got))
+	}
+	if got[0].CrossRail() {
+		t.Fatal("a same-chain/same-chain cross must not be CrossRail")
+	}
+	if terms, _ := got[0].BridgeCovenant(); terms != nil || got[0].BridgeLightning() != nil {
+		t.Fatal("same-rail match must expose no bridge sides")
+	}
+}
+
 // activeOf finds a resting order's active amount by scanning the pair.
 func activeOf(s *offerstore.Store, offerID string) uint64 {
 	for _, e := range s.SnapshotPairEntries(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}) {
