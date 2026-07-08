@@ -80,6 +80,7 @@ func main() {
 	resume := flag.Bool("resume", false, "cross: instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund) and exit")
 	lnSocket := flag.String("ln-socket", "", "lightning/pureln: the maker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg; required for -mode lightning and -mode pureln)")
 	subAnchor := flag.Int64("sub-anchor-depth", 3, "lightning: Bitcoin-anchor depth the maker requires on the taker's asset funding before it pays the invoice (>=2; the submarine cross-leg safety gate)")
+	max0conf := flag.Uint64("max-0conf", 0, "lightning: 0-conf LP-fronting cap (asset atoms). Trades whose on-chain asset leg is <= this settle INSTANTLY (skip the anchor-bury wait); the maker/taker fronts the Bitcoin-reorg risk. Advertised in the offer's LightningTerms. 0 = disabled (always anchor-gate).")
 	onchainCltv := flag.Uint("onchain-cltv", 240, "lightning: advisory CLTV (blocks) in the resting LightningTerms (the load-bearing T_seq is minted per-lift)")
 	assetLnSocket := flag.String("asset-ln-socket", "", "pureln: the maker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg; required for -mode pureln)")
 	btcAsset := flag.String("btc-asset", "", "pureln: BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in)")
@@ -125,7 +126,7 @@ func main() {
 			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
 			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet, lnSocket: *lnSocket,
 			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
-			spendFee: *spendFee,
+			spendFee: *spendFee, max0conf: *max0conf,
 			reverse:  strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
 		})
 		return

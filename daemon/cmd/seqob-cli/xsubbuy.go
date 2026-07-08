@@ -61,7 +61,8 @@ func cmdXSubBuy(args []string) {
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (pays the invoice) (required)")
 	minAnchor := fs.Int64("min-anchor-depth", 3, "Bitcoin-anchor depth required on the maker's asset HTLC before we pay (>=2; the taker's cross-leg gate)")
-	spendFee := fs.Uint64("spend-fee", 1000, "asset-claim fee target in atoms")
+	max0conf := fs.Uint64("max-0conf", 0, "0-conf LP-fronting cap (asset atoms): if the asset leg is <= this, pay WITHOUT waiting for the anchor bury (instant, accepting Bitcoin-reorg risk). 0 = use the maker offer's advertised cap; anything set overrides it.")
+	spendFee := fs.Uint64("spend-fee", 1000, "asset-claim fee target in native sats (sized per-asset via the fee market)")
 	anchorWait := fs.Duration("anchor-wait", 20*time.Minute, "max wait for the asset HTLC to bury before paying")
 	stateFile := fs.String("state-file", "xsubbuy-session.json", "session persistence (holds P after paying)")
 	_ = fs.Parse(args)
@@ -101,8 +102,15 @@ func cmdXSubBuy(args []string) {
 	expectAsset := target.GetPair().GetBaseAsset()
 	expectSeq := target.GetBaseAmount()         // asset atoms (SELL: offer_amount == base_amount)
 	expectMsat := target.GetWantAmount() * 1000 // BTC sats the maker wants -> msat
-	fmt.Printf("lifting REVERSE lightning offer %s by %s: buy %d %s for %d msat over Lightning\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectMsat)
+	// Effective 0-conf cap: an explicit -max-0conf overrides; otherwise honor the cap
+	// the maker advertised in the offer's LightningTerms (single source of truth).
+	effMax0conf := *max0conf
+	if effMax0conf == 0 {
+		effMax0conf = target.GetLightning().GetMax_0ConfAmount()
+	}
+	instant := effMax0conf > 0 && expectSeq <= effMax0conf
+	fmt.Printf("lifting REVERSE lightning offer %s by %s: buy %d %s for %d msat over Lightning (0-conf cap=%d -> instant=%v)\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectMsat, effMax0conf, instant)
 
 	// 2. Settlement: the anchored Sequentia node (asset leg) + our LN node.
 	seqRPC, err := xliftRPCFromURL(*seqRPCURL)
@@ -200,6 +208,7 @@ func cmdXSubBuy(args []string) {
 		ExpectSeqAmount:   expectSeq,
 		ExpectInvoiceMsat: expectMsat,
 		MinAnchorDepth:    *minAnchor,
+		Max0ConfAmount:    effMax0conf,
 		SpendFeeAtoms:     *spendFee,
 		Timing:            client.XcTiming{AnchorWait: *anchorWait},
 		Log:               func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },

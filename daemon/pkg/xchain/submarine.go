@@ -35,6 +35,23 @@ type SubmarineSwap struct {
 	ln LNLeg // the Bitcoin-Lightning leg (replaces the on-chain btcBackend)
 }
 
+// ClaimSEQLeg overrides the embedded Swap.ClaimSEQLeg for submarine swaps so the
+// asset-claim fee is SIZED into the leg's own asset via the open-fee-market exchange
+// rate before broadcast. The submarine drivers pass a NATIVE-sats target
+// (SpendFeeAtoms); without sizing, claiming a high-value asset (e.g. GOLD, rate ~5e12)
+// emits that target as a raw atom count whose native-equivalent value blows past the
+// node's maxfeerate and sendrawtransaction rejects it. This mirrors the RFQ /
+// order-book paths, which already size via FeeExchangeRate. The base Swap.ClaimSEQLeg
+// keeps taking an already-sized fee, because its DEX / order-book callers pre-size it —
+// so this override, reached only through *SubmarineSwap, never double-sizes them.
+func (m *SubmarineSwap) ClaimSEQLeg(leg *LegLock, claimKey *Key, targetNativeFee uint64) (string, error) {
+	fee := targetNativeFee
+	if leg != nil && leg.Funded != nil {
+		fee = m.sizeSeqSpendFee(leg.Funded.AssetID, leg.Funded.Amount, targetNativeFee)
+	}
+	return m.Swap.ClaimSEQLeg(leg, claimKey, fee)
+}
+
 // NewSubmarineSwap wires a submarine orchestrator to the anchored Sequentia node
 // (SEQ leg) and a Bitcoin-Lightning leg (a SeqLN/CLN node on Bitcoin). prim is
 // the shared hashlock: for a NORMAL swap the taker holds the secret and the
@@ -146,6 +163,11 @@ type NormalParams struct {
 	InvoiceMsat    uint64 // expected invoice amount (0 = don't cross-check)
 	MinAnchorDepth int64  // Bitcoin-anchor depth required before paying (> 1)
 	AnchorTimeout  time.Duration
+	// Max0ConfAmount is the 0-conf LP-fronting cap (asset atoms). When > 0 and the
+	// SEQ-leg value is <= it, the maker SKIPS the anchor-bury wait and pays the LN
+	// leg at 0-conf, fronting the Bitcoin-reorg risk on this small amount (instant
+	// settlement). Above the cap the anchor gate is enforced as normal.
+	Max0ConfAmount uint64
 }
 
 // NormalResult reports the outcome of a completed NORMAL swap.
@@ -167,7 +189,11 @@ type NormalResult struct {
 // The maker never pays the invoice until step 2 passes, so a Bitcoin reorg cannot
 // leave it out-of-pocket on LN with an un-fundable SEQ claim.
 func (m *SubmarineSwap) RunNormal(p NormalParams, makerClaimKey *Key, seqClaimFee uint64) (*NormalResult, error) {
-	if p.MinAnchorDepth < 2 {
+	// 0-conf LP-fronting (value <= cap) is the DELIBERATE exception to the anchor
+	// gate: the small-amount reorg risk is fronted by the maker, so the >= 2 depth
+	// floor only binds when we WILL wait for the gate.
+	zeroConf := p.Max0ConfAmount > 0 && p.SeqAmountAtoms <= p.Max0ConfAmount
+	if !zeroConf && p.MinAnchorDepth < 2 {
 		return nil, fmt.Errorf("%w: NORMAL swap MinAnchorDepth=%d must be >= 2 (design §3.2)", ErrLNLegInvalid, p.MinAnchorDepth)
 	}
 	// 1. Verify the taker's SEQ HTLC (correct H, amount, claimable by the maker).
@@ -178,10 +204,17 @@ func (m *SubmarineSwap) RunNormal(p NormalParams, makerClaimKey *Key, seqClaimFe
 	if err != nil {
 		return nil, err
 	}
-	// 2. Wait for the SEQ funding to be anchor-buried (the safety gate).
-	anchor, err := m.waitSeqAnchorBuried(vseq.BlockHash, p.MinAnchorDepth, p.AnchorTimeout)
-	if err != nil {
-		return &NormalResult{Anchor: anchor}, err
+	// 2. Wait for the SEQ funding to be anchor-buried (the safety gate) UNLESS this
+	// is a 0-conf LP-fronting swap: below the cap the maker pays immediately and
+	// fronts the Bitcoin-reorg risk (instant settlement on small amounts).
+	var anchor *SubAnchorEvidence
+	if zeroConf {
+		anchor = &SubAnchorEvidence{SeqBlockHash: vseq.BlockHash, MinAnchorDepth: 0, OK: true}
+	} else {
+		anchor, err = m.waitSeqAnchorBuried(vseq.BlockHash, p.MinAnchorDepth, p.AnchorTimeout)
+		if err != nil {
+			return &NormalResult{Anchor: anchor}, err
+		}
 	}
 	// 3. Pay the invoice -> learn P. This is the irreversible LN action; it only
 	// happens after the SEQ funding is anchor-deep.

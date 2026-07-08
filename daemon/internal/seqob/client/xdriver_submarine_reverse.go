@@ -236,7 +236,8 @@ type TakerReverseSubmarineParams struct {
 	ExpectInvoiceMsat uint64 // BTC-LN we expect to pay (required)
 
 	MinAnchorDepth int64  // anchor-depth gate we require before paying (>=2, default 3)
-	SpendFeeAtoms  uint64 // asset-claim fee (default 1000)
+	Max0ConfAmount uint64 // 0-conf LP-fronting cap (asset atoms); value <= it skips the bury wait
+	SpendFeeAtoms  uint64 // NATIVE-sats target for the asset-claim spend (sized per-asset; default 1000)
 	Timing         XcTiming
 	Log            func(format string, args ...interface{})
 
@@ -333,15 +334,24 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	}
 	res.SeqLeg = vseq.Leg
 
-	// 3. THE GATE: do NOT pay until the asset HTLC is anchor-buried (a plain
-	// invoice is irreversible once paid).
-	ev, err := waitAnchorBuried(ops, leg.BlockHash, p.MinAnchorDepth, p.Timing.AnchorWait)
-	res.Anchor = ev
-	if err != nil {
-		sendXcFail(p.Crypter, send, "ANCHOR_TIMEOUT", err.Error())
-		return res, fmt.Errorf("taker reverse anchor gate: %w", err)
+	// 3. THE GATE: do NOT pay until the asset HTLC is anchor-buried (a plain invoice
+	// is irreversible once paid) — UNLESS this is a 0-conf LP-fronting swap. Below the
+	// cap the taker pays immediately and fronts the Bitcoin-reorg risk on this small
+	// amount (instant settlement; the asset leg is still verified + already confirmed
+	// on Sequentia, only the Bitcoin-anchor DEPTH bury is skipped).
+	if p.Max0ConfAmount > 0 && vseq.Leg.Funded.Amount <= p.Max0ConfAmount {
+		res.Anchor = &xchain.SubAnchorEvidence{SeqBlockHash: leg.BlockHash, MinAnchorDepth: 0, OK: true}
+		p.logf("reverse taker: 0-CONF FRONTING — asset leg %d atoms <= cap %d; skipping the %d-block anchor-bury wait (accepting Bitcoin-reorg risk), paying the invoice",
+			vseq.Leg.Funded.Amount, p.Max0ConfAmount, p.MinAnchorDepth)
+	} else {
+		ev, err := waitAnchorBuried(ops, leg.BlockHash, p.MinAnchorDepth, p.Timing.AnchorWait)
+		res.Anchor = ev
+		if err != nil {
+			sendXcFail(p.Crypter, send, "ANCHOR_TIMEOUT", err.Error())
+			return res, fmt.Errorf("taker reverse anchor gate: %w", err)
+		}
+		p.logf("reverse taker: asset HTLC anchor-buried (depth=%d); paying the invoice", ev.AnchorDepth)
 	}
-	p.logf("reverse taker: asset HTLC anchor-buried (depth=%d); paying the invoice", ev.AnchorDepth)
 
 	// 4. Pay the invoice -> learn P. Irreversible.
 	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, p.ExpectInvoiceMsat)
@@ -357,7 +367,9 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	if err := ops.InjectSecret(preimage); err != nil {
 		return res, err
 	}
-	claimTx, err := ops.ClaimSEQLeg(vseq.Leg, p.SeqClaimKey, xcSafeFee(p.SpendFeeAtoms, vseq.Leg.Funded.Amount))
+	// Pass the NATIVE-sats target; LiveSubReverseTakerOps.ClaimSEQLeg (via
+	// SubmarineSwap.ClaimSEQLeg) sizes it into the leg's own asset and clamps it.
+	claimTx, err := ops.ClaimSEQLeg(vseq.Leg, p.SeqClaimKey, p.SpendFeeAtoms)
 	if err != nil {
 		return res, fmt.Errorf("taker reverse claim asset (RETRYABLE, taker holds P): %w", err)
 	}
