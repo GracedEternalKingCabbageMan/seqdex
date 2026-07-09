@@ -134,6 +134,43 @@ func (l *clnLNLeg) NodeID() (string, error) {
 	return res.ID, nil
 }
 
+// ReconnectPeers re-establishes the transport connection to any channel peer that
+// has dropped. CLN silently tears down a peer's TCP/Noise connection when it goes
+// idle (and a peer restart drops it too); a channel with a disconnected peer stays
+// open on-chain but cannot route an HTLC, so a maker that re-quotes after a fill
+// must reconnect first or the next leg fails to pay. It is best-effort: it lists
+// peers and, for each disconnected one, issues `connect id` (CLN redials a known
+// address from gossip / the peer's stored addr). Peers with no known address are
+// skipped and surfaced in the returned error, but the ones that could reconnect
+// still do. Returns the count reconnected. Idempotent — connecting an
+// already-connected peer is a no-op — so it is safe to call before every re-quote.
+func (l *clnLNLeg) ReconnectPeers() (int, error) {
+	var res struct {
+		Peers []struct {
+			ID        string `json:"id"`
+			Connected bool   `json:"connected"`
+		} `json:"peers"`
+	}
+	if err := l.rpc.call(&res, "listpeers", map[string]interface{}{}); err != nil {
+		return 0, fmt.Errorf("listpeers: %w", err)
+	}
+	reconnected := 0
+	var firstErr error
+	for _, p := range res.Peers {
+		if p.Connected {
+			continue
+		}
+		if err := l.rpc.call(nil, "connect", map[string]interface{}{"id": p.ID}); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("connect %s: %w", p.ID, err)
+			}
+			continue
+		}
+		reconnected++
+	}
+	return reconnected, firstErr
+}
+
 func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
 	// Decode first so we never pay an invoice whose hash is not the swap secret,
 	// and to sanity-check the amount. CLN's decoder command is `decode` (the older

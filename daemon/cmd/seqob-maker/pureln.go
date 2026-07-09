@@ -51,6 +51,7 @@ type pureLNMakerConfig struct {
 	holdTimeout time.Duration
 	reverse     bool // true = SELL the asset (maker gives asset; holds BTC); false = BUY (maker acquires asset; holds asset)
 	onchainCltv uint32
+	requote     bool // true = re-post a fresh offer after each settled fill instead of exiting
 }
 
 // plnDirection maps the maker config to the driver's direction and the offer's
@@ -99,6 +100,27 @@ func buildPureLNOffer(cfg pureLNMakerConfig, holdLnNodeID string) *seqobv1.Offer
 		o.WantAsset, o.WantAmount = cfg.asset, cfg.assetAmt
 	}
 	return o
+}
+
+// reconnectPlnPeers reconnects any dropped channel peers on BOTH of the maker's
+// Lightning nodes (the SeqLN-on-Sequentia asset node and the SeqLN-on-Bitcoin BTC
+// node) before a re-quote. A pure-LN swap holds one leg and pays the other, so a
+// silently dropped peer on either node would leave the next swap unroutable. It is
+// best-effort: failures are logged, not fatal (a peer with no known address stays
+// down until it dials in, and the swap-time hold/pay would fail cleanly anyway).
+func reconnectPlnPeers(cfg pureLNMakerConfig) {
+	assetLeg := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset)
+	if n, err := assetLeg.ReconnectPeers(); err != nil {
+		fmt.Printf("requote: asset-LN peer reconnect: reconnected %d, err: %v\n", n, err)
+	} else if n > 0 {
+		fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
+	}
+	btcLeg := xchain.NewCLNLNLeg(cfg.btcLnSock)
+	if n, err := btcLeg.ReconnectPeers(); err != nil {
+		fmt.Printf("requote: BTC-LN peer reconnect: reconnected %d, err: %v\n", n, err)
+	} else if n > 0 {
+		fmt.Printf("requote: reconnected %d BTC-LN peer(s)\n", n)
+	}
 }
 
 // runPureLNMaker posts a pure-LN offer and serves swaps. No Ocean wallet, no
@@ -239,14 +261,23 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 			go func(sid string, in chan []byte) {
 				settled := false
 				defer func() {
+					// -requote: re-post a fresh quote while still holding the in-flight slot
+					// (racing lifts are refused as "busy" until it is live -> no double-post).
+					// Both legs are Lightning, so reconnect BOTH LN nodes' dropped channel
+					// peers before re-quoting or the next swap's hold/pay cannot route.
+					if settled && cfg.requote {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
+							reconnectPlnPeers(cfg)
+						})
+					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled {
+					if settled && !cfg.requote {
 						filled = true
 					}
 					mu.Unlock()
-					if settled {
+					if settled && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 				}()

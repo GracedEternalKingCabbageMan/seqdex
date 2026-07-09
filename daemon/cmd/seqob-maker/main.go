@@ -85,6 +85,7 @@ func main() {
 	assetLnSocket := flag.String("asset-ln-socket", "", "pureln: the maker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg; required for -mode pureln)")
 	btcAsset := flag.String("btc-asset", "", "pureln: BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in)")
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
+	requote := flag.Bool("requote", false, "cross/lightning/pureln: after each settled fill, reconnect dropped channel peers and re-post a FRESH offer (same offer id) instead of cancelling and exiting; keeps a live quote without a manual restart (default off = quote once then exit)")
 	flag.Parse()
 
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
@@ -114,6 +115,7 @@ func main() {
 			assetLnSock: *assetLnSocket, btcLnSock: *lnSocket, btcAsset: *btcAsset,
 			holdTimeout: *holdTimeout, onchainCltv: uint32(*onchainCltv),
 			reverse: strings.ToLower(*side) == "sell", // sell = maker gives the asset (holds BTC); buy = maker acquires (holds asset)
+			requote: *requote,
 		})
 		return
 	}
@@ -128,6 +130,7 @@ func main() {
 			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
 			spendFee: *spendFee, max0conf: *max0conf,
 			reverse:  strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
+			requote:  *requote,
 		})
 		return
 	}
@@ -142,6 +145,7 @@ func main() {
 			btcDelta: uint32(*btcDelta), seqDelta: uint32(*seqDelta),
 			minBTCConf: *minBTCConf, spendFee: *spendFee, stateDir: *xstateDir,
 			btcFeeRate: *btcFeeRate,
+			requote:    *requote,
 		})
 		return
 	}
@@ -690,6 +694,7 @@ type crossMakerConfig struct {
 	spendFee     uint64
 	stateDir     string
 	btcFeeRate   float64
+	requote      bool
 }
 
 // runCrossMaker posts a cross-chain offer and serves forward lifts with the
@@ -901,14 +906,29 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			go func(sid string, in chan []byte, reverse bool) {
 				settled := false
 				defer func() {
+					// -requote: re-post a fresh quote WHILE still holding the in-flight
+					// slot, so the serve loop refuses any racing lift as "busy" until the
+					// new offer is live (no double-post / oversell). Cross legs are on-chain
+					// (no LN channel peers), so the pre-quote "reconnect" is a reachability
+					// ping of both backends.
+					if settled && cfg.requote {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
+							if _, err := btcChain.BlockCount(); err != nil {
+								fmt.Printf("requote: bitcoind unreachable before re-quote: %v\n", err)
+							}
+							if _, err := seqChain.BlockCount(); err != nil {
+								fmt.Printf("requote: sequentia node unreachable before re-quote: %v\n", err)
+							}
+						})
+					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled {
+					if settled && !cfg.requote {
 						filled = true
 					}
 					mu.Unlock()
-					if settled {
+					if settled && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 				}()
@@ -1106,29 +1126,89 @@ func persistXSessionReverse(dir, sid, offerID string, r *client.MakerReverseResu
 }
 
 // cancelOffer removes the filled resting offer from the book (signed cancel).
+// This is the NON-requote terminal path: the maker quotes once and exits.
 func cancelOffer(relay string, o *seqobv1.Offer, key *btcec.PrivateKey) {
+	if err := postCancel(relay, o, key); err != nil {
+		fmt.Printf("cancel offer: %v\n", err)
+		return
+	}
+	fmt.Printf("offer %s cancelled after fill (restart the maker to re-quote)\n", o.GetOfferId())
+}
+
+// postCancel signs and POSTs an offer cancel to the relay, returning only when the
+// relay has processed it (HTTP 200 => the offer is removed from the book). The
+// nonce is the wall-clock nanosecond, which is strictly increasing across calls,
+// so each cancel beats the store's replay guard and a re-posted same offer_id can
+// be cancelled again on the next fill.
+func postCancel(relay string, o *seqobv1.Offer, key *btcec.PrivateKey) error {
 	c := &seqobv1.OfferCancel{OfferId: o.GetOfferId(), Nonce: uint64(time.Now().UnixNano())}
 	if err := offer.SignCancel(c, key); err != nil {
-		fmt.Printf("cancel offer: sign: %v\n", err)
-		return
+		return fmt.Errorf("sign: %w", err)
 	}
 	b, err := jsonMarshal.Marshal(c)
 	if err != nil {
-		fmt.Printf("cancel offer: marshal: %v\n", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	resp, err := http.Post(relay+"/v1/offers/cancel", "application/json", bytes.NewReader(b))
 	if err != nil {
-		fmt.Printf("cancel offer: %v\n", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("cancel offer: status %d: %s\n", resp.StatusCode, string(body))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// refreshOfferForRequote rolls an offer forward for a fresh quote: it moves the
+// created/expires window to [now, now+expiry) and re-signs it (the signature
+// covers those fields), leaving the offer_id, pair, amounts and settlement terms
+// untouched. Returns the error from re-signing, if any. It is deliberately pure
+// (no I/O) so the re-quote refresh is unit-testable on its own.
+func refreshOfferForRequote(o *seqobv1.Offer, expiry time.Duration, key *btcec.PrivateKey) error {
+	now := time.Now()
+	o.CreatedAtUnix = uint64(now.Unix())
+	o.ExpiresAtUnix = uint64(now.Add(expiry).Unix())
+	return offer.SignOffer(o, key)
+}
+
+// requoteAfterFill keeps a maker's quote continuously live after a settled fill,
+// replacing the old cancel-and-exit behaviour when -requote is set. It is called
+// from a settle goroutine's defer WHILE that goroutine still holds the single
+// in-flight slot, so the serve loop refuses any new lift as "busy" until the fresh
+// quote is up: the maker can neither double-post (there is never a second offer_id)
+// nor oversell (only one offer rests at a time, at full size). Steps:
+//
+//  1. reconnect any dropped channel peers so the next leg can actually route
+//     (the maker's asset/BTC LN nodes silently drop peers between fills);
+//  2. refresh the offer's created/expiry window and re-sign it;
+//  3. cancel the just-filled resting offer, then re-submit the SAME offer_id.
+//
+// Cancel-then-resubmit (rather than an in-place edit) is used on purpose: it is
+// robust even if the relay's expiry sweeper already reaped the offer between the
+// lift and settlement — the cancel then simply no-ops and the submit re-adds it —
+// and the submit path re-registers this connection as the maker's lift endpoint.
+// The cancel is synchronous (returns only after HTTP 200 => removed), so the
+// submit that follows can never collide with the old resting copy.
+func requoteAfterFill(ws *crossWS, wsURL string, o *seqobv1.Offer, relay string, key *btcec.PrivateKey, expiry time.Duration, reconnect func()) {
+	if reconnect != nil {
+		reconnect()
+	}
+	if err := refreshOfferForRequote(o, expiry, key); err != nil {
+		fmt.Printf("requote: re-sign failed: %v (offer NOT re-posted)\n", err)
 		return
 	}
-	fmt.Printf("offer %s cancelled after fill (restart the maker to re-quote)\n", o.GetOfferId())
+	// Remove the filled copy first (idempotent if already swept), then re-post.
+	if err := postCancel(relay, o, key); err != nil {
+		fmt.Printf("requote: cancel of filled offer failed (continuing to re-post): %v\n", err)
+	}
+	if err := ws.write(&seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); err != nil {
+		fmt.Printf("requote: re-submit failed: %v; reconnecting relay + re-posting\n", err)
+		ws.redialLoop(wsURL, o)
+	}
+	fmt.Printf("re-quoted: offer %s live again (%d %s), fresh expiry; awaiting the next lift\n",
+		o.GetOfferId(), o.GetBaseAmount(), o.GetOfferAsset())
 }
 
 // rpcFromURL parses http://user:pass@host:port into an xchain RPC client.
