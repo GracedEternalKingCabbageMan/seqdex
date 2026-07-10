@@ -89,6 +89,8 @@ func cmdXSubAs(args []string) {
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations to wait on our own BTC leg before announcing")
 	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
+	extBolt11 := fs.String("asset-bolt11", "", "DEVICE-PREIMAGE mode: an asset invoice created OUT-OF-BAND by the device (the wallet) on its own hosted node with the device's OWN preimage. When set (with -payment-hash), this taker NEVER mints/settles the preimage: it funds the BTC HTLC on H, forwards this bolt11 to the maker, and waits for it to be PAID (the device settles). Non-custodial receive.")
+	extHashHex := fs.String("payment-hash", "", "DEVICE-PREIMAGE mode: the payment_hash H (hex) of -asset-bolt11 (H = SHA256(device preimage)).")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC refund fee target (sats)")
 	stateFile := fs.String("state-file", "xsubas-session.json", "session persistence (refund needs this)")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
@@ -104,6 +106,16 @@ func cmdXSubAs(args []string) {
 	}
 	if *assetLnSocket == "" {
 		fatal("xsubas requires -asset-ln-socket (the taker's SeqLN-on-Sequentia lightning-rpc, asset leg)")
+	}
+	// DEVICE-PREIMAGE (external-invoice) mode: the wallet made the asset invoice on
+	// its own hosted node with its OWN preimage; we get only H + the bolt11, never P.
+	var extHashH []byte
+	if *extBolt11 != "" {
+		var derr error
+		extHashH, derr = hex.DecodeString(*extHashHex)
+		if derr != nil || len(extHashH) != 32 {
+			fatal("-asset-bolt11 requires -payment-hash <32-byte hex H>")
+		}
 	}
 
 	// 1. Find + verify a matching sub-asset offer (maker SELLS: LnAssetLNForBTC).
@@ -164,6 +176,13 @@ func cmdXSubAs(args []string) {
 	if err != nil {
 		fatal("mint refund key: %v", err)
 	}
+	// H = the device invoice's hash in external mode (we hold no P), else SHA256(P).
+	hashHex := hex.EncodeToString(hashArr[:])
+	secretHex := hex.EncodeToString(secret)
+	if extHashH != nil {
+		hashHex = hex.EncodeToString(extHashH)
+		secretHex = "" // device-held; this taker never learns the preimage
+	}
 	st := &xsubasState{
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		Relay:            *relay,
@@ -172,8 +191,8 @@ func cmdXSubAs(args []string) {
 		Asset:            *asset,
 		AssetAmount:      assetAtoms,
 		BtcAmount:        btcSats,
-		SecretHex:        hex.EncodeToString(secret),
-		HashHex:          hex.EncodeToString(hashArr[:]),
+		SecretHex:        secretHex,
+		HashHex:          hashHex,
 		BtcRefundPrivHex: hex.EncodeToString(btcRefundKey.Bytes()),
 		Status:           "opening",
 	}
@@ -234,21 +253,28 @@ func cmdXSubAs(args []string) {
 	if *invoiceMode != "plain" && *invoiceMode != "hold" {
 		fatal("-asset-invoice must be plain or hold")
 	}
+	// External mode builds the BTC HTLC on the device-supplied H (not SHA256(secret)).
+	htlcLock := xchain.NewHashLock(secret)
+	if extHashH != nil {
+		htlcLock = xchain.NewHashLockFromHash(extHashH)
+	}
 	takerOps := &client.LiveSubAssetTakerOps{
-		Swap:    xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLock(secret)),
+		Swap:    xchain.NewSwapBitcoin(btcChain, nil, htlcLock),
 		AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
 		BTC:     btcChain,
 		Plain:   *invoiceMode == "plain",
 	}
 	res, err := client.RunTakerSubAsset(client.TakerSubAssetParams{
-		Ops:          takerOps,
-		Crypter:      crypter,
-		BtcAmount:    btcSats,
-		AssetAmount:  assetAtoms,
-		MinBTCConf:   *minBTCConf,
-		SpendFeeSats: *spendFee,
-		BtcRefundKey: btcRefundKey,
-		Preimage:     secret,
+		Ops:            takerOps,
+		Crypter:        crypter,
+		BtcAmount:      btcSats,
+		AssetAmount:    assetAtoms,
+		MinBTCConf:     *minBTCConf,
+		SpendFeeSats:   *spendFee,
+		BtcRefundKey:   btcRefundKey,
+		Preimage:       secret,
+		ExternalHashH:  extHashH,
+		ExternalBolt11: *extBolt11,
 		OnBtcLegFunded: func(r *client.TakerSubAssetResult) {
 			if r.BtcLeg != nil {
 				st.BtcLegTxid = r.BtcLeg.Funded.TxID

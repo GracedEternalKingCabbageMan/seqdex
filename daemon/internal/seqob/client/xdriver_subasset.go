@@ -83,6 +83,12 @@ type SubAssetTakerOps interface {
 	SettleAssetHold(h, preimage []byte) error
 	// CancelAssetHold fails the held asset invoice back (maker never paid / abort).
 	CancelAssetHold(h []byte) error
+	// WaitAssetPaid blocks until the asset invoice with payment_hash h is PAID on
+	// the receiving node. Used by the DEVICE-PREIMAGE (external-invoice) mode: the
+	// invoice was created out-of-band by the device with its OWN preimage, so the
+	// driver never mints/settles it — it only observes that the maker's payment
+	// arrived (the device's node auto-settles, revealing P to the maker).
+	WaitAssetPaid(h []byte, timeout time.Duration) error
 	// RefundBTCLeg reclaims the BTC HTLC via the refund/ELSE (CLTV) branch.
 	RefundBTCLeg(leg *xchain.LegLock, refundKey *xchain.Key, nLockTime uint32, fee uint64) (string, error)
 }
@@ -190,6 +196,10 @@ func (o *LiveSubAssetTakerOps) CancelAssetHold(h []byte) error {
 		return nil // nothing to cancel; an unpaid plain invoice simply expires
 	}
 	return o.AssetLN.CancelHold(h)
+}
+func (o *LiveSubAssetTakerOps) WaitAssetPaid(h []byte, timeout time.Duration) error {
+	_, err := o.AssetLN.WaitPaidByHash(h, timeout)
+	return err
 }
 func (o *LiveSubAssetTakerOps) RefundBTCLeg(leg *xchain.LegLock, refundKey *xchain.Key, nLockTime uint32, fee uint64) (string, error) {
 	return o.Swap.RefundBTCLeg(leg, refundKey, nLockTime, fee)
@@ -400,7 +410,16 @@ type TakerSubAssetParams struct {
 	MinBTCConf   int         // confs to wait on our own BTC leg before announcing (default 1)
 	SpendFeeSats uint64      // BTC HTLC refund fee target in native sats (default 1000)
 	BtcRefundKey *xchain.Key // reclaims the BTC HTLC after T_btc (minted if nil)
-	Preimage     []byte      // 32-byte secret P (minted if nil)
+	Preimage     []byte      // 32-byte secret P (minted if nil). IGNORED in external-invoice mode.
+	// DEVICE-PREIMAGE (external-invoice) mode: when ExternalBolt11 is set, the asset
+	// invoice was created OUT-OF-BAND by the device (the wallet) on the receiving
+	// node with the device's OWN preimage. The driver then NEVER mints P, creates an
+	// invoice, or settles: it funds the BTC HTLC on the device-supplied H, announces
+	// the device's bolt11 to the maker, and waits for the invoice to be PAID (the
+	// device's node auto-settles, revealing P to the maker, who claims the BTC). The
+	// preimage stays device-held; this taker never learns it. Non-custodial receive.
+	ExternalHashH  []byte // the device invoice's payment_hash H (H = SHA256(device P))
+	ExternalBolt11 string // the device-created asset invoice on H (the maker pays this)
 	// OnBtcLegFunded fires once the BTC HTLC is broadcast (before its confirmation
 	// wait), so a CLI can persist the refund material (leg + T_btc) to disk before
 	// anything downstream can fail. The result already carries BtcLeg/BtcLocktime.
@@ -454,11 +473,21 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 			return nil, fmt.Errorf("subasset taker: mint refund key: %w", err)
 		}
 	}
-	secret := p.Preimage
-	if len(secret) == 0 {
-		secret = make([]byte, 32)
-		if _, err := rand.Read(secret); err != nil {
-			return nil, err
+	// DEVICE-PREIMAGE (external-invoice) mode: the device created the asset invoice
+	// with its own preimage; this taker only gets H + the bolt11 and NEVER the
+	// preimage. Otherwise (self-driven mode) it mints P and creates the invoice.
+	external := p.ExternalBolt11 != ""
+	if external && len(p.ExternalHashH) != 32 {
+		return nil, fmt.Errorf("subasset taker: external-invoice mode needs a 32-byte ExternalHashH")
+	}
+	var secret []byte
+	if !external {
+		secret = p.Preimage
+		if len(secret) == 0 {
+			secret = make([]byte, 32)
+			if _, err := rand.Read(secret); err != nil {
+				return nil, err
+			}
 		}
 	}
 	res := &TakerSubAssetResult{}
@@ -494,9 +523,15 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	}
 	res.BtcLocktime = terms.BtcLocktime
 
-	// 2. Fund the BTC HTLC (claim=maker with P, refund=us after T_btc).
-	hashArr := sha256.Sum256(secret)
-	hashH := hashArr[:]
+	// 2. Fund the BTC HTLC (claim=maker with P, refund=us after T_btc). H is the
+	//    device's invoice hash in external mode, else SHA256(our minted P).
+	var hashH []byte
+	if external {
+		hashH = p.ExternalHashH
+	} else {
+		hashArr := sha256.Sum256(secret)
+		hashH = hashArr[:]
+	}
 	res.HashH = hashH
 	p.logf("subasset taker: locking BTC HTLC: %d sats, T_btc=%d", p.BtcAmount, terms.BtcLocktime)
 	btcLeg, hp, err := p.Ops.LockBTCLeg(makerClaimPub, refundKey.PubKey(), atomsToCoins(p.BtcAmount), terms.BtcLocktime)
@@ -531,14 +566,21 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	}
 	p.logf("subasset taker: BTC HTLC %s confirmed", btcLeg.Funded.TxID)
 
-	// 4. Issue the asset hold invoice on H (we hold P; released only when we settle).
-	invoice, invH, err := p.Ops.PrepareAssetHold(secret, p.AssetAmount*1000)
-	if err != nil {
-		sendXcFail(p.Crypter, send, "asset_invoice", err.Error())
-		return res, fmt.Errorf("subasset taker: prepare asset hold invoice (refund BTC at T_btc): %w", err)
-	}
-	if hex.EncodeToString(invH) != hex.EncodeToString(hashH) {
-		return res, fmt.Errorf("subasset taker: hold invoice hash != H (internal)")
+	// 4. The asset invoice on H. External mode: the DEVICE already created it (we
+	//    only forward its bolt11; we never mint P). Self-driven: we create it.
+	var invoice string
+	if external {
+		invoice = p.ExternalBolt11
+	} else {
+		var invH []byte
+		invoice, invH, err = p.Ops.PrepareAssetHold(secret, p.AssetAmount*1000)
+		if err != nil {
+			sendXcFail(p.Crypter, send, "asset_invoice", err.Error())
+			return res, fmt.Errorf("subasset taker: prepare asset invoice (refund BTC at T_btc): %w", err)
+		}
+		if hex.EncodeToString(invH) != hex.EncodeToString(hashH) {
+			return res, fmt.Errorf("subasset taker: invoice hash != H (internal)")
+		}
 	}
 
 	// 5. Announce the funded leg + invoice.
@@ -561,8 +603,24 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	// 6. Await the maker's "verified, about to pay" ack (best-effort; a failing
 	//    maker instead couriers XcFail, which recvXcType surfaces).
 	if _, err := recvXcType(recv, p.Crypter, XcSubAsBtcVerified, p.Timing.SeqLockWait); err != nil {
-		_ = p.Ops.CancelAssetHold(hashH)
+		if !external {
+			_ = p.Ops.CancelAssetHold(hashH)
+		}
 		return res, fmt.Errorf("subasset taker: maker did not verify the BTC leg (refund BTC at T_btc): %w", err)
+	}
+
+	if external {
+		// 7-external (DEVICE-PREIMAGE): the device's node holds P and auto-settles
+		// when the maker pays. We NEVER learn P; we only wait for the invoice to be
+		// PAID (= the maker paid, the device revealed P to the maker, the maker
+		// claims the BTC). The received asset lands in the device's own node.
+		p.logf("subasset taker: awaiting the maker's asset payment (device settles; preimage device-held)")
+		if err := p.Ops.WaitAssetPaid(hashH, p.Timing.SeqLockWait); err != nil {
+			return res, fmt.Errorf("subasset taker: maker never paid the asset (refund BTC at T_btc): %w", err)
+		}
+		res.Received = true // res.Preimage stays nil: the device holds it, not us
+		p.logf("subasset taker: asset invoice PAID (device received the asset; maker claims BTC with the device-revealed P)")
+		return res, nil
 	}
 
 	// 7. Wait for the maker's asset payment to be HELD at our node, then SETTLE it
