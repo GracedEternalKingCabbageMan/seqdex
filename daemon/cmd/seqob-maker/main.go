@@ -62,7 +62,7 @@ func main() {
 	confidential := flag.Bool("confidential", true, "post a confidential offer (blinded settlement); false = explicit")
 	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
-	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning | pureln (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap; pureln = BOTH legs over Lightning, no on-chain leg / no anchor gate; base is the asset, quote is the BTC sentinel)")
+	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning | pureln | subasset (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap; pureln = BOTH legs over Lightning; subasset = the submarine's MIRROR: asset over Lightning + BTC on-chain HTLC, taker pays BTC on-chain and receives the asset over LN; base is the asset, quote is the BTC sentinel)")
 	// Cross-mode settlement wiring (pkg/xchain, no Ocean needed): the SEQ leg is
 	// funded from the Sequentia NODE wallet and the BTC leg is claimed into the
 	// bitcoind wallet — the same reserves the RFQ maker uses.
@@ -98,13 +98,27 @@ func main() {
 	cross := strings.ToLower(*mode) == "cross"
 	lightning := strings.ToLower(*mode) == "lightning"
 	pureln := strings.ToLower(*mode) == "pureln"
-	if !cross && !lightning && !pureln && *account == "" {
+	subasset := strings.ToLower(*mode) == "subasset"
+	if !cross && !lightning && !pureln && !subasset && *account == "" {
 		fatal("-account is required (the Ocean account holding the offer asset)")
 	}
 
 	makerKey := loadOrGenKey(*makerPriv)
 	makerPubHex := hex.EncodeToString(makerKey.PubKey().SerializeCompressed())
 	ctx := context.Background()
+
+	if subasset {
+		runSubAssetMaker(subAssetMakerConfig{
+			relay: *relay, makerKey: makerKey, makerPubHex: makerPubHex,
+			makerPubKey: makerKey.PubKey().SerializeCompressed(),
+			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
+			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
+			btcRPCURL: *btcRPCURL, btcWallet: *btcWallet, btcChainName: *btcChainName,
+			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
+			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
+		})
+		return
+	}
 
 	if pureln {
 		runPureLNMaker(pureLNMakerConfig{
