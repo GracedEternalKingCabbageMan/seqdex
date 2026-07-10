@@ -222,7 +222,10 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	if p.Ops == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("subasset maker: Ops and Crypter are required")
 	}
-	if p.MinBTCConf <= 0 {
+	// MinBTCConf 0 is honored explicitly (0-conf: the maker fronts the Bitcoin
+	// reorg risk, like the submarine's max-0conf LP-fronting); only a negative
+	// value falls back to the safe 1-conf default.
+	if p.MinBTCConf < 0 {
 		p.MinBTCConf = 1
 	}
 	if p.MinClaimWindow == 0 {
@@ -416,7 +419,10 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	if p.Ops == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("subasset taker: Ops and Crypter are required")
 	}
-	if p.MinBTCConf <= 0 {
+	// MinBTCConf 0 is honored explicitly (0-conf: the maker fronts the Bitcoin
+	// reorg risk, like the submarine's max-0conf LP-fronting); only a negative
+	// value falls back to the safe 1-conf default.
+	if p.MinBTCConf < 0 {
 		p.MinBTCConf = 1
 	}
 	if p.SpendFeeSats == 0 {
@@ -494,7 +500,9 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 			if cerr == nil && confs >= p.MinBTCConf {
 				break
 			}
-			p.logf("subasset taker: conf poll: confs=%d err=%v", confs, cerr)
+			if cerr != nil {
+				p.logf("subasset taker: conf poll error: %v", cerr)
+			}
 			if time.Now().After(confDeadline) {
 				sendXcFail(p.Crypter, send, "btc_conf_timeout", "btc leg did not confirm in time")
 				return res, fmt.Errorf("subasset taker: btc leg %s: no %d-conf within %s (refund after T_btc %d)",
