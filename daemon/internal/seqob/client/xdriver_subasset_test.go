@@ -187,6 +187,21 @@ func (o *fakeSubAsTakerOps) CancelAssetHold(h []byte) error {
 	o.st.canceled = true
 	return nil
 }
+func (o *fakeSubAsTakerOps) WaitAssetPaid(h []byte, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		o.st.mu.Lock()
+		settled := o.st.settled
+		o.st.mu.Unlock()
+		if settled {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errSubAsTimeout
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+}
 func (o *fakeSubAsTakerOps) RefundBTCLeg(leg *xchain.LegLock, refundKey *xchain.Key, nLockTime uint32, fee uint64) (string, error) {
 	o.st.mu.Lock()
 	defer o.st.mu.Unlock()

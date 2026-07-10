@@ -40,6 +40,10 @@ func (f *fakeLNLeg) WaitInvoicePaid(string, time.Duration) (uint64, error) {
 	f.t.Fatal("WaitInvoicePaid unexpected")
 	return 0, nil
 }
+func (f *fakeLNLeg) WaitPaidByHash([]byte, time.Duration) (uint64, error) {
+	f.t.Fatal("WaitPaidByHash unexpected")
+	return 0, nil
+}
 
 var _ LNLeg = (*fakeLNLeg)(nil)
 

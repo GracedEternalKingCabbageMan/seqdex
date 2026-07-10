@@ -88,6 +88,12 @@ type LNLeg interface {
 	// WaitInvoicePaid blocks until the invoice with the given label is paid (or
 	// the deadline / invoice expiry), returning the received amount (msat).
 	WaitInvoicePaid(label string, timeout time.Duration) (paidMsat uint64, err error)
+
+	// WaitPaidByHash blocks until the invoice with the given payment_hash is paid,
+	// polling listinvoices (the invoice may have been created out-of-band, e.g. by
+	// a device with its OWN preimage, so the caller has only the hash, not a label
+	// and NOT the preimage). Returns the received amount (msat).
+	WaitPaidByHash(paymentHash []byte, timeout time.Duration) (paidMsat uint64, err error)
 }
 
 // --- CLN implementation over the lightning-rpc unix socket ------------------
@@ -399,6 +405,41 @@ func (l *clnLNLeg) WaitInvoicePaid(label string, timeout time.Duration) (uint64,
 		return res.AmountReceivedMsat, nil
 	}
 	return res.AmountMsat, nil
+}
+
+// WaitPaidByHash polls listinvoices for an invoice with the given payment_hash
+// until it is "paid" (or the deadline). Unlike WaitInvoicePaid it needs no label
+// and never touches the preimage — used by the sub-asset external-invoice mode,
+// where a DEVICE created the invoice with its own preimage and the driver only
+// learns that the payment arrived (settlement is signaled by "paid", the preimage
+// stays device-held).
+func (l *clnLNLeg) WaitPaidByHash(paymentHash []byte, timeout time.Duration) (uint64, error) {
+	deadline := time.Now().Add(timeout)
+	hashHex := hex.EncodeToString(paymentHash)
+	for {
+		var res struct {
+			Invoices []struct {
+				Status             string `json:"status"`
+				AmountReceivedMsat uint64 `json:"amount_received_msat"`
+				AmountMsat         uint64 `json:"amount_msat"`
+			} `json:"invoices"`
+		}
+		err := l.rpc.call(&res, "listinvoices", map[string]interface{}{"payment_hash": hashHex})
+		if err == nil {
+			for _, inv := range res.Invoices {
+				if inv.Status == "paid" {
+					if inv.AmountReceivedMsat != 0 {
+						return inv.AmountReceivedMsat, nil
+					}
+					return inv.AmountMsat, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w: invoice %s not paid within %s (last err: %v)", ErrLNLegTimeout, hashHex[:12], timeout, err)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // --- minimal CLN lightning-rpc client (unix socket, JSON-RPC 2.0) -----------
