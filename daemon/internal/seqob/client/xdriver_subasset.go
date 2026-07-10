@@ -113,10 +113,24 @@ func (o *LiveSubAssetMakerOps) ClaimBTCLeg(leg *xchain.LegLock, claimKey *xchain
 }
 
 // LiveSubAssetTakerOps binds the taker seam to a real BTC-leg swap + asset LN leg.
+//
+// The asset LN invoice has two equally-atomic modes, selected by Plain:
+//   - HOLD (Plain=false, the directive's shape): a holdinvoice-plugin invoice on
+//     H. The maker's payment is HELD at the taker's node; the taker explicitly
+//     settles with P, releasing it. Needs the holdinvoice plugin on the asset node.
+//   - PLAIN (Plain=true): a bare BOLT11 whose payment_hash = H, preimage = P (the
+//     taker holds P). The maker's payment auto-settles at the taker's node,
+//     revealing P to the maker. Needs no plugin. This is safe here because the
+//     ON-CHAIN BTC HTLC is the hold (hashlock + CLTV): the maker cannot claim the
+//     BTC without P, and P is only revealed by the maker paying (delivering) the
+//     asset. It is exactly how the deployed pure-LN BUY pays the asset leg.
 type LiveSubAssetTakerOps struct {
 	Swap    *xchain.Swap
 	AssetLN xchain.LNLeg
 	BTC     *xchain.BitcoinChain
+	Plain   bool // true = plain BOLT11 (no holdinvoice plugin); false = hold invoice
+
+	label string // the plain invoice's label, for WaitInvoicePaid
 }
 
 func (o *LiveSubAssetTakerOps) BtcTip() (int64, error)                    { return o.BTC.BlockCount() }
@@ -126,21 +140,43 @@ func (o *LiveSubAssetTakerOps) LockBTCLeg(claimPub, refundPub []byte, amountCoin
 }
 func (o *LiveSubAssetTakerOps) PrepareAssetHold(p []byte, amtMsat uint64) (string, []byte, error) {
 	h := sha256.Sum256(p)
-	label := "subas-" + hex.EncodeToString(h[:8])
-	bolt11, err := o.AssetLN.CreateHoldInvoice(h[:], amtMsat, 0, label, "sub-asset swap: taker receives asset over LN")
+	o.label = "subas-" + hex.EncodeToString(h[:8])
+	if o.Plain {
+		// A plain BOLT11 on preimage P (payment_hash = H); it auto-settles when paid.
+		bolt11, err := o.AssetLN.CreateInvoice(p, amtMsat, 0, o.label, "sub-asset swap: taker receives asset over LN")
+		if err != nil {
+			return "", nil, err
+		}
+		return bolt11, h[:], nil
+	}
+	bolt11, err := o.AssetLN.CreateHoldInvoice(h[:], amtMsat, 0, o.label, "sub-asset swap: taker receives asset over LN")
 	if err != nil {
 		return "", nil, err
 	}
 	return bolt11, h[:], nil
 }
 func (o *LiveSubAssetTakerOps) WaitAssetHeld(h []byte, timeout time.Duration) error {
+	if o.Plain {
+		// A plain invoice auto-settles; "held" == "paid" (the asset has arrived and
+		// P is already revealed to the maker). Block until the maker pays it.
+		_, err := o.AssetLN.WaitInvoicePaid(o.label, timeout)
+		return err
+	}
 	_, err := o.AssetLN.WaitHeld(h, timeout)
 	return err
 }
 func (o *LiveSubAssetTakerOps) SettleAssetHold(h, preimage []byte) error {
+	if o.Plain {
+		return nil // already auto-settled by the payment
+	}
 	return o.AssetLN.SettleHold(h, preimage)
 }
-func (o *LiveSubAssetTakerOps) CancelAssetHold(h []byte) error { return o.AssetLN.CancelHold(h) }
+func (o *LiveSubAssetTakerOps) CancelAssetHold(h []byte) error {
+	if o.Plain {
+		return nil // nothing to cancel; an unpaid plain invoice simply expires
+	}
+	return o.AssetLN.CancelHold(h)
+}
 func (o *LiveSubAssetTakerOps) RefundBTCLeg(leg *xchain.LegLock, refundKey *xchain.Key, nLockTime uint32, fee uint64) (string, error) {
 	return o.Swap.RefundBTCLeg(leg, refundKey, nLockTime, fee)
 }
