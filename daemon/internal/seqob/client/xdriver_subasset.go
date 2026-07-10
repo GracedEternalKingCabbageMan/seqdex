@@ -44,11 +44,10 @@ import (
 
 // SubAssetMakerOps is the narrow settlement seam the maker driver runs against.
 // LiveSubAssetMakerOps binds it to a real *xchain.Swap (BTC leg) + asset LNLeg;
-// tests substitute a fake to exercise the handshake without RPC/LN.
+// tests substitute a fake to exercise the handshake without RPC/LN. It is built
+// per-swap by NewMakerOps once the taker's H is known (the BTC-leg hashlock must
+// embed H for VerifyBTCLeg/ClaimBTCLeg).
 type SubAssetMakerOps interface {
-	// AssetLNNodeID returns the maker's asset LN node id (informational; the maker
-	// PAYS the taker's invoice, so the taker never dials the maker).
-	AssetLNNodeID() (string, error)
 	// BtcTip returns the parent (Bitcoin) chain tip height.
 	BtcTip() (int64, error)
 	// VerifyBTCLeg checks the taker's funded BTC HTLC matches the agreed params
@@ -92,13 +91,24 @@ type SubAssetTakerOps interface {
 
 // LiveSubAssetMakerOps binds the maker seam to a real BTC-leg swap + asset LN leg.
 type LiveSubAssetMakerOps struct {
-	Swap    *xchain.Swap    // built with xchain.NewSwapBitcoin (real BitcoinChain BTC leg)
-	AssetLN xchain.LNLeg    // the maker's SeqLN-on-Sequentia asset node (pays the taker's invoice)
+	Swap    *xchain.Swap // built with xchain.NewSwapBitcoin (real BitcoinChain BTC leg)
+	AssetLN xchain.LNLeg // the maker's SeqLN-on-Sequentia asset node (pays the taker's invoice)
 	BTC     *xchain.BitcoinChain
 }
 
 func (o *LiveSubAssetMakerOps) AssetLNNodeID() (string, error) { return o.AssetLN.NodeID() }
 func (o *LiveSubAssetMakerOps) BtcTip() (int64, error)         { return o.BTC.BlockCount() }
+
+// NewLiveSubAssetMakerOps builds the maker's live ops for a swap whose taker H is
+// hashH: the BTC-leg swap embeds hashH so VerifyBTCLeg/ClaimBTCLeg recompute and
+// match it. seq is unused (the asset leg is over LN, not on-chain) and may be nil.
+func NewLiveSubAssetMakerOps(btc *xchain.BitcoinChain, assetLN xchain.LNLeg, hashH []byte) *LiveSubAssetMakerOps {
+	return &LiveSubAssetMakerOps{
+		Swap:    xchain.NewSwapBitcoin(btc, nil, xchain.NewHashLockFromHash(hashH)),
+		AssetLN: assetLN,
+		BTC:     btc,
+	}
+}
 func (o *LiveSubAssetMakerOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, providedScript []byte, btcLocktime uint32,
 	txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error) {
 	// assetID "" = real BTC on the parent chain.
@@ -107,7 +117,9 @@ func (o *LiveSubAssetMakerOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub
 func (o *LiveSubAssetMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64) ([]byte, error) {
 	return o.AssetLN.Pay(bolt11, h, amtMsat)
 }
-func (o *LiveSubAssetMakerOps) InjectSecret(preimage []byte) error { return o.Swap.InjectSecret(preimage) }
+func (o *LiveSubAssetMakerOps) InjectSecret(preimage []byte) error {
+	return o.Swap.InjectSecret(preimage)
+}
 func (o *LiveSubAssetMakerOps) ClaimBTCLeg(leg *xchain.LegLock, claimKey *xchain.Key, fee uint64) (string, error) {
 	return o.Swap.ClaimBTCLeg(leg, claimKey, fee)
 }
@@ -133,8 +145,10 @@ type LiveSubAssetTakerOps struct {
 	label string // the plain invoice's label, for WaitInvoicePaid
 }
 
-func (o *LiveSubAssetTakerOps) BtcTip() (int64, error)                    { return o.BTC.BlockCount() }
-func (o *LiveSubAssetTakerOps) BtcConfirmations(txid string) (int, error) { return o.BTC.Confirmations(txid) }
+func (o *LiveSubAssetTakerOps) BtcTip() (int64, error) { return o.BTC.BlockCount() }
+func (o *LiveSubAssetTakerOps) BtcConfirmations(txid string) (int, error) {
+	return o.BTC.Confirmations(txid)
+}
 func (o *LiveSubAssetTakerOps) LockBTCLeg(claimPub, refundPub []byte, amountCoins string, locktime uint32) (*xchain.LegLock, int64, error) {
 	return o.Swap.LockBTCLeg(claimPub, refundPub, amountCoins, locktime)
 }
@@ -186,25 +200,29 @@ func (o *LiveSubAssetTakerOps) RefundBTCLeg(leg *xchain.LegLock, refundKey *xcha
 // MakerSubAssetParams configures RunMakerSubAsset. Amounts come from the SIGNED
 // offer; the maker mints a fresh BTC claim key per lift and advertises its pubkey.
 type MakerSubAssetParams struct {
-	Ops          SubAssetMakerOps
-	Crypter      *Crypter
-	BtcAmount    uint64        // sats the taker locks on-chain (the maker receives)
-	AssetAmount  uint64        // asset atoms the maker pays over Lightning
-	BtcLocktime  uint32        // T_btc: the CLTV height for the taker's BTC refund branch
-	MinBTCConf   int           // confirmations required on the taker's BTC leg (default 1)
-	MinClaimWindow uint32      // reject if T_btc is within this many blocks of the tip (default 6)
-	SpendFeeSats uint64        // BTC HTLC claim fee target in native sats (default 1000)
-	HoldTimeout  time.Duration // how long to wait for the taker to settle after we pay (default 2m)
-	MakerBtcClaimKey *xchain.Key // the key that claims the BTC HTLC (minted if nil)
-	Timing       XcTiming
-	Log          func(format string, args ...interface{})
+	// NewMakerOps binds the settlement engine (BTC-leg swap + asset LN) to the
+	// taker's H once it arrives — the maker never knows H until the taker announces
+	// its funded BTC HTLC, and the BTC-leg hashlock must embed H.
+	NewMakerOps      func(hashH []byte) SubAssetMakerOps
+	AssetLNNodeID    string // advisory: the maker's asset LN node id, put in Terms
+	Crypter          *Crypter
+	BtcAmount        uint64        // sats the taker locks on-chain (the maker receives)
+	AssetAmount      uint64        // asset atoms the maker pays over Lightning
+	BtcLocktime      uint32        // T_btc: the CLTV height for the taker's BTC refund branch
+	MinBTCConf       int           // confirmations required on the taker's BTC leg (default 1)
+	MinClaimWindow   uint32        // reject if T_btc is within this many blocks of the tip (default 6)
+	SpendFeeSats     uint64        // BTC HTLC claim fee target in native sats (default 1000)
+	HoldTimeout      time.Duration // how long to wait for the taker to settle after we pay (default 2m)
+	MakerBtcClaimKey *xchain.Key   // the key that claims the BTC HTLC (minted if nil)
+	Timing           XcTiming
+	Log              func(format string, args ...interface{})
 }
 
 type MakerSubAssetResult struct {
-	HashH       []byte
-	Preimage    []byte
+	HashH        []byte
+	Preimage     []byte
 	BtcClaimTxid string
-	Settled     bool
+	Settled      bool
 }
 
 func (p *MakerSubAssetParams) logf(f string, a ...interface{}) {
@@ -219,8 +237,8 @@ func (p *MakerSubAssetParams) logf(f string, a ...interface{}) {
 // (blocking until the taker settles -> learn P), and claim the BTC HTLC with P.
 func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*MakerSubAssetResult, error) {
 	p.Timing.setDefaults()
-	if p.Ops == nil || p.Crypter == nil {
-		return nil, fmt.Errorf("subasset maker: Ops and Crypter are required")
+	if p.NewMakerOps == nil || p.Crypter == nil {
+		return nil, fmt.Errorf("subasset maker: NewMakerOps and Crypter are required")
 	}
 	// MinBTCConf 0 is honored explicitly (0-conf: the maker fronts the Bitcoin
 	// reorg risk, like the submarine's max-0conf LP-fronting); only a negative
@@ -248,14 +266,10 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	recv := chanRecv(in)
 	res := &MakerSubAssetResult{}
 
-	// 1. Terms request -> advertise terms.
+	// 1. Terms request -> advertise terms (the asset LN node id is advisory: the
+	//    maker PAYS the taker, so the taker never dials it).
 	if _, err := recvXcType(recv, p.Crypter, XcSubAsTermsRequest, p.Timing.TermsReqWait); err != nil {
 		return res, err
-	}
-	assetNodeID, err := p.Ops.AssetLNNodeID()
-	if err != nil {
-		sendXcFail(p.Crypter, send, "maker_node", err.Error())
-		return res, fmt.Errorf("subasset maker: asset LN node id: %w", err)
 	}
 	if err := sendXc(&XcMsg{
 		Type:             XcSubAsTerms,
@@ -263,7 +277,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		BtcLocktime:      p.BtcLocktime,
 		BtcAmount:        p.BtcAmount,
 		SeqAmount:        p.AssetAmount,
-		MakerLNNodeID:    assetNodeID,
+		MakerLNNodeID:    p.AssetLNNodeID,
 	}, p.Crypter, send); err != nil {
 		return res, err
 	}
@@ -294,13 +308,17 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		return res, fmt.Errorf("subasset maker: bad btc redeem_script hex: %w", err)
 	}
 
+	// Now that the taker's H is known, bind the settlement engine: the BTC-leg
+	// swap embeds H so VerifyBTCLeg/ClaimBTCLeg recompute and match it.
+	ops := p.NewMakerOps(hashH)
+
 	// 3. Verify the on-chain BTC HTLC (H, claim=maker, refund=taker, amount, confs).
 	//    The taker announces the instant ITS node sees MinBTCConf; ours can lag by
 	//    propagation, so poll: only a proven-INVALID leg is terminal.
 	var verified *xchain.VerifiedBTCLeg
 	verifyDeadline := time.Now().Add(p.Timing.SeqLockWait)
 	for {
-		verified, err = p.Ops.VerifyBTCLeg(hashH, claimKey.PubKey(), takerRefundPub, script,
+		verified, err = ops.VerifyBTCLeg(hashH, claimKey.PubKey(), takerRefundPub, script,
 			p.BtcLocktime, funded.Leg.Txid, funded.Leg.Vout, funded.Leg.Amount, p.MinBTCConf)
 		if err == nil {
 			break
@@ -323,7 +341,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	// 4. Claim-window guard: never pay the asset unless T_btc is far enough out to
 	//    still claim the BTC after we learn P. On the anchor chain (Bitcoin) confs
 	//    are final, so a comfortable block margin is the whole safety condition.
-	tip, err := p.Ops.BtcTip()
+	tip, err := ops.BtcTip()
 	if err != nil {
 		sendXcFail(p.Crypter, send, "btc_tip", err.Error())
 		return res, fmt.Errorf("subasset maker: btc tip: %w", err)
@@ -341,7 +359,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	// 5. Pay the taker's asset hold invoice. This BLOCKS until the taker settles it
 	//    with P; on settle we learn P. The payment is a HELD LN HTLC until then, so
 	//    a taker that never settles simply times it out (nothing delivered).
-	preimage, err := p.Ops.PayAssetHold(funded.Bolt11, hashH, p.AssetAmount*1000)
+	preimage, err := ops.PayAssetHold(funded.Bolt11, hashH, p.AssetAmount*1000)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_asset", err.Error())
 		return res, fmt.Errorf("subasset maker: pay asset hold invoice: %w", err)
@@ -355,10 +373,10 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	p.logf("subasset maker: asset paid + settled; learned P; claiming BTC HTLC")
 
 	// 6. Feed P into the BTC-leg hashlock, then claim the on-chain BTC HTLC with it.
-	if err := p.Ops.InjectSecret(preimage); err != nil {
+	if err := ops.InjectSecret(preimage); err != nil {
 		return res, fmt.Errorf("subasset maker: inject secret (RETRYABLE, maker holds P): %w", err)
 	}
-	claimTxid, err := p.Ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
+	claimTxid, err := ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
 	if err != nil {
 		// We hold P; this is retryable out of band (the leg is confirmed and ours
 		// to claim until T_btc). Surface it, but the value is recoverable.

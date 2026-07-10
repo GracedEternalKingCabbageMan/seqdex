@@ -31,26 +31,26 @@ import (
 )
 
 type subAssetMakerConfig struct {
-	relay       string
-	makerKey    *btcec.PrivateKey
-	makerPubHex string
-	makerPubKey []byte // 33-byte compressed (advisory LightningTerms keys)
-	asset       string // the SEQ asset the maker sells (base), and the asset LN leg's id
-	assetAmt    uint64 // asset atoms the maker pays over Lightning
-	btcSats     uint64 // BTC sats the taker locks on-chain (the maker receives)
-	feeAsset    string
-	expiry      time.Duration
-	minAnchor   uint32 // offer.min_anchor_depth (display only; the BTC leg is anchor-final by construction)
-	offerID     string
-	btcRPCURL   string // bitcoind RPC URL (verify + claim the on-chain BTC HTLC)
-	btcWallet   string // bitcoind wallet that receives the claimed BTC
+	relay        string
+	makerKey     *btcec.PrivateKey
+	makerPubHex  string
+	makerPubKey  []byte // 33-byte compressed (advisory LightningTerms keys)
+	asset        string // the SEQ asset the maker sells (base), and the asset LN leg's id
+	assetAmt     uint64 // asset atoms the maker pays over Lightning
+	btcSats      uint64 // BTC sats the taker locks on-chain (the maker receives)
+	feeAsset     string
+	expiry       time.Duration
+	minAnchor    uint32 // offer.min_anchor_depth (display only; the BTC leg is anchor-final by construction)
+	offerID      string
+	btcRPCURL    string // bitcoind RPC URL (verify + claim the on-chain BTC HTLC)
+	btcWallet    string // bitcoind wallet that receives the claimed BTC
 	btcChainName string
-	assetLnSock string // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
-	btcDelta    uint32 // T_btc = parent tip + this (the taker's on-chain refund CLTV)
-	minBTCConf  int    // confirmations required on the taker's BTC leg before paying the asset
-	spendFee    uint64 // BTC HTLC claim fee target (native sats)
-	holdTimeout time.Duration // how long the maker waits for the taker to settle after it pays
-	requote     bool   // true = re-post a fresh offer after each settled fill instead of exiting
+	assetLnSock  string        // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
+	btcDelta     uint32        // T_btc = parent tip + this (the taker's on-chain refund CLTV)
+	minBTCConf   int           // confirmations required on the taker's BTC leg before paying the asset
+	spendFee     uint64        // BTC HTLC claim fee target (native sats)
+	holdTimeout  time.Duration // how long the maker waits for the taker to settle after it pays
+	requote      bool          // true = re-post a fresh offer after each settled fill instead of exiting
 }
 
 // buildSubAssetOffer builds a Lightning offer (base=asset, quote=the BTC sentinel)
@@ -127,14 +127,14 @@ func runSubAssetMaker(cfg subAssetMakerConfig) {
 		cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.btcDelta, cfg.minBTCConf, assetID, cfg.btcChainName)
 	fmt.Printf("  taker lifts with: seqob-cli xsubas -asset %s -offer-id %s -maker-pubkey %s\n", cfg.asset, o.GetOfferId(), cfg.makerPubHex)
 
-	serveSubAsset(ws, wsURL, o, cfg, btcChain)
+	serveSubAsset(ws, wsURL, o, cfg, btcChain, assetID)
 }
 
 // serveSubAsset is the sub-asset event loop: each swap gets its own goroutine
 // running RunMakerSubAsset; the loop routes sealed courier frames to the session's
 // inbox. Same whole-swap discipline as serveSubmarine: ONE swap in flight, and the
 // offer is cancelled after its first settlement (unless -requote).
-func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMakerConfig, btcChain *xchain.BitcoinChain) {
+func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMakerConfig, btcChain *xchain.BitcoinChain, assetLNID string) {
 	var mu sync.Mutex
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
@@ -239,22 +239,21 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					return
 				}
 				tBtc := uint32(tip) + cfg.btcDelta
-				assetLN := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset)
-				makerOps := &client.LiveSubAssetMakerOps{
-					Swap:    xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLockFromHash(nil)),
-					AssetLN: assetLN,
-					BTC:     btcChain,
-				}
 				p := client.MakerSubAssetParams{
-					Ops:         makerOps,
-					Crypter:     cr,
-					BtcAmount:   o.GetWantAmount(),  // BTC sats the taker locks on-chain
-					AssetAmount: o.GetOfferAmount(), // asset atoms the maker pays over LN
-					BtcLocktime: tBtc,
-					MinBTCConf:  cfg.minBTCConf,
-					SpendFeeSats: cfg.spendFee,
-					HoldTimeout: cfg.holdTimeout,
-					Log:         logf,
+					// Bind the BTC-leg swap to the taker's H once it arrives (the hashlock
+					// must embed H for VerifyBTCLeg/ClaimBTCLeg); a fresh asset LN leg per swap.
+					NewMakerOps: func(hashH []byte) client.SubAssetMakerOps {
+						return client.NewLiveSubAssetMakerOps(btcChain, xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset), hashH)
+					},
+					AssetLNNodeID: assetLNID,
+					Crypter:       cr,
+					BtcAmount:     o.GetWantAmount(),  // BTC sats the taker locks on-chain
+					AssetAmount:   o.GetOfferAmount(), // asset atoms the maker pays over LN
+					BtcLocktime:   tBtc,
+					MinBTCConf:    cfg.minBTCConf,
+					SpendFeeSats:  cfg.spendFee,
+					HoldTimeout:   cfg.holdTimeout,
+					Log:           logf,
 				}
 				res, err := client.RunMakerSubAsset(p, in, send)
 				if err != nil {

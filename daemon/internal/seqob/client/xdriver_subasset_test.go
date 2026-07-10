@@ -220,14 +220,15 @@ func TestSubAssetHandshake(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		makerRes, makerErr = RunMakerSubAsset(MakerSubAssetParams{
-			Ops:         &fakeSubAsMakerOps{st: st},
-			Crypter:     mc,
-			BtcAmount:   btcSats,
-			AssetAmount: assetAtoms,
-			BtcLocktime: tBtc,
-			MinBTCConf:  1,
-			HoldTimeout: 3 * time.Second,
-			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+			NewMakerOps:   func(hashH []byte) SubAssetMakerOps { return &fakeSubAsMakerOps{st: st} },
+			AssetLNNodeID: "02fakenode",
+			Crypter:       mc,
+			BtcAmount:     btcSats,
+			AssetAmount:   assetAtoms,
+			BtcLocktime:   tBtc,
+			MinBTCConf:    1,
+			HoldTimeout:   3 * time.Second,
+			Timing:        XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
 		}, net.toMaker, net.makerSend)
 	}()
 
@@ -284,12 +285,13 @@ func TestSubAssetTakerRejectsBadAmount(t *testing.T) {
 
 	go func() {
 		_, _ = RunMakerSubAsset(MakerSubAssetParams{
-			Ops:         &fakeSubAsMakerOps{st: st},
-			Crypter:     mc,
-			BtcAmount:   btcSats + 5000, // != taker's expectation
-			AssetAmount: assetAtoms,
-			BtcLocktime: 200,
-			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 2 * time.Second},
+			NewMakerOps:   func(hashH []byte) SubAssetMakerOps { return &fakeSubAsMakerOps{st: st} },
+			AssetLNNodeID: "02fakenode",
+			Crypter:       mc,
+			BtcAmount:     btcSats + 5000, // != taker's expectation
+			AssetAmount:   assetAtoms,
+			BtcLocktime:   200,
+			Timing:        XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 2 * time.Second},
 		}, net.toMaker, net.makerSend)
 	}()
 
