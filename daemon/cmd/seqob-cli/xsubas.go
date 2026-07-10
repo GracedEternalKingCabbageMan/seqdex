@@ -88,6 +88,7 @@ func cmdXSubAs(args []string) {
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations to wait on our own BTC leg before announcing")
+	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC refund fee target (sats)")
 	stateFile := fs.String("state-file", "xsubas-session.json", "session persistence (refund needs this)")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
@@ -230,10 +231,14 @@ func cmdXSubAs(args []string) {
 		return from.GetSwapMsg().GetCiphertext(), nil
 	}
 
+	if *invoiceMode != "plain" && *invoiceMode != "hold" {
+		fatal("-asset-invoice must be plain or hold")
+	}
 	takerOps := &client.LiveSubAssetTakerOps{
 		Swap:    xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLock(secret)),
 		AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
 		BTC:     btcChain,
+		Plain:   *invoiceMode == "plain",
 	}
 	res, err := client.RunTakerSubAsset(client.TakerSubAssetParams{
 		Ops:          takerOps,
