@@ -67,6 +67,19 @@ func cmdXSubBuy(args []string) {
 	stateFile := fs.String("state-file", "xsubbuy-session.json", "session persistence (holds P after paying)")
 	_ = fs.Parse(args)
 
+	// The anchor gate must wait for the maker's asset-HTLC SEQ block to be buried by
+	// min-anchor-depth BITCOIN blocks. testnet4 blocks are irregular — up to ~20 min apart
+	// under the 20-minute difficulty-reset rule — so a fixed 20 min wait CANNOT cover the
+	// default depth of 3 (you can't bury 3 Bitcoin blocks in 20 min), which deadlocks the
+	// swap: the taker times out ("anchor not buried to depth N") before the gate can open.
+	// Scale the wait to the requested depth (~20 min/block budget), unless the caller asked
+	// for a larger one explicitly. min-anchor-depth 0 (the max-0conf instant path) is exempt.
+	if *minAnchor > 0 {
+		if want := time.Duration(*minAnchor) * 20 * time.Minute; *anchorWait < want {
+			*anchorWait = want
+		}
+	}
+
 	if *asset == "" {
 		fatal("xsubbuy requires -asset (the hex asset id; the pair is <asset>/BTC)")
 	}
