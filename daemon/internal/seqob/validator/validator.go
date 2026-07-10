@@ -262,8 +262,8 @@ func (v *Validator) checkLightning(o *seqobv1.Offer) error {
 			return fmt.Errorf("lightning %s invalid: %v", pk.name, err)
 		}
 	}
-	if lt.GetLnDirection() > 3 {
-		return fmt.Errorf("lightning ln_direction must be 0/1 (submarine: asset<->BTC-LN) or 2/3 (pure-LN: asset-LN<->BTC-LN)")
+	if lt.GetLnDirection() > 4 {
+		return fmt.Errorf("lightning ln_direction must be 0/1 (submarine: asset<->BTC-LN), 2/3 (pure-LN: asset-LN<->BTC-LN), or 4 (sub-asset: asset-LN<->BTC-on-chain)")
 	}
 	if !offer.LnDirectionConsistent(lt.GetLnDirection(), o.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_SELL) {
 		return fmt.Errorf("lightning ln_direction inconsistent with trade_dir")
