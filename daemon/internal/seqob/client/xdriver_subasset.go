@@ -486,6 +486,7 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	}
 
 	// 3. Wait out our own confirmation on a live parent (broadcast-only -> hp==0).
+	p.logf("subasset taker: BTC HTLC broadcast (hp=%d), waiting for %d conf(s)", hp, p.MinBTCConf)
 	if hp <= 0 {
 		confDeadline := time.Now().Add(p.Timing.BtcConfWait)
 		for {
@@ -493,6 +494,7 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 			if cerr == nil && confs >= p.MinBTCConf {
 				break
 			}
+			p.logf("subasset taker: conf poll: confs=%d err=%v", confs, cerr)
 			if time.Now().After(confDeadline) {
 				sendXcFail(p.Crypter, send, "btc_conf_timeout", "btc leg did not confirm in time")
 				return res, fmt.Errorf("subasset taker: btc leg %s: no %d-conf within %s (refund after T_btc %d)",
