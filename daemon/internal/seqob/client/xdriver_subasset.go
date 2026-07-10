@@ -309,6 +309,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 			sendXcFail(p.Crypter, send, "btc_leg_invalid", err.Error())
 			return res, err
 		}
+		p.logf("subasset maker: BTC leg %s not yet verifiable, retrying: %v", funded.Leg.Txid, err)
 		time.Sleep(p.Timing.Poll)
 	}
 	if funded.Leg.Amount != p.BtcAmount {
