@@ -1,0 +1,297 @@
+package main
+
+// subasset.go adds the SUB-ASSET maker mode to seqob-maker: the MIRROR of the
+// submarine mode. Here the asset leg is over LIGHTNING and the BTC leg is an
+// ON-CHAIN HTLC, so a taker pays BTC on-chain and receives the asset over
+// Lightning. It glues two proven primitives:
+//   - the real-bitcoind on-chain BTC HTLC from the CROSS mode (xchain.NewSwapBitcoin:
+//     VerifyBTCLeg / ClaimBTCLeg), and
+//   - the asset Lightning hold invoice from the PURELN mode (an asset LNLeg:
+//     the maker PAYS the taker's hold invoice, learning P).
+//
+// Only the maker-SELL flow is defined (the directive's shape): the maker gives the
+// asset over LN and receives BTC in the taker's on-chain HTLC. It needs a bitcoind
+// (-btc-rpc / -btc-chain, to verify + claim the BTC HTLC) and the maker's
+// SeqLN-on-Sequentia asset lightning-rpc (-asset-ln-socket, to pay the asset). It
+// needs NO Sequentia node RPC and NO BTC-LN socket.
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/thanhpk/randstr"
+
+	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/client"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
+)
+
+type subAssetMakerConfig struct {
+	relay       string
+	makerKey    *btcec.PrivateKey
+	makerPubHex string
+	makerPubKey []byte // 33-byte compressed (advisory LightningTerms keys)
+	asset       string // the SEQ asset the maker sells (base), and the asset LN leg's id
+	assetAmt    uint64 // asset atoms the maker pays over Lightning
+	btcSats     uint64 // BTC sats the taker locks on-chain (the maker receives)
+	feeAsset    string
+	expiry      time.Duration
+	minAnchor   uint32 // offer.min_anchor_depth (display only; the BTC leg is anchor-final by construction)
+	offerID     string
+	btcRPCURL   string // bitcoind RPC URL (verify + claim the on-chain BTC HTLC)
+	btcWallet   string // bitcoind wallet that receives the claimed BTC
+	btcChainName string
+	assetLnSock string // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
+	btcDelta    uint32 // T_btc = parent tip + this (the taker's on-chain refund CLTV)
+	minBTCConf  int    // confirmations required on the taker's BTC leg before paying the asset
+	spendFee    uint64 // BTC HTLC claim fee target (native sats)
+	holdTimeout time.Duration // how long the maker waits for the taker to settle after it pays
+	requote     bool   // true = re-post a fresh offer after each settled fill instead of exiting
+}
+
+// buildSubAssetOffer builds a Lightning offer (base=asset, quote=the BTC sentinel)
+// with ln_direction=LnAssetLNForBTC. The maker SELLS the asset (trade_dir=SELL):
+// it gives the asset over LN and receives BTC in the taker's on-chain HTLC.
+// maker_ln_node_pubkey advertises the maker's asset LN node (informational; the
+// maker PAYS the taker's invoice, so the taker never dials it).
+func buildSubAssetOffer(cfg subAssetMakerConfig, assetLnNodeID string) *seqobv1.Offer {
+	o := &seqobv1.Offer{
+		OfferId:           orDefault(cfg.offerID, randstr.Hex(16)),
+		SchemaVersion:     1,
+		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
+		BaseAmount:        cfg.assetAmt,
+		AllowPartial:      false, // whole-swap lifts, one at a time
+		CreatedAtUnix:     uint64(time.Now().Unix()),
+		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
+		FeeAssetHint:      cfg.feeAsset,
+		MinAnchorDepth:    cfg.minAnchor,
+		MakerLnNodePubkey: assetLnNodeID,
+		TradeDir:          seqobv1.TradeDir_TRADE_DIR_SELL, // the maker gives up the asset
+		Settlement: &seqobv1.Offer_Lightning{Lightning: &seqobv1.LightningTerms{
+			MakerClaimPub:          cfg.makerPubKey,
+			MakerRefundPub:         cfg.makerPubKey,
+			OnchainCltv:            cfg.btcDelta,
+			MakerIssuesHoldInvoice: false, // the TAKER issues the asset hold invoice
+			LnDirection:            offer.LnAssetLNForBTC,
+		}},
+	}
+	o.OfferAsset, o.OfferAmount = cfg.asset, cfg.assetAmt
+	o.WantAsset, o.WantAmount = offer.BTCSentinel, cfg.btcSats
+	return o
+}
+
+// runSubAssetMaker posts a sub-asset offer and serves swaps. It needs no Ocean
+// wallet and no Sequentia node: the asset leg is the maker's SeqLN-on-Sequentia
+// node, and the BTC it receives lands on-chain in the maker's bitcoind wallet.
+func runSubAssetMaker(cfg subAssetMakerConfig) {
+	if cfg.btcRPCURL == "" {
+		fatal("-mode subasset requires -btc-rpc (the bitcoind RPC that verifies + claims the on-chain BTC HTLC)")
+	}
+	if cfg.assetLnSock == "" {
+		fatal("-mode subasset requires -asset-ln-socket (the maker's SeqLN-on-Sequentia lightning-rpc)")
+	}
+	btcRPC, err := rpcFromURL(cfg.btcRPCURL)
+	if err != nil {
+		fatal("-btc-rpc: %v", err)
+	}
+	params, err := xchain.BitcoinChainParams(cfg.btcChainName)
+	if err != nil {
+		fatal("-btc-chain: %v", err)
+	}
+	btcChain := xchain.NewBitcoinChain(btcRPC, cfg.btcWallet, params)
+	if _, err := btcChain.BlockCount(); err != nil {
+		fatal("bitcoind unreachable: %v", err)
+	}
+	// Validate the asset LN node up front and advertise its id in the offer.
+	assetID, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).NodeID()
+	if err != nil {
+		fatal("asset lightning-rpc %s unreachable: %v", cfg.assetLnSock, err)
+	}
+
+	o := buildSubAssetOffer(cfg, assetID)
+	if err := offer.SignOffer(o, cfg.makerKey); err != nil {
+		fatal("sign offer: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(cfg.relay, "http") + "/v1/ws"
+	ws := &crossWS{}
+	if err := ws.redial(wsURL, o); err != nil {
+		fatal("dial ws %s: %v", wsURL, err)
+	}
+	fmt.Printf("seqob-maker up (SUB-ASSET): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+	fmt.Printf("  maker sells %d %s over Lightning for %d BTC sats on-chain (taker pays BTC on-chain, receives the asset over LN)  T_btc=+%d min-btc-conf=%d  asset-node=%s btc-chain=%s\n",
+		cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.btcDelta, cfg.minBTCConf, assetID, cfg.btcChainName)
+	fmt.Printf("  taker lifts with: seqob-cli xsubas -asset %s -offer-id %s -maker-pubkey %s\n", cfg.asset, o.GetOfferId(), cfg.makerPubHex)
+
+	serveSubAsset(ws, wsURL, o, cfg, btcChain)
+}
+
+// serveSubAsset is the sub-asset event loop: each swap gets its own goroutine
+// running RunMakerSubAsset; the loop routes sealed courier frames to the session's
+// inbox. Same whole-swap discipline as serveSubmarine: ONE swap in flight, and the
+// offer is cancelled after its first settlement (unless -requote).
+func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMakerConfig, btcChain *xchain.BitcoinChain) {
+	var mu sync.Mutex
+	inboxes := make(map[string]chan []byte)
+	inFlight := 0
+	filled := false
+
+	refuse := func(sid string, cr *client.Crypter, code, msg string) {
+		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
+		if sealed, err := m.Seal(cr); err == nil {
+			_ = ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
+		}
+	}
+
+	for {
+		conn := ws.current()
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			mu.Lock()
+			done := filled && inFlight == 0
+			resubmit := o
+			if filled {
+				resubmit = nil
+			}
+			mu.Unlock()
+			if done {
+				fmt.Println("offer filled and no swap in flight; exiting (restart to re-quote)")
+				return
+			}
+			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue)\n", err)
+			ws.redialLoop(wsURL, resubmit)
+			continue
+		}
+		var from seqobv1.From
+		if err := jsonUnmarshal.Unmarshal(data, &from); err != nil {
+			continue
+		}
+		switch {
+		case from.GetLiftRequested() != nil:
+			lr := from.GetLiftRequested()
+			sid := lr.GetSessionId()
+			cr, err := client.NewMakerCrypterFromLift(cfg.makerKey, lr.GetTakerSessionPubkey())
+			if err != nil {
+				fmt.Printf("lift %s: crypter error: %v\n", sid, err)
+				continue
+			}
+			mu.Lock()
+			busy, done := inFlight > 0, filled
+			var in chan []byte
+			if !busy && !done {
+				inFlight++
+				in = make(chan []byte, 8)
+				inboxes[sid] = in
+			}
+			mu.Unlock()
+			if done {
+				refuse(sid, cr, "offer_filled", "offer already filled; awaiting re-quote")
+				continue
+			}
+			if busy {
+				refuse(sid, cr, "busy", "another swap is in flight (whole-swap, one at a time)")
+				continue
+			}
+			fmt.Printf("sub-asset swap requested: session %s offer %s\n", sid, lr.GetOfferId())
+
+			send := func(sealed []byte) error {
+				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
+			}
+			logf := func(format string, args ...interface{}) { fmt.Printf("session "+sid+": "+format+"\n", args...) }
+
+			go func(sid string, in chan []byte) {
+				settled := false
+				defer func() {
+					// -requote: re-post a fresh quote while still holding the in-flight
+					// slot. Only the asset-LN leg has channel peers to reconnect (the BTC
+					// leg is on-chain), so reconnect the asset LN node before re-quoting.
+					if settled && cfg.requote {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
+							if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {
+								fmt.Printf("requote: asset-LN peer reconnect: reconnected %d, err: %v\n", n, err)
+							} else if n > 0 {
+								fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
+							}
+						})
+					}
+					mu.Lock()
+					inFlight--
+					delete(inboxes, sid)
+					if settled && !cfg.requote {
+						filled = true
+					}
+					mu.Unlock()
+					if settled && !cfg.requote {
+						cancelOffer(cfg.relay, o, cfg.makerKey)
+					}
+				}()
+
+				// The maker builds the BTC-leg swap with a hash-only lock (it learns P
+				// by paying the asset over LN) and its asset LN node. T_btc is minted
+				// per-swap from the current parent tip.
+				tip, err := btcChain.BlockCount()
+				if err != nil {
+					fmt.Printf("session %s: btc tip: %v\n", sid, err)
+					return
+				}
+				tBtc := uint32(tip) + cfg.btcDelta
+				assetLN := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset)
+				makerOps := &client.LiveSubAssetMakerOps{
+					Swap:    xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLockFromHash(nil)),
+					AssetLN: assetLN,
+					BTC:     btcChain,
+				}
+				p := client.MakerSubAssetParams{
+					Ops:         makerOps,
+					Crypter:     cr,
+					BtcAmount:   o.GetWantAmount(),  // BTC sats the taker locks on-chain
+					AssetAmount: o.GetOfferAmount(), // asset atoms the maker pays over LN
+					BtcLocktime: tBtc,
+					MinBTCConf:  cfg.minBTCConf,
+					SpendFeeSats: cfg.spendFee,
+					HoldTimeout: cfg.holdTimeout,
+					Log:         logf,
+				}
+				res, err := client.RunMakerSubAsset(p, in, send)
+				if err != nil {
+					fmt.Printf("session %s: sub-asset swap ended: %v\n", sid, err)
+					if res != nil && len(res.Preimage) > 0 && res.BtcClaimTxid == "" {
+						fmt.Printf("session %s: (maker holds P; retry ClaimBTCLeg before T_btc=%d)\n", sid, tBtc)
+					}
+					return
+				}
+				settled = res.Settled
+				fmt.Printf("session %s: SUB-ASSET SWAP SETTLED: paid the asset over LN, claimed BTC on-chain in %s\n",
+					sid, res.BtcClaimTxid)
+			}(sid, in)
+
+		case from.GetSwapMsg() != nil:
+			sm := from.GetSwapMsg()
+			mu.Lock()
+			in := inboxes[sm.GetSessionId()]
+			mu.Unlock()
+			if in == nil {
+				fmt.Printf("session %s: swap_msg without a live sub-asset session; ignoring\n", sm.GetSessionId())
+				continue
+			}
+			select {
+			case in <- sm.GetCiphertext():
+			default:
+				fmt.Printf("session %s: inbox full; dropping frame\n", sm.GetSessionId())
+			}
+
+		case from.GetOrderStatus() != nil:
+			st := from.GetOrderStatus()
+			fmt.Printf("order %s status=%s active=%d txid=%s\n",
+				st.GetOfferId(), st.GetStatus(), st.GetActiveAmount(), st.GetSettleTxid())
+
+		case from.GetError() != nil:
+			e := from.GetError()
+			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+		}
+	}
+}

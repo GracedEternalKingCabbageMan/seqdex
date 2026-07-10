@@ -58,6 +58,10 @@ func main() {
 		cmdXSubBuy(os.Args[2:])
 	case "xpln":
 		cmdXPln(os.Args[2:])
+	case "xsubas":
+		cmdXSubAs(os.Args[2:])
+	case "xsubas-refund":
+		cmdXSubAsRefund(os.Args[2:])
 	default:
 		usage()
 	}
@@ -81,7 +85,10 @@ commands:
   xsubbuy   buy the asset with BTC over LIGHTNING (reverse submarine): anchor-gate + pay the maker's invoice, claim the asset
           (flags: -relay -asset -offer-id -maker-pubkey -seq-rpc -seq-wallet -ln-socket -min-anchor-depth -state-file)
   xpln    trade the asset against BTC with BOTH legs over LIGHTNING (pure-LN, no on-chain leg / no anchor wait)
-          (flags: -relay -side buy|sell -asset -offer-id -maker-pubkey -asset-ln-socket -ln-socket -final-cltv -terms-wait -hold-wait)`)
+          (flags: -relay -side buy|sell -asset -offer-id -maker-pubkey -asset-ln-socket -ln-socket -final-cltv -terms-wait -hold-wait)
+  xsubas  buy the asset by paying BTC ON-CHAIN and receiving the asset OVER LIGHTNING (submarine's mirror)
+          (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -asset-ln-socket -min-btc-conf -state-file -refund-wait)
+  xsubas-refund  recover the BTC HTLC of an aborted xsubas after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)`)
 	os.Exit(2)
 }
 
