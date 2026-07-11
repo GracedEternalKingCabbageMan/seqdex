@@ -68,6 +68,8 @@ func main() {
 		cmdXSubAsSell(os.Args[2:])
 	case "xsubas-claim-btc":
 		cmdXSubAsClaimBTC(os.Args[2:])
+	case "keygen":
+		cmdKeygen(os.Args[2:])
 	default:
 		usage()
 	}
