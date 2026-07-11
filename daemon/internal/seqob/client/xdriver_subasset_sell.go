@@ -168,7 +168,7 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 	if p.NewMakerOps == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("subasset-sell maker: NewMakerOps and Crypter are required")
 	}
-	if p.MinBTCConf <= 0 {
+	if p.MinBTCConf < 0 { // honor explicit 0-conf (LP fronts reorg risk)
 		p.MinBTCConf = 1
 	}
 	if p.SpendFeeSats == 0 {
@@ -322,7 +322,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if p.NewTakerOps == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("subasset-sell taker: NewTakerOps and Crypter are required")
 	}
-	if p.MinBTCConf <= 0 {
+	if p.MinBTCConf < 0 { // honor explicit 0-conf
 		p.MinBTCConf = 1
 	}
 	if p.MinClaimWindow == 0 {
