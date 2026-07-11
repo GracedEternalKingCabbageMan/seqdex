@@ -221,6 +221,7 @@ type MakerSubAssetParams struct {
 	BtcLocktime      uint32        // T_btc: the CLTV height for the taker's BTC refund branch
 	MinBTCConf       int           // confirmations required on the taker's BTC leg (default 1)
 	MinClaimWindow   uint32        // reject if T_btc is within this many blocks of the tip (default 6)
+	MaxClaimWindow   uint32        // reject if T_btc is more than this many blocks past the tip (0 = no bound)
 	SpendFeeSats     uint64        // BTC HTLC claim fee target in native sats (default 1000)
 	HoldTimeout      time.Duration // how long to wait for the taker to settle after we pay (default 2m)
 	MakerBtcClaimKey *xchain.Key   // the key that claims the BTC HTLC (minted if nil)
@@ -322,6 +323,13 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	// swap embeds H so VerifyBTCLeg/ClaimBTCLeg recompute and match it.
 	ops := p.NewMakerOps(hashH)
 
+	// The T_btc verified is the one ENCODED IN THE TAKER'S HTLC (funded.Leg.Locktime),
+	// not the maker's advertised value: with an externally-funded HTLC the wallet picks
+	// T_btc (from the offer's advisory OnchainCltv + the live tip), so the maker accepts
+	// the taker's choice within a sanity window (checked in step 4). For the self-funded
+	// taker this equals the maker's advertised BtcLocktime, so nothing changes.
+	tBtc := funded.Leg.Locktime
+
 	// 3. Verify the on-chain BTC HTLC (H, claim=maker, refund=taker, amount, confs).
 	//    The taker announces the instant ITS node sees MinBTCConf; ours can lag by
 	//    propagation, so poll: only a proven-INVALID leg is terminal.
@@ -329,7 +337,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	verifyDeadline := time.Now().Add(p.Timing.SeqLockWait)
 	for {
 		verified, err = ops.VerifyBTCLeg(hashH, claimKey.PubKey(), takerRefundPub, script,
-			p.BtcLocktime, funded.Leg.Txid, funded.Leg.Vout, funded.Leg.Amount, p.MinBTCConf)
+			tBtc, funded.Leg.Txid, funded.Leg.Vout, funded.Leg.Amount, p.MinBTCConf)
 		if err == nil {
 			break
 		}
@@ -356,11 +364,17 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		sendXcFail(p.Crypter, send, "btc_tip", err.Error())
 		return res, fmt.Errorf("subasset maker: btc tip: %w", err)
 	}
-	if p.BtcLocktime <= uint32(tip) || p.BtcLocktime-uint32(tip) < p.MinClaimWindow {
+	if tBtc <= uint32(tip) || tBtc-uint32(tip) < p.MinClaimWindow {
 		sendXcFail(p.Crypter, send, "claim_window", "T_btc too close to tip to safely claim")
-		return res, fmt.Errorf("subasset maker: T_btc %d within %d of tip %d; not paying", p.BtcLocktime, p.MinClaimWindow, tip)
+		return res, fmt.Errorf("subasset maker: T_btc %d within %d of tip %d; not paying", tBtc, p.MinClaimWindow, tip)
 	}
-	p.logf("subasset maker: BTC HTLC %s verified (%d sats, T_btc=%d, tip=%d); paying asset over LN", funded.Leg.Txid, p.BtcAmount, p.BtcLocktime, tip)
+	// Upper bound: refuse an absurdly far T_btc (the maker's BTC would be locked too
+	// long against a Bitcoin reorg / griefing). 0 = no upper bound.
+	if p.MaxClaimWindow > 0 && tBtc-uint32(tip) > p.MaxClaimWindow {
+		sendXcFail(p.Crypter, send, "claim_window", "T_btc too far in the future")
+		return res, fmt.Errorf("subasset maker: T_btc %d exceeds tip %d + max %d; not paying", tBtc, tip, p.MaxClaimWindow)
+	}
+	p.logf("subasset maker: BTC HTLC %s verified (%d sats, T_btc=%d, tip=%d); paying asset over LN", funded.Leg.Txid, p.BtcAmount, tBtc, tip)
 
 	if err := sendXc(&XcMsg{Type: XcSubAsBtcVerified, HashH: funded.HashH}, p.Crypter, send); err != nil {
 		return res, err
@@ -420,6 +434,13 @@ type TakerSubAssetParams struct {
 	// preimage stays device-held; this taker never learns it. Non-custodial receive.
 	ExternalHashH  []byte // the device invoice's payment_hash H (H = SHA256(device P))
 	ExternalBolt11 string // the device-created asset invoice on H (the maker pays this)
+	// EXTERNAL BTC HTLC mode: the wallet/device funded + signed + broadcast the BTC HTLC
+	// from the USER's OWN BTC (device-signed), so this taker does NOT fund it (the LSP
+	// never fronts the BTC). It only relays the pre-funded leg to the maker. The user
+	// holds the refund key (device); this taker only carries the refund PUBKEY for the
+	// announcement and never refunds — the wallet reclaims the HTLC at CLTV.
+	ExternalBtcLeg       *xchain.LegLock // the user's pre-funded HTLC (Script + Funded{TxID,Vout,Amount} + Locktime)
+	ExternalBtcRefundPub []byte          // the user's BTC refund pubkey (encoded in the HTLC script)
 	// OnBtcLegFunded fires once the BTC HTLC is broadcast (before its confirmation
 	// wait), so a CLI can persist the refund material (leg + T_btc) to disk before
 	// anything downstream can fail. The result already carries BtcLeg/BtcLocktime.
@@ -533,38 +554,54 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 		hashH = hashArr[:]
 	}
 	res.HashH = hashH
-	p.logf("subasset taker: locking BTC HTLC: %d sats, T_btc=%d", p.BtcAmount, terms.BtcLocktime)
-	btcLeg, hp, err := p.Ops.LockBTCLeg(makerClaimPub, refundKey.PubKey(), atomsToCoins(p.BtcAmount), terms.BtcLocktime)
-	if err != nil {
-		sendXcFail(p.Crypter, send, "btc_lock_failed", err.Error())
-		return res, fmt.Errorf("subasset taker: lock BTC leg: %w", err)
-	}
-	res.BtcLeg = btcLeg
-	if p.OnBtcLegFunded != nil {
-		p.OnBtcLegFunded(res)
-	}
-
-	// 3. Wait out our own confirmation on a live parent (broadcast-only -> hp==0).
-	p.logf("subasset taker: BTC HTLC broadcast (hp=%d), waiting for %d conf(s)", hp, p.MinBTCConf)
-	if hp <= 0 {
-		confDeadline := time.Now().Add(p.Timing.BtcConfWait)
-		for {
-			confs, cerr := p.Ops.BtcConfirmations(btcLeg.Funded.TxID)
-			if cerr == nil && confs >= p.MinBTCConf {
-				break
-			}
-			if cerr != nil {
-				p.logf("subasset taker: conf poll error: %v", cerr)
-			}
-			if time.Now().After(confDeadline) {
-				sendXcFail(p.Crypter, send, "btc_conf_timeout", "btc leg did not confirm in time")
-				return res, fmt.Errorf("subasset taker: btc leg %s: no %d-conf within %s (refund after T_btc %d)",
-					btcLeg.Funded.TxID, p.MinBTCConf, p.Timing.BtcConfWait, terms.BtcLocktime)
-			}
-			time.Sleep(p.Timing.Poll)
+	// EXTERNAL BTC: the wallet already funded + broadcast the HTLC from the USER's own
+	// BTC; we relay it (the LSP fronts nothing). Else we fund it ourselves.
+	externalBtc := p.ExternalBtcLeg != nil
+	var btcLeg *xchain.LegLock
+	var announceRefundPub []byte
+	if externalBtc {
+		btcLeg = p.ExternalBtcLeg
+		announceRefundPub = p.ExternalBtcRefundPub
+		res.BtcLeg = btcLeg
+		res.BtcLocktime = btcLeg.Locktime
+		p.logf("subasset taker: relaying user-funded BTC HTLC %s (T_btc=%d); the LSP funds nothing", btcLeg.Funded.TxID, btcLeg.Locktime)
+		// The maker verifies confirmations on-chain; this taker does not hold the tx in
+		// its own wallet, so it does not poll BtcConfirmations.
+	} else {
+		p.logf("subasset taker: locking BTC HTLC: %d sats, T_btc=%d", p.BtcAmount, terms.BtcLocktime)
+		var hp int64
+		btcLeg, hp, err = p.Ops.LockBTCLeg(makerClaimPub, refundKey.PubKey(), atomsToCoins(p.BtcAmount), terms.BtcLocktime)
+		if err != nil {
+			sendXcFail(p.Crypter, send, "btc_lock_failed", err.Error())
+			return res, fmt.Errorf("subasset taker: lock BTC leg: %w", err)
 		}
+		announceRefundPub = refundKey.PubKey()
+		res.BtcLeg = btcLeg
+		if p.OnBtcLegFunded != nil {
+			p.OnBtcLegFunded(res)
+		}
+		// 3. Wait out our own confirmation on a live parent (broadcast-only -> hp==0).
+		p.logf("subasset taker: BTC HTLC broadcast (hp=%d), waiting for %d conf(s)", hp, p.MinBTCConf)
+		if hp <= 0 {
+			confDeadline := time.Now().Add(p.Timing.BtcConfWait)
+			for {
+				confs, cerr := p.Ops.BtcConfirmations(btcLeg.Funded.TxID)
+				if cerr == nil && confs >= p.MinBTCConf {
+					break
+				}
+				if cerr != nil {
+					p.logf("subasset taker: conf poll error: %v", cerr)
+				}
+				if time.Now().After(confDeadline) {
+					sendXcFail(p.Crypter, send, "btc_conf_timeout", "btc leg did not confirm in time")
+					return res, fmt.Errorf("subasset taker: btc leg %s: no %d-conf within %s (refund after T_btc %d)",
+						btcLeg.Funded.TxID, p.MinBTCConf, p.Timing.BtcConfWait, terms.BtcLocktime)
+				}
+				time.Sleep(p.Timing.Poll)
+			}
+		}
+		p.logf("subasset taker: BTC HTLC %s confirmed", btcLeg.Funded.TxID)
 	}
-	p.logf("subasset taker: BTC HTLC %s confirmed", btcLeg.Funded.TxID)
 
 	// 4. The asset invoice on H. External mode: the DEVICE already created it (we
 	//    only forward its bolt11; we never mint P). Self-driven: we create it.
@@ -583,18 +620,19 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 		}
 	}
 
-	// 5. Announce the funded leg + invoice.
+	// 5. Announce the funded leg + invoice. The refund pubkey + T_btc are the ones
+	//    actually embedded in the HTLC (the user's, in external-BTC mode).
 	if err := sendXc(&XcMsg{
 		Type:              XcSubAsBtcFunded,
 		HashH:             hex.EncodeToString(hashH),
-		TakerBtcRefundPub: hex.EncodeToString(refundKey.PubKey()),
+		TakerBtcRefundPub: hex.EncodeToString(announceRefundPub),
 		Bolt11:            invoice,
 		Leg: &XcLeg{
 			Txid:         btcLeg.Funded.TxID,
 			Vout:         btcLeg.Funded.Vout,
 			Amount:       btcLeg.Funded.Amount,
 			RedeemScript: hex.EncodeToString(btcLeg.Script),
-			Locktime:     terms.BtcLocktime,
+			Locktime:     btcLeg.Locktime,
 		},
 	}, p.Crypter, send); err != nil {
 		return res, err

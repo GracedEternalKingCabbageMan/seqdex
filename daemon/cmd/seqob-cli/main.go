@@ -62,6 +62,8 @@ func main() {
 		cmdXSubAs(os.Args[2:])
 	case "xsubas-refund":
 		cmdXSubAsRefund(os.Args[2:])
+	case "xsubas-fund-btc":
+		cmdXSubAsFundBtc(os.Args[2:])
 	default:
 		usage()
 	}

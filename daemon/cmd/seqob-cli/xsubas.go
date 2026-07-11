@@ -91,6 +91,15 @@ func cmdXSubAs(args []string) {
 	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
 	extBolt11 := fs.String("asset-bolt11", "", "DEVICE-PREIMAGE mode: an asset invoice created OUT-OF-BAND by the device (the wallet) on its own hosted node with the device's OWN preimage. When set (with -payment-hash), this taker NEVER mints/settles the preimage: it funds the BTC HTLC on H, forwards this bolt11 to the maker, and waits for it to be PAID (the device settles). Non-custodial receive.")
 	extHashHex := fs.String("payment-hash", "", "DEVICE-PREIMAGE mode: the payment_hash H (hex) of -asset-bolt11 (H = SHA256(device preimage)).")
+	// EXTERNAL BTC HTLC: the wallet already funded the HTLC from the USER's own BTC
+	// (xsubas-fund-btc / btc.js). This taker relays it; the LSP funds NOTHING. -btc-rpc
+	// is still read (for the tip sanity check) but no -btc-wallet is used.
+	extBtcTxid := fs.String("btc-htlc-txid", "", "EXTERNAL BTC: the txid of the user-funded HTLC (from xsubas-fund-btc). Enables relay-only mode.")
+	extBtcVout := fs.Uint("btc-htlc-vout", 0, "EXTERNAL BTC: the HTLC output vout")
+	extBtcAmount := fs.Uint64("btc-htlc-amount", 0, "EXTERNAL BTC: the HTLC output amount (sats)")
+	extBtcScript := fs.String("btc-htlc-script", "", "EXTERNAL BTC: the HTLC redeem script (hex)")
+	extBtcLocktime := fs.Uint("btc-locktime", 0, "EXTERNAL BTC: T_btc encoded in the HTLC (the user refund CLTV)")
+	extBtcRefundPub := fs.String("btc-refund-pub", "", "EXTERNAL BTC: the user's device refund pubkey (hex) embedded in the HTLC")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC refund fee target (sats)")
 	stateFile := fs.String("state-file", "xsubas-session.json", "session persistence (refund needs this)")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
@@ -115,6 +124,28 @@ func cmdXSubAs(args []string) {
 		extHashH, derr = hex.DecodeString(*extHashHex)
 		if derr != nil || len(extHashH) != 32 {
 			fatal("-asset-bolt11 requires -payment-hash <32-byte hex H>")
+		}
+	}
+	// EXTERNAL BTC HTLC mode: the wallet funded the HTLC from the USER's own BTC; we
+	// relay it. Build the leg from the flags + the refund pubkey.
+	var extBtcLeg *xchain.LegLock
+	var extBtcRefundPubB []byte
+	if *extBtcTxid != "" {
+		script, serr := hex.DecodeString(*extBtcScript)
+		if serr != nil || len(script) == 0 {
+			fatal("-btc-htlc-txid requires -btc-htlc-script <hex>")
+		}
+		if *extBtcAmount == 0 || *extBtcLocktime == 0 {
+			fatal("-btc-htlc-txid requires -btc-htlc-amount and -btc-locktime")
+		}
+		extBtcRefundPubB, serr = hex.DecodeString(*extBtcRefundPub)
+		if serr != nil || len(extBtcRefundPubB) == 0 {
+			fatal("-btc-htlc-txid requires -btc-refund-pub <hex>")
+		}
+		extBtcLeg = &xchain.LegLock{
+			Script:   script,
+			Funded:   &xchain.FundedHTLC{TxID: *extBtcTxid, Vout: uint32(*extBtcVout), Amount: *extBtcAmount},
+			Locktime: uint32(*extBtcLocktime),
 		}
 	}
 
@@ -265,16 +296,18 @@ func cmdXSubAs(args []string) {
 		Plain:   *invoiceMode == "plain",
 	}
 	res, err := client.RunTakerSubAsset(client.TakerSubAssetParams{
-		Ops:            takerOps,
-		Crypter:        crypter,
-		BtcAmount:      btcSats,
-		AssetAmount:    assetAtoms,
-		MinBTCConf:     *minBTCConf,
-		SpendFeeSats:   *spendFee,
-		BtcRefundKey:   btcRefundKey,
-		Preimage:       secret,
-		ExternalHashH:  extHashH,
-		ExternalBolt11: *extBolt11,
+		Ops:                  takerOps,
+		Crypter:              crypter,
+		BtcAmount:            btcSats,
+		AssetAmount:          assetAtoms,
+		MinBTCConf:           *minBTCConf,
+		SpendFeeSats:         *spendFee,
+		BtcRefundKey:         btcRefundKey,
+		Preimage:             secret,
+		ExternalHashH:        extHashH,
+		ExternalBolt11:       *extBolt11,
+		ExternalBtcLeg:       extBtcLeg,
+		ExternalBtcRefundPub: extBtcRefundPubB,
 		OnBtcLegFunded: func(r *client.TakerSubAssetResult) {
 			if r.BtcLeg != nil {
 				st.BtcLegTxid = r.BtcLeg.Funded.TxID
