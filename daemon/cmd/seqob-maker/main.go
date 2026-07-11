@@ -99,13 +99,27 @@ func main() {
 	lightning := strings.ToLower(*mode) == "lightning"
 	pureln := strings.ToLower(*mode) == "pureln"
 	subasset := strings.ToLower(*mode) == "subasset"
-	if !cross && !lightning && !pureln && !subasset && *account == "" {
+	subassetSell := strings.ToLower(*mode) == "subasset-sell"
+	if !cross && !lightning && !pureln && !subasset && !subassetSell && *account == "" {
 		fatal("-account is required (the Ocean account holding the offer asset)")
 	}
 
 	makerKey := loadOrGenKey(*makerPriv)
 	makerPubHex := hex.EncodeToString(makerKey.PubKey().SerializeCompressed())
 	ctx := context.Background()
+
+	if subassetSell {
+		runSubAssetSellMaker(subAssetSellMakerConfig{
+			relay: *relay, makerKey: makerKey, makerPubHex: makerPubHex,
+			makerPubKey: makerKey.PubKey().SerializeCompressed(),
+			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
+			feeAsset: *feeAsset, expiry: *expiry, offerID: *offerID,
+			btcRPCURL: *btcRPCURL, btcWallet: *btcWallet, btcChainName: *btcChainName,
+			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
+			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
+		})
+		return
+	}
 
 	if subasset {
 		runSubAssetMaker(subAssetMakerConfig{
