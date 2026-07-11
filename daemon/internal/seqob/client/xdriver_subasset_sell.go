@@ -309,8 +309,13 @@ type TakerSubAssetSellParams struct {
 	MinClaimWindow uint32      // require T_btc at least this many blocks past tip before paying (default 6)
 	SpendFeeSats   uint64      // BTC claim fee target (native sats; default 1000)
 	BtcClaimKey    *xchain.Key // claims the BTC HTLC with P (device-keyed; minted if nil)
-	Timing         XcTiming
-	Log            func(format string, args ...interface{})
+	// ExternalClaimPub is the wallet's device BTC-claim pubkey. When set, the driver runs
+	// LSP-side: it offers this pubkey in the courier, verifies the HTLC claim branch = it,
+	// pays the asset over LN, and RETURNS P + the HTLC terms WITHOUT claiming on-chain — the
+	// wallet holds the matching privkey and claims itself. Keeps the LSP non-custodial.
+	ExternalClaimPub []byte
+	Timing           XcTiming
+	Log              func(format string, args ...interface{})
 }
 
 type TakerSubAssetSellResult struct {
@@ -318,6 +323,17 @@ type TakerSubAssetSellResult struct {
 	Preimage     []byte
 	BtcClaimTxid string
 	Received     bool
+	// Terms echoed for the wallet to claim the BTC HTLC itself (device-claim mode). When
+	// ExternalClaimPub was set, Preimage + these fields are returned and Received stays false
+	// (the wallet claims on-chain with its device key); otherwise they are populated too but
+	// the driver has already claimed (BtcClaimTxid set, Received true).
+	MakerLNNodeID  string
+	MakerRefundPub []byte
+	TakerClaimPub  []byte
+	BtcTxid        string
+	BtcVout        uint32
+	BtcRedeemHex   string
+	BtcLocktime    uint32
 }
 
 func (p *TakerSubAssetSellParams) logf(f string, a ...interface{}) {
@@ -344,17 +360,26 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
 	}
+	// Device-claim (LSP-side) mode: the wallet supplies its claim PUBKEY; we never hold the
+	// privkey, so we cannot (and must not) claim the BTC — we return P + terms for the wallet.
+	deviceClaim := len(p.ExternalClaimPub) > 0
+	var claimPub []byte
 	claimKey := p.BtcClaimKey
-	if claimKey == nil {
-		var err error
-		if claimKey, err = xchain.NewKey(); err != nil {
-			return nil, fmt.Errorf("subasset-sell taker: mint claim key: %w", err)
+	if deviceClaim {
+		claimPub = p.ExternalClaimPub
+	} else {
+		if claimKey == nil {
+			var err error
+			if claimKey, err = xchain.NewKey(); err != nil {
+				return nil, fmt.Errorf("subasset-sell taker: mint claim key: %w", err)
+			}
 		}
+		claimPub = claimKey.PubKey()
 	}
-	res := &TakerSubAssetSellResult{}
+	res := &TakerSubAssetSellResult{TakerClaimPub: claimPub}
 
 	// 1. Request terms, offering our BTC claim pubkey (the HTLC claim branch = us).
-	if err := sendXc(&XcMsg{Type: XcSubAsSellTermsRequest, TakerBtcClaimPub: hex.EncodeToString(claimKey.PubKey())}, p.Crypter, send); err != nil {
+	if err := sendXc(&XcMsg{Type: XcSubAsSellTermsRequest, TakerBtcClaimPub: hex.EncodeToString(claimPub)}, p.Crypter, send); err != nil {
 		return res, err
 	}
 	terms, err := recvXcType(recv, p.Crypter, XcSubAsSellTerms, p.Timing.BtcFundWait)
@@ -370,6 +395,8 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if err != nil || len(makerRefundPub) == 0 {
 		return res, fmt.Errorf("%w: malformed maker_refund_pub", ErrXcBadTerms)
 	}
+	res.MakerRefundPub = makerRefundPub
+	res.MakerLNNodeID = terms.MakerLNNodeID
 	if terms.Leg == nil || terms.MakerLNNodeID == "" {
 		return res, fmt.Errorf("%w: terms missing BTC leg or maker asset node id", ErrXcBadTerms)
 	}
@@ -384,6 +411,10 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 		return res, fmt.Errorf("subasset-sell taker: bad redeem script: %w", err)
 	}
 	tBtc := terms.Leg.Locktime
+	res.BtcTxid = terms.Leg.Txid
+	res.BtcVout = terms.Leg.Vout
+	res.BtcRedeemHex = terms.Leg.RedeemScript
+	res.BtcLocktime = tBtc
 
 	// Bind the settlement engine to the maker's H (VerifyBTCLeg/ClaimBTCLeg recompute
 	// against it; PayAsset learns P by paying the invoice on H).
@@ -394,7 +425,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	var verified *xchain.VerifiedBTCLeg
 	verifyDeadline := time.Now().Add(p.Timing.SeqLockWait)
 	for {
-		verified, err = ops.VerifyBTCLeg(hashH, claimKey.PubKey(), makerRefundPub, script,
+		verified, err = ops.VerifyBTCLeg(hashH, claimPub, makerRefundPub, script,
 			tBtc, terms.Leg.Txid, terms.Leg.Vout, terms.Leg.Amount, p.MinBTCConf)
 		if err == nil {
 			break
@@ -428,6 +459,13 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 		return res, fmt.Errorf("subasset-sell taker: settled preimage does not hash to H")
 	}
 	res.Preimage = preimage
+
+	// Device-claim (LSP-side) mode: we hold no claim privkey. Return P + the HTLC terms so
+	// the wallet claims the BTC on-chain itself with its device key. The LSP stays custody-free.
+	if deviceClaim {
+		p.logf("subasset-sell taker: paid the asset + learned P; returning P+terms for the wallet to claim (LSP does not claim)")
+		return res, nil
+	}
 	p.logf("subasset-sell taker: paid the asset + learned P; claiming the BTC HTLC on-chain")
 
 	// 4. Claim the maker's BTC HTLC with P (device-signed).

@@ -36,12 +36,17 @@ func cmdXSubAsSell(args []string) {
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations required on the maker's BTC HTLC before paying the asset")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC claim fee target (sats)")
 	claimPrivHex := fs.String("btc-claim-priv", "", "device BTC claim privkey (32-byte hex); generated if empty (the key that claims the BTC — never given to the LSP)")
+	claimPubHex := fs.String("btc-claim-pub", "", "device BTC claim PUBKEY (33-byte hex). LSP-side/device-claim mode: drive the courier + pay the asset, then return P + the HTLC terms WITHOUT claiming — the wallet holds the matching privkey and claims itself. Mutually exclusive with -btc-claim-priv.")
+	jsonOut := fs.Bool("json", false, "emit one JSON line {settled,preimage,hash_h,maker_ln_node_id,btc_htlc{...}} for programmatic (LSP) callers")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	payWait := fs.Duration("pay-wait", 15*time.Minute, "max wait for the asset LN payment to settle")
 	_ = fs.Parse(args)
 
 	if *asset == "" || *btcRPCURL == "" || *assetLnSocket == "" {
 		fatal("xsubas-sell requires -asset, -btc-rpc, -asset-ln-socket")
+	}
+	if *claimPubHex != "" && *claimPrivHex != "" {
+		fatal("-btc-claim-pub (device-claim mode) and -btc-claim-priv are mutually exclusive")
 	}
 
 	// 1. Find + verify a matching sub-asset-SELL offer (maker BUYS: LnBTCForAssetLN).
@@ -88,9 +93,17 @@ func cmdXSubAsSell(args []string) {
 	if _, err := xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset).NodeID(); err != nil {
 		fatal("asset lightning-rpc %s unreachable: %v", *assetLnSocket, err)
 	}
-	// The device BTC claim key (kept device-side; never handed to the LSP).
+	// The device BTC claim key. In device-claim (LSP-side) mode only the PUBKEY is provided:
+	// the driver returns P + the HTLC terms and the wallet claims with its own privkey.
 	var claimKey *xchain.Key
-	if *claimPrivHex != "" {
+	var externalClaimPub []byte
+	if *claimPubHex != "" {
+		pb, derr := hex.DecodeString(*claimPubHex)
+		if derr != nil || len(pb) != 33 {
+			fatal("-btc-claim-pub must be 33-byte compressed pubkey hex")
+		}
+		externalClaimPub = pb
+	} else if *claimPrivHex != "" {
 		kb, derr := hex.DecodeString(*claimPrivHex)
 		if derr != nil || len(kb) != 32 {
 			fatal("-btc-claim-priv must be 32-byte hex")
@@ -159,19 +172,37 @@ func cmdXSubAsSell(args []string) {
 				BTC:     btcChain,
 			}
 		},
-		Crypter:      crypter,
-		BtcAmount:    btcSats,
-		AssetAmount:  assetAtoms,
-		MinBTCConf:   *minBTCConf,
-		SpendFeeSats: *spendFee,
-		BtcClaimKey:  claimKey,
-		Timing:       client.XcTiming{TermsWait: *termsWait, BtcFundWait: *termsWait, SeqLockWait: *payWait},
-		Log:          func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
+		Crypter:          crypter,
+		BtcAmount:        btcSats,
+		AssetAmount:      assetAtoms,
+		MinBTCConf:       *minBTCConf,
+		SpendFeeSats:     *spendFee,
+		BtcClaimKey:      claimKey,
+		ExternalClaimPub: externalClaimPub,
+		Timing:           client.XcTiming{TermsWait: *termsWait, BtcFundWait: *termsWait, SeqLockWait: *payWait},
+		Log:              func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
 	}, send, recv)
 	if err != nil {
-		fmt.Printf("sub-asset-SELL swap ended: %v\n", err)
+		if *jsonOut {
+			fmt.Printf(`{"settled":false,"error":%q}`+"\n", err.Error())
+		} else {
+			fmt.Printf("sub-asset-SELL swap ended: %v\n", err)
+		}
 		return
 	}
-	fmt.Printf("SUB-ASSET SELL SWAP SETTLED: paid %d %s over Lightning, received %d BTC sats on-chain in %s; preimage %s\n",
-		assetAtoms, *asset, btcSats, res.BtcClaimTxid, hex.EncodeToString(res.Preimage))
+	if *jsonOut {
+		// Device-claim mode: emit P + the HTLC terms for the wallet to claim on-chain itself.
+		fmt.Printf(`{"settled":true,"preimage":%q,"hash_h":%q,"maker_ln_node_id":%q,"btc_htlc":{"txid":%q,"vout":%d,"amount":%d,"redeem_script":%q,"t_btc":%d,"taker_claim_pubkey":%q,"maker_refund_pubkey":%q},"btc_claim_txid":%q}`+"\n",
+			hex.EncodeToString(res.Preimage), hex.EncodeToString(res.HashH), res.MakerLNNodeID,
+			res.BtcTxid, res.BtcVout, btcSats, res.BtcRedeemHex, res.BtcLocktime,
+			hex.EncodeToString(res.TakerClaimPub), hex.EncodeToString(res.MakerRefundPub), res.BtcClaimTxid)
+		return
+	}
+	if res.Received {
+		fmt.Printf("SUB-ASSET SELL SWAP SETTLED: paid %d %s over Lightning, received %d BTC sats on-chain in %s; preimage %s\n",
+			assetAtoms, *asset, btcSats, res.BtcClaimTxid, hex.EncodeToString(res.Preimage))
+	} else {
+		fmt.Printf("SUB-ASSET SELL: paid %d %s over Lightning + learned P (%s); wallet claims %d BTC sats from HTLC %s:%d\n",
+			assetAtoms, *asset, hex.EncodeToString(res.Preimage), btcSats, res.BtcTxid, res.BtcVout)
+	}
 }
