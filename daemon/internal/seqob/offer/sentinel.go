@@ -50,6 +50,11 @@ const (
 	//     asset over LN (pays a hold invoice the taker issues on H) and receives
 	//     BTC in the taker's on-chain HTLC (claims it with P) -> SELL.
 	LnAssetLNForBTC uint32 = 4
+	//   LnBTCForAssetLN: the MIRROR (sub-asset SELL). BTC-on-chain exchanged for
+	//     asset-LN; the maker BUYS the asset — it LOCKS BTC in an on-chain HTLC
+	//     (claim=taker with P, refund=maker) and holds an asset invoice on H; the
+	//     taker pays the asset over LN and claims the BTC -> BUY (maker acquires).
+	LnBTCForAssetLN uint32 = 5
 )
 
 // IsPureLN reports whether an ln_direction is a pure-LN (both-legs-Lightning)
@@ -59,9 +64,10 @@ func IsPureLN(lnDirection uint32) bool {
 }
 
 // IsSubAsset reports whether an ln_direction is a sub-asset swap: the asset leg is
-// over Lightning and the BTC leg is an on-chain HTLC (the submarine's mirror).
+// over Lightning and the BTC leg is an on-chain HTLC (the submarine's mirror). Both
+// directions: LnAssetLNForBTC (BUY, maker sells) and LnBTCForAssetLN (SELL, maker buys).
 func IsSubAsset(lnDirection uint32) bool {
-	return lnDirection == LnAssetLNForBTC
+	return lnDirection == LnAssetLNForBTC || lnDirection == LnBTCForAssetLN
 }
 
 // IsBTCSentinel reports whether an asset id is the BTC sentinel.
@@ -85,7 +91,7 @@ func DirectionConsistent(direction uint32, isSell bool) bool {
 // BUY (maker acquires the asset) is the NORMAL flow (asset -> BTC-LN).
 func LnDirectionConsistent(lnDirection uint32, isSell bool) bool {
 	switch lnDirection {
-	case LnAssetForBTC, LnAssetLNForBTCLN: // maker acquires the asset -> BUY
+	case LnAssetForBTC, LnAssetLNForBTCLN, LnBTCForAssetLN: // maker acquires the asset -> BUY
 		return !isSell
 	case LnBTCForAsset, LnBTCLNForAssetLN, LnAssetLNForBTC: // maker gives the asset -> SELL
 		return isSell
