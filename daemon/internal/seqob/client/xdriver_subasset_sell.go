@@ -39,12 +39,15 @@ import (
 type SubAssetSellMakerOps interface {
 	BtcTip() (int64, error)
 	BtcConfirmations(txid string) (int, error)
+	// AssetLNNodeID returns the maker's asset LN node id (the taker pays the hold by
+	// bare hash to it — the holdinvoice plugin holds by hash, no bolt11).
+	AssetLNNodeID() (string, error)
 	// LockBTCLeg funds the BTC HTLC (claim = takerClaimPub with P, refund = refundPub
 	// after locktime). The maker funds it from its OWN BTC wallet.
 	LockBTCLeg(takerClaimPub, refundPub []byte, amountCoins string, locktime uint32) (*xchain.LegLock, int64, error)
-	// CreateAssetHold issues the asset HOLD invoice on paymentHash h for amtMsat
-	// (requires the holdinvoice plugin on the maker's asset node).
-	CreateAssetHold(h []byte, amtMsat uint64) (bolt11 string, err error)
+	// CreateAssetHold registers a HOLD on paymentHash h for amtMsat on the maker's
+	// asset node (holdinvoice plugin). The taker pays the bare hash; no bolt11.
+	CreateAssetHold(h []byte, amtMsat uint64) error
 	// WaitAssetHeld blocks until the taker's asset payment for h is accepted-and-held.
 	WaitAssetHeld(h []byte, timeout time.Duration) error
 	// SettleAssetHold settles the held invoice with P, taking the asset + revealing P.
@@ -67,12 +70,14 @@ func (o *LiveSubAssetSellMakerOps) BtcTip() (int64, error) { return o.BTC.BlockC
 func (o *LiveSubAssetSellMakerOps) BtcConfirmations(txid string) (int, error) {
 	return o.BTC.Confirmations(txid)
 }
+func (o *LiveSubAssetSellMakerOps) AssetLNNodeID() (string, error) { return o.AssetLN.NodeID() }
 func (o *LiveSubAssetSellMakerOps) LockBTCLeg(takerClaimPub, refundPub []byte, amountCoins string, locktime uint32) (*xchain.LegLock, int64, error) {
 	return o.Swap.LockBTCLeg(takerClaimPub, refundPub, amountCoins, locktime)
 }
-func (o *LiveSubAssetSellMakerOps) CreateAssetHold(h []byte, amtMsat uint64) (string, error) {
+func (o *LiveSubAssetSellMakerOps) CreateAssetHold(h []byte, amtMsat uint64) error {
 	label := "subassell-" + hex.EncodeToString(h[:8])
-	return o.AssetLN.CreateHoldInvoice(h, amtMsat, 0, label, "sub-asset SELL: maker buys the asset over LN")
+	_, err := o.AssetLN.CreateHoldInvoice(h, amtMsat, 0, label, "sub-asset SELL: maker buys the asset over LN")
+	return err // bolt11 is null for this plugin; the taker pays the bare hash to our node
 }
 func (o *LiveSubAssetSellMakerOps) WaitAssetHeld(h []byte, timeout time.Duration) error {
 	_, err := o.AssetLN.WaitHeld(h, timeout)
@@ -94,9 +99,10 @@ type SubAssetSellTakerOps interface {
 	BtcTip() (int64, error)
 	VerifyBTCLeg(hashH, takerClaimPub, makerRefundPub, providedScript []byte, btcLocktime uint32,
 		txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error)
-	// PayAsset pays the maker's asset hold invoice (bolt11 bound to wantHash) for
-	// amtMsat and BLOCKS until the maker settles it, returning the revealed preimage P.
-	PayAsset(bolt11 string, wantHash []byte, amtMsat uint64) (preimage []byte, err error)
+	// PayAsset pays the maker's held asset by BARE HASH to makerNodeID for amtMsat
+	// (the holdinvoice plugin holds by hash, no bolt11) and BLOCKS until the maker
+	// settles, returning the revealed preimage P.
+	PayAsset(makerNodeID string, wantHash []byte, amtMsat uint64) (preimage []byte, err error)
 	// InjectSecret feeds P into the BTC-leg hashlock so the claim witness can be built.
 	InjectSecret(preimage []byte) error
 	// ClaimBTCLeg spends the maker's BTC HTLC via the claim/IF branch with P.
@@ -116,8 +122,10 @@ func (o *LiveSubAssetSellTakerOps) VerifyBTCLeg(hashH, takerClaimPub, makerRefun
 	txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error) {
 	return o.Swap.VerifyBTCLeg(hashH, takerClaimPub, makerRefundPub, providedScript, btcLocktime, txid, vout, amount, "", minConf)
 }
-func (o *LiveSubAssetSellTakerOps) PayAsset(bolt11 string, wantHash []byte, amtMsat uint64) ([]byte, error) {
-	return o.AssetLN.Pay(bolt11, wantHash, amtMsat)
+func (o *LiveSubAssetSellTakerOps) PayAsset(makerNodeID string, wantHash []byte, amtMsat uint64) ([]byte, error) {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	return o.AssetLN.PayHash(makerNodeID, wantHash, amtMsat, 18, secret)
 }
 func (o *LiveSubAssetSellTakerOps) InjectSecret(preimage []byte) error {
 	return o.Swap.InjectSecret(preimage)
@@ -234,16 +242,21 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 	}
 	p.logf("subasset-sell maker: BTC HTLC %s confirmed", btcLeg.Funded.TxID)
 
-	// 3. Issue the asset HOLD invoice on H and advertise both legs.
-	bolt11, err := ops.CreateAssetHold(hashH, p.AssetAmount*1000)
+	// 3. Register the asset HOLD on H and advertise both legs. The holdinvoice plugin
+	//    holds by hash (no bolt11), so the taker pays the bare hash to our node id.
+	if err := ops.CreateAssetHold(hashH, p.AssetAmount*1000); err != nil {
+		sendXcFail(p.Crypter, send, "asset_hold", err.Error())
+		return res, fmt.Errorf("subasset-sell maker: register asset hold (reclaim BTC at T_btc): %w", err)
+	}
+	nodeID, err := ops.AssetLNNodeID()
 	if err != nil {
-		sendXcFail(p.Crypter, send, "asset_invoice", err.Error())
-		return res, fmt.Errorf("subasset-sell maker: create asset hold invoice (refund BTC at T_btc): %w", err)
+		sendXcFail(p.Crypter, send, "maker_node", err.Error())
+		return res, fmt.Errorf("subasset-sell maker: asset node id: %w", err)
 	}
 	if err := sendXc(&XcMsg{
 		Type:           XcSubAsSellTerms,
 		HashH:          hex.EncodeToString(hashH),
-		Bolt11:         bolt11,
+		MakerLNNodeID:  nodeID,
 		BtcAmount:      p.BtcAmount,
 		SeqAmount:      p.AssetAmount,
 		MakerRefundPub: hex.EncodeToString(refundKey.PubKey()),
@@ -357,8 +370,8 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if err != nil || len(makerRefundPub) == 0 {
 		return res, fmt.Errorf("%w: malformed maker_refund_pub", ErrXcBadTerms)
 	}
-	if terms.Leg == nil || terms.Bolt11 == "" {
-		return res, fmt.Errorf("%w: terms missing leg or invoice", ErrXcBadTerms)
+	if terms.Leg == nil || terms.MakerLNNodeID == "" {
+		return res, fmt.Errorf("%w: terms missing BTC leg or maker asset node id", ErrXcBadTerms)
 	}
 	if terms.BtcAmount != 0 && terms.BtcAmount != p.BtcAmount {
 		return res, fmt.Errorf("%w: maker BTC amount %d != expected %d", ErrXcBadTerms, terms.BtcAmount, p.BtcAmount)
@@ -404,10 +417,10 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	}
 	p.logf("subasset-sell taker: maker BTC HTLC %s verified (%d sats, T_btc=%d); paying the asset over LN", terms.Leg.Txid, p.BtcAmount, tBtc)
 
-	// 3. Pay the maker's asset hold invoice over LN (device co-signs). Blocks until the
-	//    maker settles it, returning P. If the maker never settles, the LN payment fails
+	// 3. Pay the maker's held asset by bare hash over LN (device co-signs). Blocks until
+	//    the maker settles, returning P. If the maker never settles, the LN payment fails
 	//    back and nothing is lost.
-	preimage, err := ops.PayAsset(terms.Bolt11, hashH, p.AssetAmount*1000)
+	preimage, err := ops.PayAsset(terms.MakerLNNodeID, hashH, p.AssetAmount*1000)
 	if err != nil {
 		return res, fmt.Errorf("subasset-sell taker: pay asset invoice (nothing lost, LN returns): %w", err)
 	}

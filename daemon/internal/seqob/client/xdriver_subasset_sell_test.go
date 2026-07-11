@@ -49,11 +49,14 @@ func (o *fakeSellMakerOps) LockBTCLeg(takerClaimPub, refundPub []byte, amountCoi
 	o.st.btcConfs = 1
 	return &xchain.LegLock{Script: []byte{0x51}, Funded: &xchain.FundedHTLC{TxID: o.st.btcTxid, Vout: 0, Amount: o.st.btcAmt}, Locktime: locktime}, 0, nil
 }
-func (o *fakeSellMakerOps) CreateAssetHold(h []byte, amtMsat uint64) (string, error) {
+func (o *fakeSellMakerOps) AssetLNNodeID() (string, error) {
+	return "02" + hex.EncodeToString(make([]byte, 32)), nil
+}
+func (o *fakeSellMakerOps) CreateAssetHold(h []byte, amtMsat uint64) error {
 	o.st.mu.Lock()
 	defer o.st.mu.Unlock()
 	o.st.holdHash = append([]byte(nil), h...)
-	return "ln-sell-hold-" + hex.EncodeToString(h[:4]), nil
+	return nil
 }
 func (o *fakeSellMakerOps) WaitAssetHeld(h []byte, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -100,7 +103,7 @@ func (o *fakeSellTakerOps) VerifyBTCLeg(hashH, takerClaimPub, makerRefundPub, sc
 }
 
 // PayAsset marks the payment held, then blocks until the maker settles, returning P.
-func (o *fakeSellTakerOps) PayAsset(bolt11 string, wantHash []byte, amtMsat uint64) ([]byte, error) {
+func (o *fakeSellTakerOps) PayAsset(makerNodeID string, wantHash []byte, amtMsat uint64) ([]byte, error) {
 	o.st.mu.Lock()
 	o.st.takerPaid = true
 	o.st.mu.Unlock()
