@@ -240,6 +240,39 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 // hold plugin resolves regardless of it, so an agreed-or-arbitrary value works
 // (the maker may convey an expected secret over the courier). finalCltv is the
 // final-hop cltv delta (0 => a small default).
+// directHop builds a single-hop sendpay route over our OWN (possibly private/
+// unannounced) channel to a directly-connected payee — the payee is the final hop,
+// so it receives amountMsat with no routing fee. Used when getroute can't see the
+// channel (private + asset-aware routing uses only the gossip graph).
+func (l *clnLNLeg) directHop(destNodeID string, amountMsat uint64, finalCltv uint32) (json.RawMessage, error) {
+	var res struct {
+		Channels []struct {
+			PeerID         string `json:"peer_id"`
+			State          string `json:"state"`
+			ShortChannelID string `json:"short_channel_id"`
+			Direction      int    `json:"direction"`
+			SpendableMsat  uint64 `json:"spendable_msat"`
+		} `json:"channels"`
+	}
+	if err := l.rpc.call(&res, "listpeerchannels", map[string]interface{}{"id": destNodeID}); err != nil {
+		return nil, fmt.Errorf("listpeerchannels: %w", err)
+	}
+	delay := finalCltv
+	if delay == 0 {
+		delay = 18
+	}
+	for _, c := range res.Channels {
+		if c.PeerID == destNodeID && c.State == "CHANNELD_NORMAL" && c.ShortChannelID != "" && c.SpendableMsat >= amountMsat {
+			hop := map[string]interface{}{
+				"id": destNodeID, "channel": c.ShortChannelID, "direction": c.Direction,
+				"amount_msat": amountMsat, "delay": delay, "style": "tlv",
+			}
+			return json.Marshal(hop)
+		}
+	}
+	return nil, fmt.Errorf("no direct CHANNELD_NORMAL channel to %s with >= %d msat spendable", destNodeID, amountMsat)
+}
+
 func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error) {
 	phHex := hex.EncodeToString(paymentHash)
 
@@ -258,11 +291,19 @@ func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uin
 	var route struct {
 		Route []json.RawMessage `json:"route"`
 	}
-	if err := l.rpc.call(&route, "getroute", rparams); err != nil {
-		return nil, fmt.Errorf("getroute: %w", err)
-	}
-	if len(route.Route) == 0 {
-		return nil, fmt.Errorf("%w: no route to %s (asset %q)", ErrLNLegInvalid, destNodeID, l.assetID)
+	rerr := l.rpc.call(&route, "getroute", rparams)
+	if rerr != nil || len(route.Route) == 0 {
+		// Asset-aware getroute uses only the gossip graph, so it misses an UNANNOUNCED
+		// (private) channel to a directly-connected payee. Fall back to a single-hop
+		// route over our own channel to the destination.
+		hop, derr := l.directHop(destNodeID, amountMsat, finalCltv)
+		if derr != nil {
+			if rerr != nil {
+				return nil, fmt.Errorf("getroute: %w (and no direct channel: %v)", rerr, derr)
+			}
+			return nil, fmt.Errorf("%w: no route to %s (asset %q): %v", ErrLNLegInvalid, destNodeID, l.assetID, derr)
+		}
+		route.Route = []json.RawMessage{hop}
 	}
 
 	// 2. Send the HTLC to the bare hash along that route.
