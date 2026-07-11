@@ -247,13 +247,19 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					},
 					AssetLNNodeID: assetLNID,
 					Crypter:       cr,
-					BtcAmount:     o.GetWantAmount(),  // BTC sats the taker locks on-chain
-					AssetAmount:   o.GetOfferAmount(), // asset atoms the maker pays over LN
-					BtcLocktime:   tBtc,
-					MinBTCConf:    cfg.minBTCConf,
-					SpendFeeSats:  cfg.spendFee,
-					HoldTimeout:   cfg.holdTimeout,
-					Log:           logf,
+					// Claim the taker's BTC HTLC with the maker's IDENTITY key, so its pubkey
+					// equals the offer's LightningTerms.MakerClaimPub (= cfg.makerPubKey) that a
+					// device-funded (external-BTC) HTLC is locked to BEFORE the courier handshake.
+					// Without this the maker would mint an ephemeral key and VerifyBTCLeg would
+					// fail on any device-funded leg (script mismatch).
+					MakerBtcClaimKey: xchain.KeyFromBytes(cfg.makerKey.Serialize()),
+					BtcAmount:        o.GetWantAmount(),  // BTC sats the taker locks on-chain
+					AssetAmount:      o.GetOfferAmount(), // asset atoms the maker pays over LN
+					BtcLocktime:      tBtc,
+					MinBTCConf:       cfg.minBTCConf,
+					SpendFeeSats:     cfg.spendFee,
+					HoldTimeout:      cfg.holdTimeout,
+					Log:              logf,
 				}
 				res, err := client.RunMakerSubAsset(p, in, send)
 				if err != nil {
