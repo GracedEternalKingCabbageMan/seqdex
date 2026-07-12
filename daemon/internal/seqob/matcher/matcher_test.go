@@ -354,9 +354,69 @@ func TestSameRailNotCrossRail(t *testing.T) {
 	}
 }
 
+// confidential re-signs o in the blinded-book namespace (confidential=true). The
+// namespace is part of the canonical signed bytes, so it must be set before signing.
+func confidential(t *testing.T, k *btcec.PrivateKey, o *seqobv1.Offer) *seqobv1.Offer {
+	t.Helper()
+	o.Confidential = true
+	o.MakerSig = nil
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
+// TestConfidentialNeverCrossesTransparent asserts the separate blinded book: a
+// confidential offer must NEVER cross a transparent offer on the same pair, even
+// when their prices cross. Both legs of a confidential swap must blind on-chain, so
+// a confidential order can only fill against another confidential order.
+func TestConfidentialNeverCrossesTransparent(t *testing.T) {
+	// Case 1: a confidential incoming must not cross a transparent resting order.
+	{
+		s := offerstore.New(nil)
+		m := New(s)
+		mk, tk := newKey(t), newKey(t)
+		mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true)) // transparent SELL
+		in := confidential(t, tk, buy(t, tk, "b1", 100, 50, true))
+		mustSubmit(t, s, in)
+		if got := m.Cross(in); len(got) != 0 {
+			t.Fatalf("confidential incoming must not cross a transparent resting order, got %d matches", len(got))
+		}
+		if activeOf(s, "s1") != 100 {
+			t.Fatal("transparent resting SELL must be untouched by a confidential incoming")
+		}
+	}
+
+	// Case 2: a transparent incoming must not cross a resting confidential order.
+	{
+		s := offerstore.New(nil)
+		m := New(s)
+		mk, tk := newKey(t), newKey(t)
+		mustSubmit(t, s, confidential(t, mk, sell(t, mk, "s2", 100, 45, true)))
+		in := buy(t, tk, "b2", 100, 50, true)
+		mustSubmit(t, s, in)
+		if got := m.Cross(in); len(got) != 0 {
+			t.Fatalf("transparent incoming must not cross a confidential resting order, got %d matches", len(got))
+		}
+	}
+
+	// Case 3 (sanity): a confidential incoming DOES cross a confidential resting order.
+	{
+		s := offerstore.New(nil)
+		m := New(s)
+		mk, tk := newKey(t), newKey(t)
+		mustSubmit(t, s, confidential(t, mk, sell(t, mk, "s3", 100, 45, true)))
+		in := confidential(t, tk, buy(t, tk, "b3", 100, 50, true))
+		mustSubmit(t, s, in)
+		if got := m.Cross(in); len(got) != 1 {
+			t.Fatalf("confidential-vs-confidential must cross, got %d matches", len(got))
+		}
+	}
+}
+
 // activeOf finds a resting order's active amount by scanning the pair.
 func activeOf(s *offerstore.Store, offerID string) uint64 {
-	for _, e := range s.SnapshotPairEntries(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}) {
+	for _, e := range s.SnapshotPairEntries(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}, false) {
 		if e.Offer.GetOfferId() == offerID {
 			return e.ActiveAmount
 		}

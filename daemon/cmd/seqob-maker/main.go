@@ -208,6 +208,11 @@ func main() {
 
 	o := buildOffer(*base, *quote, *side, *baseAmt, *quoteAmt, *feeAsset,
 		*expiry, uint32(*minAnchor), recvAddr, blindingPub, *offerID)
+	// Post into the SEPARATE blinded book when confidential: the signed namespace tag
+	// segregates this offer so it only crosses another confidential offer (both legs
+	// blind on-chain). recvAddr is already the blech32 confidential form here (its
+	// blinding pubkey was just parsed), satisfying the relay's confidential-offer rules.
+	o.Confidential = *confidential
 	if err := offer.SignOffer(o, makerKey); err != nil {
 		fatal("sign offer: %v", err)
 	}
@@ -224,7 +229,7 @@ func main() {
 		return signedPSET, utxosToSwapUnblinded(utxos), nil
 	}
 	maker := &client.Maker{
-		Wallet: &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential},
+		Wallet: &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential, RequireConfidential: *confidential},
 		// Bind every co-sign to this signed offer (asset legs, price floor,
 		// remaining size) so a malicious taker cannot drain the maker.
 		Offer: o,

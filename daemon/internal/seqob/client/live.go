@@ -24,6 +24,13 @@ type LiveWallet struct {
 	TakerInputsConfidential  bool
 	TakerRecvConfidential    bool
 	MakerOutputsConfidential bool
+
+	// RequireConfidential is set when this wallet serves the BLINDED book. As maker
+	// it makes ResponderComplete FAIL CLOSED: it refuses to co-sign unless the
+	// taker's half is already confidential (real input blinders or a blinded
+	// output), so a confidential-book swap can never settle explicit/mixed and leak
+	// an amount through the public swap ratio.
+	RequireConfidential bool
 }
 
 var errNotWired = errors.New("live wallet backend not wired (Phase-1 tests use StubWallet / a mock Backend)")
@@ -38,9 +45,13 @@ func (w *LiveWallet) ProposerBuildRequest(o *seqobv1.Offer, takeBase uint64, tak
 	if err != nil {
 		return nil, err
 	}
+	// A confidential-book offer forces BOTH legs blinded: the taker must receive to a
+	// blinded output (so its leg is CT), and the maker already published a blinding
+	// key (so its leg is CT). This is not opt-in on the blinded book.
+	confBook := o.GetConfidential()
 	conf := LegConfidentiality{
 		TakerInputsConfidential: w.TakerInputsConfidential,
-		TakerRecvConfidential:   w.TakerRecvConfidential,
+		TakerRecvConfidential:   w.TakerRecvConfidential || confBook,
 		// The maker asked to receive confidentially iff it published a blinding key.
 		MakerRecvConfidential: o.GetSameChain().GetMakerBlindingPub() != "",
 	}
@@ -52,6 +63,7 @@ func (w *LiveWallet) ProposerBuildRequest(o *seqobv1.Offer, takeBase uint64, tak
 		PayAmount:     pay,
 		RecvAsset:     o.GetOfferAsset(),
 		RecvAmount:    recv,
+		Confidential:  confBook,
 	}, conf)
 }
 
@@ -63,9 +75,14 @@ func (w *LiveWallet) ResponderComplete(req *seqdexv1.SwapRequest) (*seqdexv1.Swa
 	if w.Backend == nil {
 		return nil, errNotWired
 	}
-	blind := requestIsConfidential(req) ||
-		psetHasConfidentialOutput(req.GetTransaction()) ||
-		w.MakerOutputsConfidential
+	takerConfidential := requestIsConfidential(req) || psetHasConfidentialOutput(req.GetTransaction())
+	// Blinded-book fail-closed: refuse to co-sign unless the taker's half is already
+	// confidential. Otherwise a downgraded (explicit/mixed) tx would settle and the
+	// public swap ratio would leak the confidential leg's amount.
+	if w.RequireConfidential && !takerConfidential {
+		return nil, errors.New("confidential book: refusing to settle a swap whose taker half is not blinded")
+	}
+	blind := takerConfidential || w.MakerOutputsConfidential || w.RequireConfidential
 	return w.Backend.ResponderComplete(req, blind)
 }
 

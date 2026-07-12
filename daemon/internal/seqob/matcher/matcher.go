@@ -45,7 +45,7 @@ func isSubAssetOffer(o *seqobv1.Offer) bool {
 // Book is the subset of offerstore.Store the matcher needs (so it can be faked
 // in tests).
 type Book interface {
-	SnapshotPairEntries(p *seqobv1.AssetPair) []offerstore.Entry
+	SnapshotPairEntries(p *seqobv1.AssetPair, confidential bool) []offerstore.Entry
 	Get(k offerstore.Key) (*offerstore.Entry, bool)
 	ApplyPartialFill(k offerstore.Key, filledBase uint64, settleTxid string, anchorConfs uint32) error
 }
@@ -271,7 +271,9 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 // (a) are live with active size and (b) cross incoming's price, sorted best-
 // price-first then oldest-first (price-time priority).
 func (m *Matcher) candidates(incoming *seqobv1.Offer) []offerstore.Entry {
-	all := m.book.SnapshotPairEntries(incoming.GetPair())
+	// Snapshot only the incoming order's OWN book namespace (confidential vs
+	// transparent), so a confidential offer only ever sees confidential candidates.
+	all := m.book.SnapshotPairEntries(incoming.GetPair(), incoming.GetConfidential())
 	inKey := keyOf(incoming)
 	buy := incoming.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_BUY
 
@@ -281,6 +283,12 @@ func (m *Matcher) candidates(incoming *seqobv1.Offer) []offerstore.Entry {
 			continue // never match against self
 		}
 		if e.ActiveAmount == 0 {
+			continue
+		}
+		// Belt-and-suspenders even with namespaced snapshots: a confidential offer
+		// crosses ONLY another confidential offer. Both legs must blind on-chain, else
+		// an observer reads the confidential leg's amount off the public swap ratio.
+		if e.Offer.GetConfidential() != incoming.GetConfidential() {
 			continue
 		}
 		// Opposite side only.

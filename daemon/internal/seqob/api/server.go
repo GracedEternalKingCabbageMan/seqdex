@@ -48,7 +48,7 @@ type Server struct {
 	// for sessions opened on CROSS-CHAIN offers (they span a real parent-chain
 	// confirmation between courier rounds).
 	crossDeadline time.Duration
-	upgrader  websocket.Upgrader
+	upgrader      websocket.Upgrader
 
 	// makerConns tracks WS connections by registered maker_pubkey so a lift can be
 	// routed to an online maker. Best-effort (Phase-1).
@@ -208,7 +208,11 @@ func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pair := &seqobv1.AssetPair{BaseAsset: parts[0], QuoteAsset: parts[1]}
-	writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.store.SnapshotPair(pair)})
+	// ?confidential=1 serves the separate BLINDED book for this pair; the default
+	// (absent/0) serves the existing transparent book unchanged, so the live
+	// unblinded DEX is byte-for-byte untouched.
+	confidential := isTruthy(r.URL.Query().Get("confidential"))
+	writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.store.SnapshotPair(pair, confidential)})
 }
 
 func (s *Server) handleLift(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +310,15 @@ func httpErr(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	b, _ := json.Marshal(map[string]interface{}{"code": code, "message": msg})
 	w.Write(b)
+}
+
+// isTruthy reports whether a query-string flag reads as set (1/true/yes/on).
+func isTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func clientIP(r *http.Request) string {

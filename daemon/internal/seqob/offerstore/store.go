@@ -223,11 +223,23 @@ func (s *Store) OrderStatusOf(k Key) (*seqobv1.OrderStatus, bool) {
 	return e.orderStatus(k), true
 }
 
-// SnapshotPair returns all live offers for a pair.
-func (s *Store) SnapshotPair(p *seqobv1.AssetPair) []*seqobv1.Offer {
+// SnapshotPair returns all live offers for a pair in the requested book
+// namespace: confidential=false is the transparent (unblinded) book, confidential=true
+// is the separate blinded book. The two namespaces are DISJOINT views over the pair
+// so a confidential offer never appears in the transparent book and vice-versa
+// (Confidential-book requirement 1); the matcher additionally guarantees they never
+// cross.
+func (s *Store) SnapshotPair(p *seqobv1.AssetPair, confidential bool) []*seqobv1.Offer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshotLocked(pairKey(p))
+	set := s.pairs[pairKey(p)]
+	out := make([]*seqobv1.Offer, 0, len(set))
+	for k := range set {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
+			out = append(out, e.Offer)
+		}
+	}
+	return out
 }
 
 func (s *Store) snapshotLocked(pk string) []*seqobv1.Offer {
@@ -241,17 +253,19 @@ func (s *Store) snapshotLocked(pk string) []*seqobv1.Offer {
 	return out
 }
 
-// SnapshotPairEntries returns value copies of every live entry for a pair, for
-// the matcher's price-time-priority walk. Copies (not the live *Entry) so the
-// matcher reads a consistent snapshot; the enclosed *Offer is immutable once
-// signed, so sharing its pointer is safe.
-func (s *Store) SnapshotPairEntries(p *seqobv1.AssetPair) []Entry {
+// SnapshotPairEntries returns value copies of every live entry for a pair in the
+// requested book namespace (confidential true/false), for the matcher's
+// price-time-priority walk. Copies (not the live *Entry) so the matcher reads a
+// consistent snapshot; the enclosed *Offer is immutable once signed, so sharing its
+// pointer is safe. Filtering by confidential here keeps the blinded and unblinded
+// books as disjoint order sets.
+func (s *Store) SnapshotPairEntries(p *seqobv1.AssetPair, confidential bool) []Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	set := s.pairs[pairKey(p)]
 	out := make([]Entry, 0, len(set))
 	for k := range set {
-		if e, ok := s.entries[k]; ok {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
 			out = append(out, *e)
 		}
 	}
