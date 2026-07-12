@@ -60,6 +60,20 @@ message Offer {
   string maker_ln_node_pubkey = 17;
   repeated string ln_connect_hints = 18;
 
+  // Confidential book namespace. When true, this offer rests in the SEPARATE
+  // BLINDED book and may ONLY cross another confidential offer, so BOTH swap legs
+  // are CT-blinded on-chain (blinded amounts + assets + rangeproofs on every swap
+  // output). This is REQUIRED for confidentiality: if one leg were transparent an
+  // observer would derive the confidential leg's amount from the public swap ratio
+  // (the order price). A confidential offer MUST use SameChainTerms (the interactive
+  // co-sign rail: the covenant rail introspects EXPLICIT amounts and is
+  // CT-incompatible), MUST publish maker_blinding_pub + a blinded (blech32) receive
+  // address, and MUST NOT involve the BTC sentinel (the parent chain has no CT).
+  // Being part of the signed canonical bytes, the namespace is authenticated by
+  // maker_sig automatically. Transparent-by-default: an offer with this unset (the
+  // proto3 default false) rests in the existing unblinded book, unchanged.
+  bool confidential = 19;
+
   // Settlement variant. Reserved field numbers keep future variants additive.
   oneof settlement {
     SameChainTerms  same_chain  = 20;

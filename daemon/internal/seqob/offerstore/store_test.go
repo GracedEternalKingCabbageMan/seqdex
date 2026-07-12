@@ -33,6 +33,38 @@ func mkOffer(t *testing.T, k *btcec.PrivateKey, id string, expires uint64) *seqo
 	return o
 }
 
+// TestSnapshotPairNamespaceDisjoint asserts the transparent and confidential books
+// are disjoint views over the same pair: SnapshotPair(false) returns only
+// transparent offers, SnapshotPair(true) only confidential ones.
+func TestSnapshotPairNamespaceDisjoint(t *testing.T) {
+	s := New(nil)
+	k := key(t)
+
+	transparent := mkOffer(t, k, "t1", 1799999999)
+	conf := mkOffer(t, k, "c1", 1799999999)
+	conf.Confidential = true
+	conf.MakerSig = nil
+	if err := offer.SignOffer(conf, k); err != nil {
+		t.Fatalf("sign confidential: %v", err)
+	}
+	if _, err := s.Submit(transparent); err != nil {
+		t.Fatalf("submit transparent: %v", err)
+	}
+	if _, err := s.Submit(conf); err != nil {
+		t.Fatalf("submit confidential: %v", err)
+	}
+
+	pair := &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}
+	pub := s.SnapshotPair(pair, false)
+	if len(pub) != 1 || pub[0].GetOfferId() != "t1" {
+		t.Fatalf("transparent book must contain only t1, got %+v", pub)
+	}
+	blinded := s.SnapshotPair(pair, true)
+	if len(blinded) != 1 || blinded[0].GetOfferId() != "c1" {
+		t.Fatalf("confidential book must contain only c1, got %+v", blinded)
+	}
+}
+
 func key(t *testing.T) *btcec.PrivateKey {
 	t.Helper()
 	k, err := btcec.NewPrivateKey()
@@ -52,7 +84,7 @@ func TestSubmitVerifiesAndSnapshot(t *testing.T) {
 	if _, err := s.Submit(o); err == nil {
 		t.Fatalf("expected duplicate submit to fail")
 	}
-	snap := s.SnapshotPair(&seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"})
+	snap := s.SnapshotPair(&seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}, false)
 	if len(snap) != 1 {
 		t.Fatalf("snapshot len = %d, want 1", len(snap))
 	}
@@ -167,7 +199,7 @@ func TestExpirySweeper(t *testing.T) {
 	if n := s.SweepExpired(); n != 1 {
 		t.Fatalf("expected 1 expired, swept %d", n)
 	}
-	if len(s.SnapshotPair(o.GetPair())) != 0 {
+	if len(s.SnapshotPair(o.GetPair(), false)) != 0 {
 		t.Fatalf("expired offer still in book")
 	}
 }
