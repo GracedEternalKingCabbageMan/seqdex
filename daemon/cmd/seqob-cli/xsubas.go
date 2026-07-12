@@ -90,7 +90,8 @@ func cmdXSubAs(args []string) {
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations to wait on our own BTC leg before announcing")
 	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
 	extBolt11 := fs.String("asset-bolt11", "", "DEVICE-PREIMAGE mode: an asset invoice created OUT-OF-BAND by the device (the wallet) on its own hosted node with the device's OWN preimage. When set (with -payment-hash), this taker NEVER mints/settles the preimage: it funds the BTC HTLC on H, forwards this bolt11 to the maker, and waits for it to be PAID (the device settles). Non-custodial receive.")
-	extHashHex := fs.String("payment-hash", "", "DEVICE-PREIMAGE mode: the payment_hash H (hex) of -asset-bolt11 (H = SHA256(device preimage)).")
+	extHashHex := fs.String("payment-hash", "", "DEVICE-PREIMAGE / DEVICE-HODL mode: the payment_hash H (hex). H = SHA256(device preimage).")
+	takerLnNodeID := fs.String("taker-ln-node-id", "", "DEVICE-HODL BUY: the taker's HOSTED asset node id. The device registered a HOLD on -payment-hash at that node and holds P; relays H + this node id (no bolt11), the maker pays the bare hash, and the DEVICE settles out-of-band (POST /node/settle). Requires -payment-hash and (normally) the external-BTC flags.")
 	// EXTERNAL BTC HTLC: the wallet already funded the HTLC from the USER's own BTC
 	// (xsubas-fund-btc / btc.js). This taker relays it; the LSP funds NOTHING. -btc-rpc
 	// is still read (for the tip sanity check) but no -btc-wallet is used.
@@ -124,6 +125,15 @@ func cmdXSubAs(args []string) {
 		extHashH, derr = hex.DecodeString(*extHashHex)
 		if derr != nil || len(extHashH) != 32 {
 			fatal("-asset-bolt11 requires -payment-hash <32-byte hex H>")
+		}
+	}
+	// DEVICE-HODL BUY: the device registered a hold on H at its OWN hosted node and holds
+	// P; we relay H + the node id (no bolt11) and wait for HELD. Requires -payment-hash.
+	if *takerLnNodeID != "" {
+		var derr error
+		extHashH, derr = hex.DecodeString(*extHashHex)
+		if derr != nil || len(extHashH) != 32 {
+			fatal("-taker-ln-node-id requires -payment-hash <32-byte hex H>")
 		}
 	}
 	// EXTERNAL BTC HTLC mode: the wallet funded the HTLC from the USER's own BTC; we
@@ -293,7 +303,7 @@ func cmdXSubAs(args []string) {
 		Swap:    xchain.NewSwapBitcoin(btcChain, nil, htlcLock),
 		AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
 		BTC:     btcChain,
-		Plain:   *invoiceMode == "plain",
+		Plain:   *invoiceMode == "plain" && *takerLnNodeID == "",
 	}
 	res, err := client.RunTakerSubAsset(client.TakerSubAssetParams{
 		Ops:                  takerOps,
@@ -306,6 +316,7 @@ func cmdXSubAs(args []string) {
 		Preimage:             secret,
 		ExternalHashH:        extHashH,
 		ExternalBolt11:       *extBolt11,
+		TakerLNNodeID:        *takerLnNodeID,
 		ExternalBtcLeg:       extBtcLeg,
 		ExternalBtcRefundPub: extBtcRefundPubB,
 		OnBtcLegFunded: func(r *client.TakerSubAssetResult) {
@@ -345,6 +356,16 @@ func cmdXSubAs(args []string) {
 					res.BtcLocktime, *stateFile, *btcWallet, *btcChainName)
 			}
 		}
+		return
+	}
+
+	if res.Held {
+		// DEVICE-HODL BUY: the maker's asset payment is HELD at our hosted node. We do NOT
+		// settle here — the DEVICE settles (POST /node/settle) to release the asset and
+		// reveal P to the maker, who then claims our BTC HTLC.
+		st.Status = "held_device_settle"
+		st.save(*stateFile)
+		fmt.Printf("HODL BUY: the maker's asset payment is HELD on H=%s. Settle from the DEVICE (POST /node/settle {payment_hash, preimage:P}) to release the asset and reveal P to the maker (who then claims your BTC HTLC).\n", st.HashHex)
 		return
 	}
 

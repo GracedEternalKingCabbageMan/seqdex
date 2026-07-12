@@ -109,6 +109,12 @@ func (o *fakeSubAsMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64
 	}
 }
 
+// PayAssetHashHold is the pay-by-hash HODL variant: node id is ignored in the fake,
+// it drives the same held-then-settle simulation keyed by hash.
+func (o *fakeSubAsMakerOps) PayAssetHashHold(takerNodeID string, h []byte, amtMsat uint64) ([]byte, error) {
+	return o.PayAssetHold("", h, amtMsat)
+}
+
 func (o *fakeSubAsMakerOps) InjectSecret(preimage []byte) error {
 	o.st.mu.Lock()
 	defer o.st.mu.Unlock()

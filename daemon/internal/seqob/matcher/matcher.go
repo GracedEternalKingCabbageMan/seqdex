@@ -29,8 +29,18 @@ import (
 	"sort"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 )
+
+// isSubAssetOffer reports whether an offer is a sub-asset swap (asset over LN <->
+// BTC on-chain HTLC). Both directions rest on the <asset>/BTC pair on opposite
+// sides with lined-up assets, so without a guard the matcher would auto-cross a
+// sub-asset BUY (ln 4) against a sub-asset SELL (ln 5).
+func isSubAssetOffer(o *seqobv1.Offer) bool {
+	ln := o.GetLightning()
+	return ln != nil && offer.IsSubAsset(ln.GetLnDirection())
+}
 
 // Book is the subset of offerstore.Store the matcher needs (so it can be faked
 // in tests).
@@ -281,6 +291,13 @@ func (m *Matcher) candidates(incoming *seqobv1.Offer) []offerstore.Entry {
 		// swap to be well-formed and the price to cross.
 		if incoming.GetOfferAsset() != e.Offer.GetWantAsset() ||
 			incoming.GetWantAsset() != e.Offer.GetOfferAsset() {
+			continue
+		}
+		// Sub-asset offers (asset-LN <-> BTC on-chain HTLC) are COURIER-LIFT ONLY: a
+		// taker runs the HTLC handshake, and the relay has no maker-vs-maker settlement
+		// path for them, so they must never auto-cross. This keeps a sub-asset BUY
+		// (ln 4) and SELL (ln 5) coexisting on the asset/BTC pair without crossing.
+		if isSubAssetOffer(incoming) || isSubAssetOffer(e.Offer) {
 			continue
 		}
 		if !crosses(incoming, e.Offer) {

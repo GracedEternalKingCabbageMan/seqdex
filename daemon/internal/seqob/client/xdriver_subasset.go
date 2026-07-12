@@ -57,6 +57,11 @@ type SubAssetMakerOps interface {
 	// PayAssetHold pays the taker's asset hold invoice bound to h for amtMsat and
 	// BLOCKS until the taker settles it, returning the revealed preimage P.
 	PayAssetHold(bolt11 string, h []byte, amtMsat uint64) (preimage []byte, err error)
+	// PayAssetHashHold pays the taker's HELD invoice by BARE HASH to takerNodeID
+	// (the taker's device registered a hold on h at its OWN hosted node; there is no
+	// bolt11), BLOCKS until the DEVICE settles, and returns the revealed preimage P.
+	// It is the maker's mirror of the SELL taker's PayAsset (pay-by-hash to a hold).
+	PayAssetHashHold(takerNodeID string, h []byte, amtMsat uint64) (preimage []byte, err error)
 	// InjectSecret feeds the learned preimage P into the BTC-leg hashlock so the
 	// claim witness can be built (the maker built the swap with a hash-only lock).
 	InjectSecret(preimage []byte) error
@@ -122,6 +127,16 @@ func (o *LiveSubAssetMakerOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub
 }
 func (o *LiveSubAssetMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64) ([]byte, error) {
 	return o.AssetLN.Pay(bolt11, h, amtMsat)
+}
+
+// PayAssetHashHold pays the taker's HELD invoice by BARE HASH to takerNodeID: the
+// taker's device pre-registered a hold on h at its own hosted node (no bolt11), so
+// the maker routes a hash-locked payment there and blocks (through the HELD state)
+// until the device settles, learning P. Mirror of LiveSubAssetSellTakerOps.PayAsset.
+func (o *LiveSubAssetMakerOps) PayAssetHashHold(takerNodeID string, h []byte, amtMsat uint64) ([]byte, error) {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	return o.AssetLN.PayHash(takerNodeID, h, amtMsat, 18, secret)
 }
 func (o *LiveSubAssetMakerOps) InjectSecret(preimage []byte) error {
 	return o.Swap.InjectSecret(preimage)
@@ -309,9 +324,12 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		sendXcFail(p.Crypter, send, "bad_pubkey", "malformed taker refund pubkey")
 		return res, fmt.Errorf("subasset maker: bad taker_btc_refund_pub")
 	}
-	if funded.Leg == nil || funded.Bolt11 == "" {
-		sendXcFail(p.Crypter, send, "bad_funded", "funded message missing leg or invoice")
-		return res, fmt.Errorf("subasset maker: funded message missing leg/invoice")
+	// HODL BUY: the taker's device registered a hold on H at its OWN hosted node and
+	// relays that node id instead of a bolt11 (the maker pays the bare hash to it).
+	hodl := funded.TakerLNNodeID != ""
+	if funded.Leg == nil || (funded.Bolt11 == "" && !hodl) {
+		sendXcFail(p.Crypter, send, "bad_funded", "funded message missing leg or invoice/node-id")
+		return res, fmt.Errorf("subasset maker: funded message missing leg and (bolt11 or taker node id)")
 	}
 	script, err := hex.DecodeString(funded.Leg.RedeemScript)
 	if err != nil {
@@ -383,7 +401,13 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	// 5. Pay the taker's asset hold invoice. This BLOCKS until the taker settles it
 	//    with P; on settle we learn P. The payment is a HELD LN HTLC until then, so
 	//    a taker that never settles simply times it out (nothing delivered).
-	preimage, err := ops.PayAssetHold(funded.Bolt11, hashH, p.AssetAmount*1000)
+	var preimage []byte
+	if hodl {
+		p.logf("subasset maker: paying the asset by bare hash to taker node %s (HODL; device settles, no bolt11)", funded.TakerLNNodeID)
+		preimage, err = ops.PayAssetHashHold(funded.TakerLNNodeID, hashH, p.AssetAmount*1000)
+	} else {
+		preimage, err = ops.PayAssetHold(funded.Bolt11, hashH, p.AssetAmount*1000)
+	}
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_asset", err.Error())
 		return res, fmt.Errorf("subasset maker: pay asset hold invoice: %w", err)
@@ -434,6 +458,11 @@ type TakerSubAssetParams struct {
 	// preimage stays device-held; this taker never learns it. Non-custodial receive.
 	ExternalHashH  []byte // the device invoice's payment_hash H (H = SHA256(device P))
 	ExternalBolt11 string // the device-created asset invoice on H (the maker pays this)
+	// DEVICE-HODL mode: the device registered a HOLD on ExternalHashH at its OWN hosted
+	// node and holds P; this taker relays H + this hosted node id (NOT a bolt11), the
+	// maker PayHash-es the bare hash, and the DEVICE settles out-of-band. This taker
+	// waits for HELD and never learns P.
+	TakerLNNodeID string
 	// EXTERNAL BTC HTLC mode: the wallet/device funded + signed + broadcast the BTC HTLC
 	// from the USER's OWN BTC (device-signed), so this taker does NOT fund it (the LSP
 	// never fronts the BTC). It only relays the pre-funded leg to the maker. The user
@@ -457,6 +486,7 @@ type TakerSubAssetResult struct {
 	BtcLeg      *xchain.LegLock
 	BtcLocktime uint32
 	Received    bool // the asset hold invoice was settled (the asset was received)
+	Held        bool // DEVICE-HODL: the maker's payment is HELD; the DEVICE settles.
 }
 
 func (p *TakerSubAssetParams) logf(f string, a ...interface{}) {
@@ -497,7 +527,10 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	// DEVICE-PREIMAGE (external-invoice) mode: the device created the asset invoice
 	// with its own preimage; this taker only gets H + the bolt11 and NEVER the
 	// preimage. Otherwise (self-driven mode) it mints P and creates the invoice.
-	external := p.ExternalBolt11 != ""
+	// DEVICE-HODL mode: the device registered a hold on H at its OWN hosted node and
+	// holds P; this taker relays H + that node id (no bolt11) and waits for HELD.
+	hodl := p.TakerLNNodeID != ""
+	external := p.ExternalBolt11 != "" || hodl
 	if external && len(p.ExternalHashH) != 32 {
 		return nil, fmt.Errorf("subasset taker: external-invoice mode needs a 32-byte ExternalHashH")
 	}
@@ -606,9 +639,12 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	// 4. The asset invoice on H. External mode: the DEVICE already created it (we
 	//    only forward its bolt11; we never mint P). Self-driven: we create it.
 	var invoice string
-	if external {
+	switch {
+	case hodl:
+		// the device created the hold on H at its hosted node; relay only H + node id
+	case external:
 		invoice = p.ExternalBolt11
-	} else {
+	default:
 		var invH []byte
 		invoice, invH, err = p.Ops.PrepareAssetHold(secret, p.AssetAmount*1000)
 		if err != nil {
@@ -622,11 +658,10 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 
 	// 5. Announce the funded leg + invoice. The refund pubkey + T_btc are the ones
 	//    actually embedded in the HTLC (the user's, in external-BTC mode).
-	if err := sendXc(&XcMsg{
+	msg := &XcMsg{
 		Type:              XcSubAsBtcFunded,
 		HashH:             hex.EncodeToString(hashH),
 		TakerBtcRefundPub: hex.EncodeToString(announceRefundPub),
-		Bolt11:            invoice,
 		Leg: &XcLeg{
 			Txid:         btcLeg.Funded.TxID,
 			Vout:         btcLeg.Funded.Vout,
@@ -634,7 +669,14 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 			RedeemScript: hex.EncodeToString(btcLeg.Script),
 			Locktime:     btcLeg.Locktime,
 		},
-	}, p.Crypter, send); err != nil {
+	}
+	if hodl {
+		// DEVICE-HODL: relay our HOSTED node id, no bolt11 (the maker pays the bare hash).
+		msg.TakerLNNodeID = p.TakerLNNodeID
+	} else {
+		msg.Bolt11 = invoice
+	}
+	if err := sendXc(msg, p.Crypter, send); err != nil {
 		return res, err
 	}
 
@@ -645,6 +687,20 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 			_ = p.Ops.CancelAssetHold(hashH)
 		}
 		return res, fmt.Errorf("subasset taker: maker did not verify the BTC leg (refund BTC at T_btc): %w", err)
+	}
+
+	if hodl {
+		// 7-hodl (DEVICE-HODL): the maker pays the bare hash to our HOSTED node, where
+		// the device registered a hold on H and holds P. We wait for the payment to be
+		// HELD, then STOP — the DEVICE settles out-of-band (revealing P to the maker,
+		// who claims the BTC). We never learn P and never settle.
+		p.logf("subasset taker: awaiting the maker's HELD asset payment on H (device settles out-of-band)")
+		if err := p.Ops.WaitAssetHeld(hashH, p.Timing.SeqLockWait); err != nil {
+			return res, fmt.Errorf("subasset taker: maker never held the asset (refund BTC at T_btc): %w", err)
+		}
+		res.Held = true
+		p.logf("subasset taker: asset payment HELD; the DEVICE settles now (maker claims BTC with the device-revealed P)")
+		return res, nil
 	}
 
 	if external {
