@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/bits"
 
 	"github.com/thanhpk/randstr"
 
@@ -29,18 +30,32 @@ func proRata(o *seqobv1.Offer, takeBase uint64) (recvOfferAsset uint64, payWantA
 	if base == 0 || takeBase == 0 || takeBase > base {
 		return 0, 0, fmt.Errorf("invalid take amount %d (base %d)", takeBase, base)
 	}
-	// recv = offer_amount * takeBase / base  (floor)
-	recvOfferAsset = o.GetOfferAmount() * takeBase / base
+	// Both factors are asset atoms (up to ~2.1e15 for a 21M-supply 8-dp asset), so
+	// factor*takeBase overflows uint64 for realistic sizes (e.g. 5e10 * 5e10 =
+	// 2.5e21 > 1.8e19). Compute the 128-bit product and divide it down so the legs
+	// stay exact. This is the authoritative price scaling; overflow here silently
+	// garbled every non-trivial fill.
+	// recv = floor(offer_amount * takeBase / base)
+	recvOfferAsset, _ = mulDiv64(o.GetOfferAmount(), takeBase, base)
 	// pay = ceil(want_amount * takeBase / base)
-	num := o.GetWantAmount() * takeBase
-	payWantAsset = num / base
-	if num%base != 0 {
+	q, rem := mulDiv64(o.GetWantAmount(), takeBase, base)
+	payWantAsset = q
+	if rem != 0 {
 		payWantAsset++
 	}
 	if recvOfferAsset == 0 || payWantAsset == 0 {
 		return 0, 0, fmt.Errorf("take amount too small for a non-zero fill")
 	}
 	return recvOfferAsset, payWantAsset, nil
+}
+
+// mulDiv64 returns floor(a*b/d) and the remainder, computing a*b in 128 bits so
+// it never overflows uint64. The proRata callers guarantee takeBase <= base, so
+// the true quotient is <= the (uint64) offer/want amount and bits.Div64 (which
+// panics only when the quotient would exceed 64 bits) is always safe.
+func mulDiv64(a, b, d uint64) (q, rem uint64) {
+	hi, lo := bits.Mul64(a, b)
+	return bits.Div64(hi, lo, d)
 }
 
 // ProposerBuildRequest builds the taker's SwapRequest. The taker is the proposer:
