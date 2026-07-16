@@ -435,14 +435,22 @@ func (s *Service) CompleteSwap(
 		feeRate, eligible := s.feeExchangeRate(feeAssetNet)
 		feeFundAccount := account
 		if !eligible {
+			// assetR isn't fee-eligible, so `account` (which holds assetR) can't
+			// fund a native fee. Fall back to the dedicated fee account in native.
 			feeAssetNet = nativeAsset
 			feeRate = exchangeRateScale
 			feeFundAccount = domain.FeeAccount
-		} else if feeAssetNet == nativeAsset {
-			// Preserve today's behavior: the native fee is funded from the
-			// dedicated fee account, not the market account.
-			feeFundAccount = domain.FeeAccount
 		}
+		// NOTE: when feeAssetNet == nativeAsset here, assetR IS the native asset, so
+		// the market `account` already holds native UTXOs (it funds the give leg
+		// from them just above) and MUST fund the native fee from the same account.
+		// Routing the native fee through domain.FeeAccount in this case was a
+		// vestige of native-asset privilege (tdex assumed a market account never
+		// holds the native asset); it violated Sequentia's no-privileged-coin fee
+		// market AND broke every native-give swap whenever fee_account's UTXO was
+		// stale/spent (-> bad-txns-inputs-missingorspent). We therefore keep
+		// feeFundAccount = account for the native-give case, exactly mirroring the
+		// working non-native path.
 
 		// Convert the required native-equivalent fee into feeAssetNet (round UP).
 		dummyFeeInAsset := feeInAsset(dummyFeeAmount, feeRate)
