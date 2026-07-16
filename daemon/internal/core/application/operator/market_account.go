@@ -14,6 +14,32 @@ import (
 
 const startYear = 2021
 
+// defaultAssetPrecision is used when precision is neither supplied by the
+// operator nor resolvable from the registry. Sequentia's default nDenomination
+// is 8, and every current live asset is 8dp, so this keeps existing behaviour.
+const defaultAssetPrecision uint = 8
+
+// resolvePrecision decides a market asset's precision (decimal places) with the
+// order: explicit operator value > registry value > default (8).
+//
+// LIMITATION: neither the gRPC field (proto3) nor the CLI flag can distinguish
+// "operator explicitly chose 0" from "left unset" - both default to 0. A
+// provided value of 0 is therefore treated as "unset" and resolved from the
+// registry. An asset that genuinely has 0 decimals still resolves correctly
+// because the registry reports 0; only a deliberate force-to-0 that contradicts
+// the registry is unexpressible over this path. Non-zero values always win.
+func (s *service) resolvePrecision(assetID string, provided uint) uint {
+	if provided != 0 {
+		return provided
+	}
+	if s.registry != nil {
+		if p, ok := s.registry.PrecisionFor(assetID); ok {
+			return p
+		}
+	}
+	return defaultAssetPrecision
+}
+
 func (s *service) NewMarket(
 	ctx context.Context,
 	market ports.Market, marketName string,
@@ -26,6 +52,16 @@ func (s *service) NewMarket(
 	if mkt != nil {
 		return nil, fmt.Errorf("market already exists")
 	}
+
+	// Resolve each asset's precision from the registry unless the operator
+	// supplied it explicitly. Pricing/order sizing depend on both assets'
+	// precisions, so a wrong number silently misprices the market.
+	baseAssetPrecision = s.resolvePrecision(
+		market.GetBaseAsset(), baseAssetPrecision,
+	)
+	quoteAssetPrecision = s.resolvePrecision(
+		market.GetQuoteAsset(), quoteAssetPrecision,
+	)
 
 	newMarket, err := domain.NewMarket(
 		market.GetBaseAsset(), market.GetQuoteAsset(), marketName,

@@ -64,13 +64,17 @@ var (
 				Value: 0,
 			},
 			&cli.UintFlag{
-				Name:  "base-asset-precision",
-				Usage: "the precision for the base asset",
+				Name: "base-asset-precision",
+				Usage: "explicit override for the base asset precision; " +
+					"if 0 (unset) the daemon sources it from the asset registry, " +
+					"falling back to 8",
 				Value: 0,
 			},
 			&cli.UintFlag{
-				Name:  "quote-asset-precision",
-				Usage: "the precision for the quote asset",
+				Name: "quote-asset-precision",
+				Usage: "explicit override for the quote asset precision; " +
+					"if 0 (unset) the daemon sources it from the asset registry, " +
+					"falling back to 8",
 				Value: 0,
 			},
 			&cli.StringFlag{

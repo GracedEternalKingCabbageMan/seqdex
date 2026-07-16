@@ -32,6 +32,11 @@ type Config struct {
 	// so same-chain swaps can pay the network fee in the transacted asset. Empty
 	// disables the open fee market (fees fall back to the native asset).
 	NodeRPC string
+	// RegistryURL is an optional Sequentia Asset Registry minimal-index url
+	// (e.g. http://host:3005/index.minimal.json) used to source each asset's
+	// precision (decimal places) at market creation. Empty disables registry
+	// lookups: precision then falls back to the CLI flag / the default (8).
+	RegistryURL string
 
 	repo     ports.RepoManager
 	pubsub   PubSubService
@@ -139,6 +144,7 @@ func (c *Config) operatorService() (OperatorService, error) {
 		repo, _ := c.repoManager()
 		operator, err := NewOperatorService(
 			wallet, pubsub, repo, c.FeeBalanceThreshold, c.TxSatsPerByte,
+			c.RegistryURL,
 		)
 		if err != nil {
 			return nil, err
