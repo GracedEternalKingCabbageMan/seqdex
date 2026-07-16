@@ -71,6 +71,15 @@ const (
 	// account (legacy behavior). Env: SEQDEX_NODE_RPC.
 	NodeRpcKey = "NODE_RPC"
 
+	// AssetRegistryURLKey is the Sequentia Asset Registry minimal-index url the
+	// daemon queries at market creation to source each asset's precision
+	// (decimal places / nDenomination). Defaults to the local registry
+	// (http://localhost:3005/index.minimal.json). An explicit per-market CLI
+	// precision flag overrides this; if the registry is unreachable or the asset
+	// is unknown, precision falls back to the default (8). Env:
+	// SEQDEX_ASSET_REGISTRY_URL. Set empty to disable registry lookups.
+	AssetRegistryURLKey = "ASSET_REGISTRY_URL"
+
 	// --- Cross-chain (XchainService) maker config ---
 	// The integrated cross-chain swap maker is enabled only when
 	// XchainParentRPCKey is set (the daemon must reach a parent "BTC" node and an
@@ -144,6 +153,7 @@ func InitConfig() error {
 	vip.SetDefault(NoOperatorTlsKey, false)
 	vip.SetDefault(ConnectProtoKey, httpsProtocol)
 	vip.SetDefault(DBTypeKey, application.DBBadger)
+	vip.SetDefault(AssetRegistryURLKey, "http://localhost:3005/index.minimal.json")
 
 	// Cross-chain maker defaults (only consulted when XCHAIN_PARENT_RPC is set).
 	vip.SetDefault(XchainParentKindKey, "elements")

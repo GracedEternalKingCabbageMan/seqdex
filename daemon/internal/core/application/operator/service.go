@@ -14,6 +14,7 @@ import (
 	"github.com/aejkcs50/seqdex/daemon/internal/core/application/wallet"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
+	"github.com/aejkcs50/seqdex/daemon/pkg/registry"
 	"github.com/aejkcs50/seqdex/daemon/pkg/seqnet"
 	"github.com/vulpemventures/go-elements/confidential"
 	"github.com/vulpemventures/go-elements/elementsutil"
@@ -36,12 +37,16 @@ type service struct {
 	network                    network.Network
 	accounts                   *accountMap
 	milliSatsPerByte           uint64
+	// registry sources an asset's precision (decimal places) at market
+	// creation. It is nil when no registry URL is configured, in which case
+	// precision falls back to the CLI flag / the default.
+	registry *registry.Client
 }
 
 func NewService(
 	walletSvc *wallet.Service, pubsubSvc *pubsub.Service,
 	repoManager ports.RepoManager, feeAccountBalanceThreshold uint64,
-	satsPerByte decimal.Decimal,
+	satsPerByte decimal.Decimal, registryURL string,
 ) (*service, error) {
 	if walletSvc == nil {
 		return nil, fmt.Errorf("missing wallet service")
@@ -74,6 +79,7 @@ func NewService(
 	svc := &service{
 		walletSvc, pubsubSvc, repoManager, feeAccountBalanceThreshold,
 		walletSvc.Network(), accounts, msatsPerByte,
+		registry.NewClient(registryURL),
 	}
 
 	svc.wallet.RegisterHandlerForTxEvent(svc.classifyAndStoreTx())
