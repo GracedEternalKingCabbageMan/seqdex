@@ -222,15 +222,18 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					// old behavior (-requote re-posts the whole; otherwise the offer is retired).
 					partial := settled && filledAsset > 0 && filledAsset < o.GetBaseAmount()
 					if partial {
-						o.BaseAmount -= filledAsset
-						o.OfferAmount -= filledAsset
-						if filledBtc <= o.WantAmount {
-							o.WantAmount -= filledBtc
-						} else {
-							o.WantAmount = 0
-						}
-						fmt.Printf("session %s: PARTIAL fill (%d asset, %d sats); re-resting the remainder %d %s\n",
-							sid, filledAsset, filledBtc, o.GetBaseAmount(), o.GetOfferAsset())
+						remainAsset := o.GetBaseAmount() - filledAsset
+						// Price the remainder at the offer's OWN rate (ceil), not by subtracting the
+						// rounded filledBtc — that subtraction drifts and can zero the want on a
+						// low-priced offer, re-resting real asset for 0 BTC (free-drainable / unpriceable).
+						// ProportionalBtc rounds up, so for any remainAsset>0 the want stays >=1.
+						mu.Lock()
+						o.WantAmount = client.ProportionalBtc(o.GetWantAmount(), remainAsset, o.GetBaseAmount())
+						o.BaseAmount = remainAsset
+						o.OfferAmount = remainAsset
+						mu.Unlock()
+						fmt.Printf("session %s: PARTIAL fill (%d asset, %d sats); re-resting the remainder %d %s for %d sats\n",
+							sid, filledAsset, filledBtc, o.GetBaseAmount(), o.GetOfferAsset(), o.GetWantAmount())
 						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
 					} else if settled && cfg.requote {
 						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)

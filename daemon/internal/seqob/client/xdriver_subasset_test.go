@@ -13,6 +13,7 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
@@ -406,6 +407,38 @@ func TestSubAssetPartialRejectsWrongBtc(t *testing.T) {
 	defer st.mu.Unlock()
 	if st.btcTxid != "" {
 		t.Fatal("BTC HTLC was funded despite the amount mismatch")
+	}
+}
+
+// TestProportionalBtcNoOverflow: the partial-price ceil must use a 128-bit product. A bare uint64
+// multiply overflows for realistic sizes (e.g. 1e6 sats * 1.5e15 atoms = 1.5e21 >> 2^64) and would
+// silently return a tiny price, letting a partial taker pay a few sats for a large asset slice.
+func TestProportionalBtcNoOverflow(t *testing.T) {
+	// Hand-computed cases (small + the exact overflow scenario from the review).
+	for _, c := range []struct{ wholeBtc, take, whole, want uint64 }{
+		{1_000_000, 1_500_000_000_000_000, 2_100_000_000_000_000, 714286},        // ceil(1e6*1.5e15/2.1e15); bare multiply overflows
+		{100_000_000, 2_100_000_000_000_000, 2_100_000_000_000_000, 100_000_000}, // whole take -> early return
+		{100_000_000, 1_050_000_000_000_000, 2_100_000_000_000_000, 50_000_000},  // exactly half
+		{1, 1, 100, 1},                                                           // ceil(1/100)=1, never 0 for a positive take
+		{200_000, 50_000, 100_000, 100_000},                                      // the handshake test's partial
+	} {
+		if got := ProportionalBtc(c.wholeBtc, c.take, c.whole); got != c.want {
+			t.Errorf("ProportionalBtc(%d,%d,%d) = %d, want %d (overflow?)", c.wholeBtc, c.take, c.whole, got, c.want)
+		}
+	}
+	// Cross-check a batch (including uint64-overflowing products) against a big.Int ceil.
+	for _, tc := range []struct{ b, tk, w uint64 }{
+		{100_000_000, 999_999_999_999_999, 2_100_000_000_000_000},
+		{4_500_000_000, 3_300_000_000, 9_000_000_000},
+		{21_000_000_00000000, 1, 2_100_000_000_000_000},
+	} {
+		num := new(big.Int).Mul(new(big.Int).SetUint64(tc.b), new(big.Int).SetUint64(tc.tk))
+		den := new(big.Int).SetUint64(tc.w)
+		num.Add(num, new(big.Int).Sub(den, big.NewInt(1)))
+		num.Div(num, den)
+		if got := ProportionalBtc(tc.b, tc.tk, tc.w); got != num.Uint64() {
+			t.Errorf("ProportionalBtc(%d,%d,%d) = %d, big.Int ceil = %s", tc.b, tc.tk, tc.w, got, num.String())
+		}
 	}
 }
 

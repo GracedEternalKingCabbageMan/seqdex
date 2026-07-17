@@ -263,29 +263,50 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 	crypters := make(map[string]*client.Crypter)
 	accepted := make(map[string]bool)
 	o := maker.Offer
-	// Reconnect + re-post the SAME offer_id (with a refreshed created/expiry window + re-sign) on any
-	// WS failure, instead of exiting. Exiting lets the supervisor restart us, which mints a NEW
-	// offer_id — so a taker who lifted the old id then races a replaced offer and gets "no maker
-	// co-sign received". Keeping the offer_id stable across reconnects (the resilience the cross maker
-	// has) is what makes interactive same-chain lifts reliable. In-flight relay sessions are lost on a
-	// reconnect, but the maker stays live + reachable for new lifts (re-registered by the re-post).
+	// Reconnect resilience + STAY on the book. Exiting on a WS error lets the supervisor restart us,
+	// which mints a NEW offer_id → a taker who lifted the old id races a replaced offer and gets "no
+	// maker co-sign". So we reconnect and re-post the SAME offer_id (refreshed window + re-sign). Two
+	// hardening rules the naive version missed: (1) re-posts are RATE-LIMITED — the relay validates a
+	// submit ASYNC and rejects (rate limit / expired) with a From_Error, keeping the conn open; an
+	// unthrottled recovery loop would exhaust the per-maker rate budget and leave us silently off-book
+	// (blocked on ReadMessage with no live offer). (2) reconnects use an ESCALATING backoff so a
+	// reconnect-succeeds-then-immediately-drops cycle can't spin the CPU / hammer a struggling relay.
+	var lastPost time.Time
+	const minRepostGap = 20 * time.Second
+	repost := func(c *websocket.Conn, reason string) bool {
+		if time.Since(lastPost) < minRepostGap {
+			return false
+		}
+		if e := refreshOfferForRequote(o, expiry, makerKey); e != nil {
+			fmt.Printf("re-post (%s): re-sign failed: %v\n", reason, e)
+			return false
+		}
+		if we := writeWS(c, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); we != nil {
+			return false
+		}
+		lastPost = time.Now()
+		fmt.Printf("re-posted offer %s (%s)\n", o.GetOfferId(), reason)
+		return true
+	}
+	backoff := time.Second
 	redial := func(old *websocket.Conn) *websocket.Conn {
 		old.Close()
-		if e := refreshOfferForRequote(o, expiry, makerKey); e != nil {
-			fmt.Printf("reconnect: re-sign offer failed: %v\n", e)
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
 		}
 		for {
 			nc, _, de := websocket.DefaultDialer.Dial(wsURL, nil)
 			if de != nil {
-				time.Sleep(5 * time.Second)
+				time.Sleep(backoff)
 				continue
 			}
-			if we := writeWS(nc, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); we != nil {
+			lastPost = time.Time{} // a reconnect genuinely evicted our offer — force the re-post past the rate gate
+			if !repost(nc, "reconnect") {
 				nc.Close()
-				time.Sleep(5 * time.Second)
+				time.Sleep(backoff)
 				continue
 			}
-			fmt.Println("relay reconnected; re-posted fresh offer (same offer_id)")
 			return nc
 		}
 	}
@@ -297,6 +318,7 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 			conn = redial(conn)
 			continue
 		}
+		backoff = time.Second // a healthy read: the connection is good, reset the reconnect backoff
 		if err := jsonUnmarshal.Unmarshal(data, &from); err != nil {
 			continue
 		}
@@ -317,6 +339,8 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 			sid := sm.GetSessionId()
 			if accepted[sid] {
 				fmt.Printf("session %s: SWAP SETTLED (taker couriered SwapComplete)\n", sid)
+				delete(accepted, sid) // B3: prune per-session state now the swap is done (serve() runs forever)
+				delete(crypters, sid)
 				continue
 			}
 			cr := crypters[sid]
@@ -345,6 +369,11 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			// B1: a relay error can mean our offer was rejected/evicted (rate limit, expired) and is now
+			// off-book — the relay validates a submit ASYNC and reports rejection here, not as a write
+			// error. Re-post it (rate-limited, so a persistent-error loop can't storm the relay) so we
+			// don't sit silently unliftable on a still-open connection.
+			repost(conn, "after relay error")
 		}
 	}
 }

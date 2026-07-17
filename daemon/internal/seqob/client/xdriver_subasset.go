@@ -264,7 +264,17 @@ func ProportionalBtc(wholeBtc, takeAsset, wholeAsset uint64) uint64 {
 	if wholeAsset == 0 || takeAsset >= wholeAsset {
 		return wholeBtc
 	}
-	return (wholeBtc*takeAsset + wholeAsset - 1) / wholeAsset
+	// ceil(wholeBtc*takeAsset / wholeAsset) with a 128-bit product. A bare uint64 multiply overflows
+	// for realistic sizes (e.g. 1e8 sats * 2.1e15 atoms = 2.1e23 >> 2^64), silently returning a tiny
+	// price — which, since taker and maker agree on the same wrapped value, would let a partial taker
+	// pay a few sats for a large asset slice. mulDiv64 does the multiply in 128 bits (see proRata); the
+	// early return guarantees takeAsset < wholeAsset, so the quotient is < wholeBtc and bits.Div64 never
+	// overflows. rem!=0 rounds up so a partial never underpays.
+	q, rem := mulDiv64(wholeBtc, takeAsset, wholeAsset)
+	if rem != 0 {
+		q++
+	}
+	return q
 }
 
 func (p *MakerSubAssetParams) logf(f string, a ...interface{}) {
