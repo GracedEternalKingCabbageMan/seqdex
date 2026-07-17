@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -26,6 +27,13 @@ type wsConn struct {
 	makerPubkey string
 }
 
+// writeWait bounds a single WS write. Without it, a maker whose OS receive buffer is full
+// blocks WriteMessage forever while holding writeMu — and because routeMatches/notifyMaker
+// call another maker's send() synchronously from the SUBMITTER's read loop, one slow maker
+// could wedge a submitter (head-of-line blocking). A deadline turns that into a fast error
+// the caller cleans up instead of a silent hang.
+const writeWait = 10 * time.Second
+
 func (c *wsConn) send(from *seqobv1.From) error {
 	b, err := jsonMarshal.Marshal(from)
 	if err != nil {
@@ -33,6 +41,7 @@ func (c *wsConn) send(from *seqobv1.From) error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return c.conn.WriteMessage(websocket.TextMessage, b)
 }
 
@@ -93,6 +102,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
+			// Log the concrete close/read error (previously swallowed). A WS-drop storm is
+			// undiagnosable without this — it distinguishes a stale-binary protocol EOF from a
+			// write-deadline timeout, a peer close, or a genuine network error.
+			if s.log != nil {
+				c.mu.Lock()
+				mp := c.makerPubkey
+				c.mu.Unlock()
+				s.log.Printf("ws closed (maker %.16s): %v", mp, err)
+			}
 			return
 		}
 		var to seqobv1.To

@@ -886,6 +886,18 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				fmt.Println("offer filled and no lift in flight; exiting (restart to re-quote)")
 				return
 			}
+			// The relay EVICTS a maker's offers when its WS drops (an offline maker can't
+			// co-sign — ws.go closeConn -> RemoveByMaker), so on reconnect we must re-post.
+			// Refresh the offer's created/expiry window + re-sign FIRST: otherwise the relay
+			// rejects the stale copy as "invalid offer: offer already expired" and the offer
+			// never comes back — the cross book stays empty until a manual fleet restart (the
+			// fragility a relay restart exposes). Refreshing revives an expired offer and is a
+			// harmless expiry-extension for a still-valid one.
+			if resubmit != nil {
+				if e := refreshOfferForRequote(resubmit, cfg.expiry, cfg.makerKey); e != nil {
+					fmt.Printf("reconnect: re-sign offer failed: %v (relay may reject re-post)\n", e)
+				}
+			}
 			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue on-chain)\n", err)
 			ws.redialLoop(wsURL, resubmit)
 			continue
