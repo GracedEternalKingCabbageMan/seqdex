@@ -23,6 +23,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -195,7 +196,7 @@ func (s *Server) handleMarkets(w http.ResponseWriter, r *http.Request) {
 	writeProto(w, &seqobv1.MarketList{Markets: s.store.Markets()})
 }
 
-// handleOrderbook serves /v1/market/{base}/{quote}/orderbook.
+// handleOrderbook serves /v1/market/{base}/{quote}/{orderbook|trades|candles}.
 func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		httpErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -203,16 +204,95 @@ func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/market/")
 	parts := strings.Split(rest, "/")
-	if len(parts) != 3 || parts[2] != "orderbook" || parts[0] == "" || parts[1] == "" {
-		httpErr(w, http.StatusNotFound, "expected /v1/market/{base}/{quote}/orderbook")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		httpErr(w, http.StatusNotFound, "expected /v1/market/{base}/{quote}/{orderbook|trades|candles}")
 		return
 	}
 	pair := &seqobv1.AssetPair{BaseAsset: parts[0], QuoteAsset: parts[1]}
-	// ?confidential=1 serves the separate BLINDED book for this pair; the default
-	// (absent/0) serves the existing transparent book unchanged, so the live
-	// unblinded DEX is byte-for-byte untouched.
-	confidential := isTruthy(r.URL.Query().Get("confidential"))
-	writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.store.SnapshotPair(pair, confidential)})
+	switch parts[2] {
+	case "orderbook":
+		// ?confidential=1 serves the separate BLINDED book for this pair; the default
+		// (absent/0) serves the existing transparent book unchanged, so the live
+		// unblinded DEX is byte-for-byte untouched.
+		confidential := isTruthy(r.URL.Query().Get("confidential"))
+		writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.store.SnapshotPair(pair, confidential)})
+	case "trades":
+		s.handleTrades(w, r, pair)
+	case "candles":
+		s.handleCandles(w, r, pair)
+	default:
+		httpErr(w, http.StatusNotFound, "expected /v1/market/{base}/{quote}/{orderbook|trades|candles}")
+	}
+}
+
+// handleTrades serves the recent-cross feed: GET /v1/market/{base}/{quote}/trades?limit=N.
+// JSON (not proto — this is metadata the wallet renders, and there is no Trade proto).
+func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request, pair *seqobv1.AssetPair) {
+	limit := 100
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= 1000 {
+		limit = v
+	}
+	type tradeJSON struct {
+		Ts    int64   `json:"ts"`    // unix seconds
+		Price float64 `json:"price"` // quote per base
+		Size  uint64  `json:"size"`  // base atoms
+	}
+	trades := s.store.TradesFor(pair, limit)
+	out := make([]tradeJSON, 0, len(trades))
+	for _, t := range trades {
+		out = append(out, tradeJSON{Ts: t.TS.Unix(), Price: t.Price, Size: t.Size})
+	}
+	writeJSON(w, map[string]interface{}{"base": pair.BaseAsset, "quote": pair.QuoteAsset, "trades": out})
+}
+
+// handleCandles serves OHLCV bucketed from the trades: GET
+// /v1/market/{base}/{quote}/candles?interval=<seconds>&limit=N. Buckets align to the epoch.
+func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request, pair *seqobv1.AssetPair) {
+	interval := int64(3600) // 1h default
+	if v, err := strconv.ParseInt(r.URL.Query().Get("interval"), 10, 64); err == nil && v >= 60 && v <= 86400*7 {
+		interval = v
+	}
+	limit := 168 // ~1 week of hourly
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= 1000 {
+		limit = v
+	}
+	type candle struct {
+		T int64   `json:"t"` // bucket start, unix seconds
+		O float64 `json:"o"`
+		H float64 `json:"h"`
+		L float64 `json:"l"`
+		C float64 `json:"c"`
+		V uint64  `json:"v"` // base volume
+	}
+	trades := s.store.TradesFor(pair, 0) // all held; bucket then trim
+	buckets := make(map[int64]*candle)
+	order := make([]int64, 0)
+	for _, t := range trades {
+		b := (t.TS.Unix() / interval) * interval
+		c := buckets[b]
+		if c == nil {
+			c = &candle{T: b, O: t.Price, H: t.Price, L: t.Price, C: t.Price}
+			buckets[b] = c
+			order = append(order, b)
+		}
+		if t.Price > c.H {
+			c.H = t.Price
+		}
+		if t.Price < c.L {
+			c.L = t.Price
+		}
+		c.C = t.Price
+		c.V += t.Size
+	}
+	// order is already ascending (trades are newest-last, buckets non-decreasing).
+	out := make([]*candle, 0, len(order))
+	for _, b := range order {
+		out = append(out, buckets[b])
+	}
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	writeJSON(w, map[string]interface{}{"base": pair.BaseAsset, "quote": pair.QuoteAsset, "interval": interval, "candles": out})
 }
 
 func (s *Server) handleLift(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +377,17 @@ func readProto(r *http.Request, m proto.Message) error {
 
 func writeProto(w http.ResponseWriter, m proto.Message) {
 	b, err := jsonMarshal.Marshal(m)
+	if err != nil {
+		httpErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
+}
+
+// writeJSON emits a plain JSON body (for the trades/candles metadata endpoints, which have no proto).
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	b, err := json.Marshal(v)
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, err.Error())
 		return

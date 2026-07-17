@@ -38,6 +38,17 @@ type Entry struct {
 	CreatedAt    time.Time
 }
 
+// Trade is one recorded cross, captured at MATCH time (SideSwap-style): the relay's
+// matcher produced a fill at this price/size. Feeds last_price, the trades feed, and
+// candles. Price is quote-per-base, the same convention as displayPrice / best_bid|ask.
+type Trade struct {
+	TS    time.Time
+	Price float64 // quote per base (matches best_bid/best_ask units)
+	Size  uint64  // base atoms filled
+}
+
+const maxTradesPerPair = 1000 // ring cap per market; oldest dropped
+
 // EventType is the kind of book delta.
 type EventType int
 
@@ -74,6 +85,48 @@ type Store struct {
 	cancelNonce map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
 	subBuf      int
 	now         func() time.Time
+	trades      map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
+}
+
+// RecordTrade appends one executed cross for the resting offer's pair at its execution
+// price (displayPrice of the resting order). Called by the matcher when a fill is produced.
+// Best-effort + non-blocking: bad inputs are ignored, never an error on the match path.
+func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
+	if restingOffer == nil || sizeBase == 0 {
+		return
+	}
+	price, _ := displayPrice(restingOffer)
+	pair := restingOffer.GetPair()
+	if price <= 0 || pair == nil {
+		return
+	}
+	pk := pairKey(pair)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.trades == nil {
+		s.trades = make(map[string][]Trade)
+	}
+	t := append(s.trades[pk], Trade{TS: s.now(), Price: price, Size: sizeBase})
+	if len(t) > maxTradesPerPair {
+		t = t[len(t)-maxTradesPerPair:]
+	}
+	s.trades[pk] = t
+}
+
+// TradesFor returns the most recent trades for a pair (up to limit; 0 = all held), newest last.
+func (s *Store) TradesFor(pair *seqobv1.AssetPair, limit int) []Trade {
+	if pair == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := s.trades[pairKey(pair)]
+	if limit > 0 && len(t) > limit {
+		t = t[len(t)-limit:]
+	}
+	out := make([]Trade, len(t))
+	copy(out, t)
+	return out
 }
 
 // New returns an empty store. If now is nil, time.Now is used.
@@ -320,12 +373,16 @@ func (s *Store) Markets() []*seqobv1.Market {
 				}
 			}
 		}
-		_ = pk
+		var last float64
+		if t := s.trades[pk]; len(t) > 0 {
+			last = t[len(t)-1].Price // newest recorded cross
+		}
 		out = append(out, &seqobv1.Market{
-			Pair:    pair,
-			BestBid: bestBid,
-			BestAsk: bestAsk,
-			NOrders: n,
+			Pair:      pair,
+			BestBid:   bestBid,
+			BestAsk:   bestAsk,
+			LastPrice: last,
+			NOrders:   n,
 		})
 	}
 	return out
