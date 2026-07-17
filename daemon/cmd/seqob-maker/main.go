@@ -244,27 +244,58 @@ func main() {
 	}
 	defer conn.Close()
 
-	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}})
+	if err := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); err != nil {
+		fatal("post offer: %v", err)
+	}
 	fmt.Printf("seqob-maker up: posted %s offer %s by maker %s\n", *side, o.GetOfferId(), makerPubHex)
 	fmt.Printf("  pair %s/%s  give %d %s  want %d %s  confidential=%v  fee-rate=%d msat/vB\n",
 		o.GetPair().GetBaseAsset(), o.GetPair().GetQuoteAsset(), o.GetOfferAmount(), o.GetOfferAsset(), o.GetWantAmount(), o.GetWantAsset(), *confidential, *msats)
 	fmt.Printf("  taker lifts with: -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), makerPubHex)
 
-	serve(conn, maker, makerKey)
+	serve(conn, maker, makerKey, wsURL, *expiry)
 }
 
 // serve is the maker's single-goroutine event loop: derive a per-lift E2E key on
 // lift_requested, then on the taker's couriered SwapRequest run the responder and
 // courier back the SwapAccept. A later swap_msg for the same session is the
 // taker's SwapComplete (the swap settled).
-func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey) {
+func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey, wsURL string, expiry time.Duration) {
 	crypters := make(map[string]*client.Crypter)
 	accepted := make(map[string]bool)
+	o := maker.Offer
+	// Reconnect + re-post the SAME offer_id (with a refreshed created/expiry window + re-sign) on any
+	// WS failure, instead of exiting. Exiting lets the supervisor restart us, which mints a NEW
+	// offer_id — so a taker who lifted the old id then races a replaced offer and gets "no maker
+	// co-sign received". Keeping the offer_id stable across reconnects (the resilience the cross maker
+	// has) is what makes interactive same-chain lifts reliable. In-flight relay sessions are lost on a
+	// reconnect, but the maker stays live + reachable for new lifts (re-registered by the re-post).
+	redial := func(old *websocket.Conn) *websocket.Conn {
+		old.Close()
+		if e := refreshOfferForRequote(o, expiry, makerKey); e != nil {
+			fmt.Printf("reconnect: re-sign offer failed: %v\n", e)
+		}
+		for {
+			nc, _, de := websocket.DefaultDialer.Dial(wsURL, nil)
+			if de != nil {
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			if we := writeWS(nc, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); we != nil {
+				nc.Close()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			fmt.Println("relay reconnected; re-posted fresh offer (same offer_id)")
+			return nc
+		}
+	}
 	for {
 		var from seqobv1.From
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			fatal("ws read: %v", err)
+			fmt.Printf("ws read: %v; reconnecting + re-posting\n", err)
+			conn = redial(conn)
+			continue
 		}
 		if err := jsonUnmarshal.Unmarshal(data, &from); err != nil {
 			continue
@@ -298,7 +329,11 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				fmt.Printf("session %s: complete swap failed: %v\n", sid, err)
 				continue
 			}
-			writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealedAccept}}})
+			if we := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealedAccept}}}); we != nil {
+				fmt.Printf("session %s: co-sign write failed: %v; reconnecting\n", sid, we)
+				conn = redial(conn)
+				continue
+			}
 			accepted[sid] = true
 			fmt.Printf("session %s: couriered SwapAccept (%d bytes); awaiting taker broadcast\n", sid, len(sealedAccept))
 
@@ -691,16 +726,16 @@ func loadOrGenKey(hexKey string) *btcec.PrivateKey {
 // own goroutines and gorilla/websocket allows only one concurrent writer.
 var wsWriteMu sync.Mutex
 
-func writeWS(c *websocket.Conn, to *seqobv1.To) {
+// writeWS returns the write error (rather than exiting) so the same-chain serve loop can reconnect
+// and re-post instead of dying — dying would let the supervisor restart us, which churns the offer_id.
+func writeWS(c *websocket.Conn, to *seqobv1.To) error {
 	b, err := jsonMarshal.Marshal(to)
 	if err != nil {
-		fatal("marshal To: %v", err)
+		return err
 	}
 	wsWriteMu.Lock()
 	defer wsWriteMu.Unlock()
-	if err := c.WriteMessage(websocket.TextMessage, b); err != nil {
-		fatal("ws write: %v", err)
-	}
+	return c.WriteMessage(websocket.TextMessage, b)
 }
 
 // --- Cross-chain (BTC<->asset) maker -----------------------------------------
