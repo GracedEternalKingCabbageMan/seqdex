@@ -48,6 +48,7 @@ type Book interface {
 	SnapshotPairEntries(p *seqobv1.AssetPair, confidential bool) []offerstore.Entry
 	Get(k offerstore.Key) (*offerstore.Entry, bool)
 	ApplyPartialFill(k offerstore.Key, filledBase uint64, settleTxid string, anchorConfs uint32) error
+	RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64)
 }
 
 // Match is one crossing of an incoming order against a resting order.
@@ -236,6 +237,8 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 		// Apply to the resting order and to the incoming order.
 		_ = m.book.ApplyPartialFill(p.key, p.fillBase, "", 0)
 		_ = m.book.ApplyPartialFill(inKey, p.fillBase, "", 0)
+		// Record the cross for last_price / trades / candles (execution price = resting order's price).
+		m.book.RecordTrade(p.e.Offer, p.fillBase)
 
 		mt := Match{
 			Pair:        incoming.GetPair(),
