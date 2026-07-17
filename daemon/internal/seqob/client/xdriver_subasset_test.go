@@ -294,6 +294,121 @@ func TestSubAssetHandshake(t *testing.T) {
 	}
 }
 
+// TestSubAssetPartialFill (T8): the taker takes HALF the offer, locking the
+// proportional BTC; the maker pays exactly the requested slice and reports the fill
+// (so its serve loop can re-rest the remainder). The whole-offer path is unchanged.
+func TestSubAssetPartialFill(t *testing.T) {
+	st := &subasState{btcTip: 100}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const offerAsset = uint64(100_000) // the WHOLE offer
+	const offerBtc = uint64(200_000)
+	const takeAsset = uint64(50_000)  // take half
+	const takeBtc = uint64(100_000)   // proportionalBtc(200_000, 50_000, 100_000)
+	const tBtc = uint32(200)
+
+	if got := ProportionalBtc(offerBtc, takeAsset, offerAsset); got != takeBtc {
+		t.Fatalf("proportional BTC = %d, want %d", got, takeBtc)
+	}
+
+	var makerRes *MakerSubAssetResult
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, makerErr = RunMakerSubAsset(MakerSubAssetParams{
+			NewMakerOps:   func(hashH []byte) SubAssetMakerOps { return &fakeSubAsMakerOps{st: st} },
+			AssetLNNodeID: "02fakenode",
+			Crypter:       mc,
+			BtcAmount:     offerBtc,   // the maker advertises the WHOLE offer
+			AssetAmount:   offerAsset,
+			BtcLocktime:   tBtc,
+			MinBTCConf:    1,
+			HoldTimeout:   3 * time.Second,
+			Timing:        XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerSubAsset(TakerSubAssetParams{
+		Ops:         &fakeSubAsTakerOps{st: st},
+		Crypter:     tc,
+		BtcAmount:   takeBtc,   // the taker locks the PROPORTIONAL BTC for its slice
+		AssetAmount: takeAsset,
+		MinBTCConf:  1,
+		Timing:      XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if makerErr != nil {
+		t.Fatalf("maker: %v", makerErr)
+	}
+	if !makerRes.Settled {
+		t.Fatalf("maker not settled: %+v", makerRes)
+	}
+	if makerRes.FilledAsset != takeAsset || makerRes.FilledBtc != takeBtc {
+		t.Fatalf("fill = %d asset / %d btc, want %d / %d", makerRes.FilledAsset, makerRes.FilledBtc, takeAsset, takeBtc)
+	}
+	if !takerRes.Received {
+		t.Fatalf("taker did not receive the asset: %+v", takerRes)
+	}
+	// The BTC HTLC the taker locked (and the maker verified/claimed) was the partial amount.
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.btcAmount != takeBtc {
+		t.Fatalf("BTC leg locked %d, want the proportional %d", st.btcAmount, takeBtc)
+	}
+}
+
+// TestSubAssetPartialRejectsWrongBtc (T8): a taker that asks for a partial slice but
+// locks a NON-proportional BTC amount is refused by the maker before it pays.
+func TestSubAssetPartialRejectsWrongBtc(t *testing.T) {
+	st := &subasState{btcTip: 100}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+	const offerAsset, offerBtc = uint64(100_000), uint64(200_000)
+	const takeAsset = uint64(50_000)
+	const tBtc = uint32(200)
+
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, makerErr = RunMakerSubAsset(MakerSubAssetParams{
+			NewMakerOps:   func(hashH []byte) SubAssetMakerOps { return &fakeSubAsMakerOps{st: st} },
+			AssetLNNodeID: "02fakenode", Crypter: mc,
+			BtcAmount: offerBtc, AssetAmount: offerAsset, BtcLocktime: tBtc, MinBTCConf: 1,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	// The taker requests half the asset but only locks HALF of the proportional BTC. Its own
+	// pre-fund terms check rejects it first, so nothing is funded (its BtcAmount disagrees with
+	// the proportional price it must pay). We assert the taker aborts before any BTC lock.
+	_, takerErr := RunTakerSubAsset(TakerSubAssetParams{
+		Ops: &fakeSubAsTakerOps{st: st}, Crypter: tc,
+		BtcAmount: uint64(50_000), // WRONG: proportional would be 100_000
+		AssetAmount: takeAsset, MinBTCConf: 1,
+		Timing: XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	_ = makerErr
+	wg.Wait()
+	if takerErr == nil {
+		t.Fatal("taker accepted a non-proportional BTC amount for a partial take")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.btcTxid != "" {
+		t.Fatal("BTC HTLC was funded despite the amount mismatch")
+	}
+}
+
 // TestSubAssetTakerRejectsBadAmount: the taker refuses terms whose BTC amount does
 // not match the signed offer, before funding anything on-chain.
 func TestSubAssetTakerRejectsBadAmount(t *testing.T) {

@@ -88,6 +88,7 @@ func cmdXSubAs(args []string) {
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations to wait on our own BTC leg before announcing")
+	takeAmount := fs.Uint64("amount", 0, "T8 PARTIAL FILL: asset atoms to take (<= the offer). 0 = the whole offer. The BTC you lock is the proportional price, rounded up; the maker re-rests the remainder.")
 	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
 	extBolt11 := fs.String("asset-bolt11", "", "DEVICE-PREIMAGE mode: an asset invoice created OUT-OF-BAND by the device (the wallet) on its own hosted node with the device's OWN preimage. When set (with -payment-hash), this taker NEVER mints/settles the preimage: it funds the BTC HTLC on H, forwards this bolt11 to the maker, and waits for it to be PAID (the device settles). Non-custodial receive.")
 	extHashHex := fs.String("payment-hash", "", "DEVICE-PREIMAGE / DEVICE-HODL mode: the payment_hash H (hex). H = SHA256(device preimage).")
@@ -184,10 +185,20 @@ func cmdXSubAs(args []string) {
 		fatal("no verified sub-asset offer found to buy %s with on-chain BTC (use `seqob-cli book -base %s -quote BTC`)", *asset, *asset)
 	}
 
-	assetAtoms := target.GetOfferAmount() // the asset the maker gives over LN
+	wholeAsset := target.GetOfferAmount() // the asset the maker gives over LN (the whole offer)
+	assetAtoms := wholeAsset              // default: take the whole offer
 	btcSats := target.GetWantAmount()     // the BTC sats the taker locks on-chain
-	fmt.Printf("taking sub-asset offer %s by %s: pay %d BTC sats ON-CHAIN, receive %d %s OVER LIGHTNING\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), btcSats, assetAtoms, *asset)
+	// T8 partial fill: take a slice and lock the PROPORTIONAL BTC (rounded up so we never
+	// underpay; the maker requires the same and re-rests the remainder).
+	if *takeAmount > 0 && *takeAmount < wholeAsset {
+		assetAtoms = *takeAmount
+		btcSats = client.ProportionalBtc(target.GetWantAmount(), assetAtoms, wholeAsset)
+	} else if *takeAmount > wholeAsset {
+		fatal("-amount %d exceeds the offer's %d %s", *takeAmount, wholeAsset, *asset)
+	}
+	fmt.Printf("taking sub-asset offer %s by %s: pay %d BTC sats ON-CHAIN, receive %d %s OVER LIGHTNING%s\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), btcSats, assetAtoms, *asset,
+		func() string { if assetAtoms < wholeAsset { return fmt.Sprintf(" (PARTIAL of %d)", wholeAsset) }; return "" }())
 
 	// 2. Wire bitcoind (BTC leg) + the asset LN node (asset leg). Validate both.
 	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
@@ -250,7 +261,7 @@ func cmdXSubAs(args []string) {
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId:            target.GetOfferId(),
 		MakerPubkey:        target.GetMakerPubkey(),
-		TakeAmount:         target.GetBaseAmount(), // whole-swap
+		TakeAmount:         assetAtoms, // T8: the slice we're taking (== base_amount for a whole lift)
 		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
 	}}})
 	la := readWS(conn)
