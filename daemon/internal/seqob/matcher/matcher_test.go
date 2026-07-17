@@ -99,6 +99,43 @@ func TestCrossFullFill(t *testing.T) {
 	_ = mk
 }
 
+// T1: a cross records a trade at the resting order's price, feeding TradesFor + Markets().LastPrice.
+func TestCrossRecordsTrade(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true)) // resting ask 0.45 (45/100)
+	// A higher ask that does NOT cross (0.60 > 0.50 bid) — leaves the pair in the book after s1
+	// fully fills, so Markets() still reports it (in production the deep-seed ladder always does).
+	mustSubmit(t, s, sell(t, mk, "s2", 50, 30, true)) // ask 0.60
+	in := buy(t, tk, "b1", 100, 50, true)
+	mustSubmit(t, s, in)
+	if got := m.Cross(in); len(got) != 1 {
+		t.Fatalf("want 1 match, got %d", len(got))
+	}
+	pair := &seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}
+	trades := s.TradesFor(pair, 0)
+	if len(trades) != 1 {
+		t.Fatalf("want 1 recorded trade, got %d", len(trades))
+	}
+	if trades[0].Price != 0.45 {
+		t.Fatalf("trade price = %v, want 0.45 (resting ask)", trades[0].Price)
+	}
+	if trades[0].Size != 100 {
+		t.Fatalf("trade size = %d, want 100 (filled base)", trades[0].Size)
+	}
+	// Markets().LastPrice picks up the newest cross.
+	var last float64
+	for _, mk2 := range s.Markets() {
+		if mk2.GetPair().GetBaseAsset() == assetA && mk2.GetPair().GetQuoteAsset() == assetB {
+			last = mk2.GetLastPrice()
+		}
+	}
+	if last != 0.45 {
+		t.Fatalf("Markets().LastPrice = %v, want 0.45", last)
+	}
+}
+
 func TestNonCrossingLeavesResting(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
