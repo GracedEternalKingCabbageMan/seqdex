@@ -249,6 +249,22 @@ type MakerSubAssetResult struct {
 	Preimage     []byte
 	BtcClaimTxid string
 	Settled      bool
+	// Partial fills (T8): the asset atoms + BTC sats this lift ACTUALLY took (<= the
+	// offer). For a whole-offer lift these equal the offer amounts; the maker's serve
+	// loop re-rests the remainder (offer - filled) when they are smaller.
+	FilledAsset uint64
+	FilledBtc   uint64
+}
+
+// ProportionalBtc is the BTC (sats) owed for taking `takeAsset` atoms out of an offer
+// of `wholeAsset` atoms priced at `wholeBtc` sats. Rounded UP so a partial taker never
+// underpays the maker's price (a sub-atom rounding always favors the maker). Both the
+// taker (what to lock) and the maker (what to require) compute it identically.
+func ProportionalBtc(wholeBtc, takeAsset, wholeAsset uint64) uint64 {
+	if wholeAsset == 0 || takeAsset >= wholeAsset {
+		return wholeBtc
+	}
+	return (wholeBtc*takeAsset + wholeAsset - 1) / wholeAsset
 }
 
 func (p *MakerSubAssetParams) logf(f string, a ...interface{}) {
@@ -337,6 +353,20 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		return res, fmt.Errorf("subasset maker: bad btc redeem_script hex: %w", err)
 	}
 
+	// Partial fills (T8): the taker MAY take less than the whole offer. funded.SeqAmount
+	// carries how much asset it wants (0 = whole, for back-compat with older takers). The
+	// BTC leg it funds must be the PROPORTIONAL amount at the offer's price; we pay exactly
+	// what it asked, and the serve loop re-rests the remainder.
+	takeAsset := funded.SeqAmount
+	if takeAsset == 0 {
+		takeAsset = p.AssetAmount
+	}
+	if takeAsset > p.AssetAmount {
+		sendXcFail(p.Crypter, send, "amount_too_large", "requested more asset than the offer")
+		return res, fmt.Errorf("subasset maker: take %d > offer %d", takeAsset, p.AssetAmount)
+	}
+	wantBtc := ProportionalBtc(p.BtcAmount, takeAsset, p.AssetAmount)
+
 	// Now that the taker's H is known, bind the settlement engine: the BTC-leg
 	// swap embeds H so VerifyBTCLeg/ClaimBTCLeg recompute and match it.
 	ops := p.NewMakerOps(hashH)
@@ -369,9 +399,9 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		p.logf("subasset maker: BTC leg %s not yet verifiable, retrying: %v", funded.Leg.Txid, err)
 		time.Sleep(p.Timing.Poll)
 	}
-	if funded.Leg.Amount != p.BtcAmount {
-		sendXcFail(p.Crypter, send, "amount_mismatch", "btc leg amount != quote")
-		return res, fmt.Errorf("subasset maker: btc leg %d != quote %d", funded.Leg.Amount, p.BtcAmount)
+	if funded.Leg.Amount != wantBtc {
+		sendXcFail(p.Crypter, send, "amount_mismatch", "btc leg amount != proportional quote")
+		return res, fmt.Errorf("subasset maker: btc leg %d != required %d (take %d of %d)", funded.Leg.Amount, wantBtc, takeAsset, p.AssetAmount)
 	}
 
 	// 4. Claim-window guard: never pay the asset unless T_btc is far enough out to
@@ -403,10 +433,10 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	//    a taker that never settles simply times it out (nothing delivered).
 	var preimage []byte
 	if hodl {
-		p.logf("subasset maker: paying the asset by bare hash to taker node %s (HODL; device settles, no bolt11)", funded.TakerLNNodeID)
-		preimage, err = ops.PayAssetHashHold(funded.TakerLNNodeID, hashH, p.AssetAmount*1000)
+		p.logf("subasset maker: paying %d asset atoms by bare hash to taker node %s (HODL; device settles, no bolt11)", takeAsset, funded.TakerLNNodeID)
+		preimage, err = ops.PayAssetHashHold(funded.TakerLNNodeID, hashH, takeAsset*1000)
 	} else {
-		preimage, err = ops.PayAssetHold(funded.Bolt11, hashH, p.AssetAmount*1000)
+		preimage, err = ops.PayAssetHold(funded.Bolt11, hashH, takeAsset*1000)
 	}
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_asset", err.Error())
@@ -424,7 +454,7 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	if err := ops.InjectSecret(preimage); err != nil {
 		return res, fmt.Errorf("subasset maker: inject secret (RETRYABLE, maker holds P): %w", err)
 	}
-	claimTxid, err := ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
+	claimTxid, err := ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, wantBtc))
 	if err != nil {
 		// We hold P; this is retryable out of band (the leg is confirmed and ours
 		// to claim until T_btc). Surface it, but the value is recoverable.
@@ -432,6 +462,8 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	}
 	res.BtcClaimTxid = claimTxid
 	res.Settled = true
+	res.FilledAsset = takeAsset
+	res.FilledBtc = wantBtc
 	_ = sendXc(&XcMsg{Type: XcSubAsSettled, Preimage: hex.EncodeToString(preimage), SettleTxid: claimTxid}, p.Crypter, send)
 	p.logf("subasset maker: SETTLED; claimed BTC HTLC in %s", claimTxid)
 	return res, nil
@@ -561,11 +593,20 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 	if terms.BtcLocktime == 0 {
 		return res, fmt.Errorf("%w: terms carried no T_btc", ErrXcBadTerms)
 	}
-	if terms.BtcAmount != 0 && terms.BtcAmount != p.BtcAmount {
+	// Partial fills (T8): the maker advertises the WHOLE offer in terms; we may take a
+	// smaller p.AssetAmount. Never over-ask, and our BTC leg must be EXACTLY the proportional
+	// price of what we take (the maker requires the same value, rounded up, so a mismatch is
+	// rejected before anything is funded). A whole-offer lift reduces to the old exact match.
+	if terms.SeqAmount != 0 {
+		if p.AssetAmount > terms.SeqAmount {
+			return res, fmt.Errorf("%w: asked %d asset but the offer is only %d", ErrXcBadTerms, p.AssetAmount, terms.SeqAmount)
+		}
+		wantBtc := ProportionalBtc(terms.BtcAmount, p.AssetAmount, terms.SeqAmount)
+		if terms.BtcAmount != 0 && p.BtcAmount != wantBtc {
+			return res, fmt.Errorf("%w: BTC %d != proportional %d for taking %d of %d", ErrXcBadTerms, p.BtcAmount, wantBtc, p.AssetAmount, terms.SeqAmount)
+		}
+	} else if terms.BtcAmount != 0 && terms.BtcAmount != p.BtcAmount {
 		return res, fmt.Errorf("%w: maker BTC amount %d != expected %d", ErrXcBadTerms, terms.BtcAmount, p.BtcAmount)
-	}
-	if terms.SeqAmount != 0 && terms.SeqAmount != p.AssetAmount {
-		return res, fmt.Errorf("%w: maker asset amount %d != expected %d", ErrXcBadTerms, terms.SeqAmount, p.AssetAmount)
 	}
 	// Refuse a T_btc that leaves no time to confirm our funding before it matures.
 	tip, err := p.Ops.BtcTip()
@@ -662,6 +703,8 @@ func RunTakerSubAsset(p TakerSubAssetParams, send XcSend, recv XcRecv) (*TakerSu
 		Type:              XcSubAsBtcFunded,
 		HashH:             hex.EncodeToString(hashH),
 		TakerBtcRefundPub: hex.EncodeToString(announceRefundPub),
+		SeqAmount:         p.AssetAmount, // T8: how much of the offer we're taking (maker pays exactly this)
+		BtcAmount:         p.BtcAmount,   // the proportional BTC we locked (== funded leg amount)
 		Leg: &XcLeg{
 			Txid:         btcLeg.Funded.TxID,
 			Vout:         btcLeg.Funded.Vout,

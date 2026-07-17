@@ -64,7 +64,7 @@ func buildSubAssetOffer(cfg subAssetMakerConfig, assetLnNodeID string) *seqobv1.
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
 		BaseAmount:        cfg.assetAmt,
-		AllowPartial:      false, // whole-swap lifts, one at a time
+		AllowPartial:      true, // T8: a taker may take a slice; the serve loop re-rests the remainder
 		CreatedAtUnix:     uint64(time.Now().Unix()),
 		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
 		FeeAssetHint:      cfg.feeAsset,
@@ -205,27 +205,44 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 
 			go func(sid string, in chan []byte) {
 				settled := false
+				var filledAsset, filledBtc uint64
 				defer func() {
-					// -requote: re-post a fresh quote while still holding the in-flight
-					// slot. Only the asset-LN leg has channel peers to reconnect (the BTC
-					// leg is on-chain), so reconnect the asset LN node before re-quoting.
-					if settled && cfg.requote {
-						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
-							if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {
-								fmt.Printf("requote: asset-LN peer reconnect: reconnected %d, err: %v\n", n, err)
-							} else if n > 0 {
-								fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
-							}
-						})
+					// Only the asset-LN leg has channel peers to reconnect (the BTC leg is
+					// on-chain), so reconnect the asset LN node before re-quoting.
+					reconnect := func() {
+						if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {
+							fmt.Printf("requote: asset-LN peer reconnect: reconnected %d, err: %v\n", n, err)
+						} else if n > 0 {
+							fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
+						}
+					}
+					// T8 partial fill: the taker took only part of the offer, so reduce it to the
+					// remainder and re-quote (there is more to sell, regardless of -requote);
+					// requoteAfterFill re-signs + re-posts the shrunk offer. A whole fill keeps the
+					// old behavior (-requote re-posts the whole; otherwise the offer is retired).
+					partial := settled && filledAsset > 0 && filledAsset < o.GetBaseAmount()
+					if partial {
+						o.BaseAmount -= filledAsset
+						o.OfferAmount -= filledAsset
+						if filledBtc <= o.WantAmount {
+							o.WantAmount -= filledBtc
+						} else {
+							o.WantAmount = 0
+						}
+						fmt.Printf("session %s: PARTIAL fill (%d asset, %d sats); re-resting the remainder %d %s\n",
+							sid, filledAsset, filledBtc, o.GetBaseAmount(), o.GetOfferAsset())
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
+					} else if settled && cfg.requote {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
 					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						filled = true
 					}
 					mu.Unlock()
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 				}()
@@ -270,8 +287,9 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					return
 				}
 				settled = res.Settled
-				fmt.Printf("session %s: SUB-ASSET SWAP SETTLED: paid the asset over LN, claimed BTC on-chain in %s\n",
-					sid, res.BtcClaimTxid)
+				filledAsset, filledBtc = res.FilledAsset, res.FilledBtc
+				fmt.Printf("session %s: SUB-ASSET SWAP SETTLED: paid %d asset over LN, claimed %d sats BTC on-chain in %s\n",
+					sid, res.FilledAsset, res.FilledBtc, res.BtcClaimTxid)
 			}(sid, in)
 
 		case from.GetSwapMsg() != nil:
