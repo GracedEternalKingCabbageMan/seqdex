@@ -3,6 +3,11 @@
 *.test
 *.out
 
+# Accidental cmd binaries built from daemon/ without -o (source lives in daemon/cmd/<name>/)
+/daemon/seqob*
+/daemon/compaged
+/daemon/oceand
+
 # Go workspace (kept local; not committed until the daemon/wallet modules land)
 go.work
 go.work.sum
