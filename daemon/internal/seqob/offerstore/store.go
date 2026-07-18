@@ -117,7 +117,6 @@ func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
 	pk := pairKey(pair)
 	ts := s.now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.trades == nil {
 		s.trades = make(map[string][]Trade)
 	}
@@ -126,10 +125,14 @@ func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
 		t = t[len(t)-maxTradesPerPair:]
 	}
 	s.trades[pk] = t
-	// Durably append (best-effort): a log write must never break the match/settle path.
-	if s.tradeLog != nil {
+	logf := s.tradeLog
+	s.mu.Unlock()
+	// Durably append AFTER releasing the lock (B-4): a slow/networked disk must never serialize the whole
+	// book behind the trade-log write on the match/settle hot path. os.File appends (O_APPEND) are atomic
+	// and Write is goroutine-safe, so concurrent appends are fine. Best-effort — a log error never breaks.
+	if logf != nil {
 		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, Price: price, Size: sizeBase}); err == nil {
-			_, _ = s.tradeLog.Write(append(b, '\n'))
+			_, _ = logf.Write(append(b, '\n'))
 		}
 	}
 }
@@ -143,21 +146,30 @@ func (s *Store) EnableTradeLog(path string) error {
 		if s.trades == nil {
 			s.trades = make(map[string][]Trade)
 		}
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		for sc.Scan() {
-			var r tradeRec
-			if json.Unmarshal(sc.Bytes(), &r) != nil || r.PK == "" || r.Price <= 0 || r.Size == 0 {
-				continue
+		// bufio.Reader (not Scanner): a single over-long/corrupt line must not silently END the replay
+		// (Scanner returns false past its cap) — read line by line, skip a bad one, keep going (B-5).
+		rd := bufio.NewReaderSize(f, 1<<20)
+		for {
+			line, rerr := rd.ReadBytes('\n')
+			if len(line) > 0 {
+				var r tradeRec
+				if json.Unmarshal(line, &r) == nil && r.PK != "" && r.Price > 0 && r.Size != 0 {
+					t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size})
+					if len(t) > maxTradesPerPair {
+						t = t[len(t)-maxTradesPerPair:]
+					}
+					s.trades[r.PK] = t
+				}
 			}
-			t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size})
-			if len(t) > maxTradesPerPair {
-				t = t[len(t)-maxTradesPerPair:]
+			if rerr != nil {
+				break
 			}
-			s.trades[r.PK] = t
 		}
 		s.mu.Unlock()
 		_ = f.Close()
+		// Compact to just the retained tail (<= maxTradesPerPair per pair) so the log can't grow without
+		// bound and each restart's replay stays O(retained), not O(all history ever) (B-5).
+		s.compactTradeLog(path)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -167,6 +179,30 @@ func (s *Store) EnableTradeLog(path string) error {
 	s.tradeLog = f
 	s.mu.Unlock()
 	return nil
+}
+
+// compactTradeLog rewrites the log to exactly the retained in-memory trades (best-effort; startup only,
+// before any concurrent RecordTrade writer is armed).
+func (s *Store) compactTradeLog(path string) {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	for pk, ring := range s.trades {
+		for _, tr := range ring {
+			if b, mErr := json.Marshal(tradeRec{PK: pk, TS: tr.TS, Price: tr.Price, Size: tr.Size}); mErr == nil {
+				_, _ = f.Write(append(b, '\n'))
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if f.Close() == nil {
+		_ = os.Rename(tmp, path)
+	} else {
+		_ = os.Remove(tmp)
+	}
 }
 
 // TradesFor returns the most recent trades for a pair (up to limit; 0 = all held), newest last.
@@ -410,6 +446,9 @@ func (s *Store) Markets() []*seqobv1.Market {
 			e, ok := s.entries[k]
 			if !ok {
 				continue
+			}
+			if e.ActiveAmount == 0 {
+				continue // B-7: a held/zeroed entry isn't fillable — don't count it or advertise its price
 			}
 			if pair == nil {
 				pair = e.Offer.GetPair()
@@ -673,6 +712,7 @@ func (s *Store) ReconcileCovenantActive(k Key, active uint64) error {
 	changed := e.ActiveAmount != active || e.SettleTxid != ""
 	e.ActiveAmount = active
 	e.SettleTxid = ""
+	e.heldFill = 0 // B-8: clear any stale held-fill size so a later RemoveCovenantFilled uses the live active, not a stale hold
 	if active >= e.Offer.GetBaseAmount() {
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_OPEN
 	} else {
