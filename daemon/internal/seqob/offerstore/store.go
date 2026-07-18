@@ -472,6 +472,12 @@ func (s *Store) Markets() []*seqobv1.Market {
 		if t := s.trades[pk]; len(t) > 0 {
 			last = t[len(t)-1].Price // newest recorded cross
 		}
+		if pair == nil || n == 0 {
+			// Every entry in this pair is held/zeroed (ActiveAmount==0): there is no fillable
+			// market to advertise. Skip rather than emit a Market with a nil Pair (blank ticker
+			// + stale last price) that a UI renders as garbage.
+			continue
+		}
 		out = append(out, &seqobv1.Market{
 			Pair:      pair,
 			BestBid:   bestBid,

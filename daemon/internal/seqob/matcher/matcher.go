@@ -215,10 +215,17 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 			}
 		}
 
+		fq := fillQuote(e.Offer, fillBase)
+		if fq == 0 {
+			// fillBase > 0 but the quote came out 0: either a zero rate denominator or a
+			// quote that overflowed uint64 (fillQuote returns 0 for both). Emitting the Match
+			// anyway would advertise "0 quote owed" for real base, so skip this candidate.
+			continue
+		}
 		plan = append(plan, planned{
 			e: e, key: keyOf(e.Offer),
 			fillBase:  fillBase,
-			fillQuote: fillQuote(e.Offer, fillBase),
+			fillQuote: fq,
 		})
 		rem -= fillBase
 	}
