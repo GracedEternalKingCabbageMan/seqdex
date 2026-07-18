@@ -61,6 +61,24 @@ func buy(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, parti
 	return o
 }
 
+// covSell is a SELL like sell(), but settled by an on-chain covenant, so an auto-cross settles
+// deterministically (the taker builds the FILL spend) and the matcher DOES commit trade-truth for
+// it. The display price stays want/offer (quote/base); the covenant rate mirrors it. min_lot 1 so
+// any fill clears the floor.
+func covSell(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, partial bool) *seqobv1.Offer {
+	t.Helper()
+	o := sell(t, k, id, base, quote, partial)
+	o.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid: "cov" + id, CovenantVout: 0,
+		AssetA: assetA, AssetB: assetB, RateNum: quote, RateDen: base,
+		MinLot: 1, MakerProgVer: 1, ExpiryLocktime: 400,
+	}}
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
 func mustSubmit(t *testing.T, s *offerstore.Store, o *seqobv1.Offer) {
 	t.Helper()
 	if _, err := s.Submit(o); err != nil {
@@ -68,43 +86,49 @@ func mustSubmit(t *testing.T, s *offerstore.Store, o *seqobv1.Offer) {
 	}
 }
 
-func TestCrossFullFill(t *testing.T) {
+// An INTERACTIVE cross is PLANNED (the Match carries the fill size + price) but commits NO
+// trade-truth: interactive orders settle only via an explicit StartLift + the maker's SettleAck
+// (B-1), never from an auto-cross (whose session id is never registered, so any co-sign fails). So
+// the book stays untouched and no trade is recorded here — recording it was a phantom (B-2).
+func TestCrossInteractivePlansNoSettle(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
 	// Resting SELL: 100 A for 45 B (ask 0.45).
 	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true))
-	// Incoming BUY: 100 A for 50 B (bid 0.50 >= 0.45) -> crosses.
+	// Incoming BUY: 100 A for 50 B (bid 0.50 >= 0.45) -> crosses (planned).
 	in := buy(t, tk, "b1", 100, 50, true)
 	mustSubmit(t, s, in)
 
 	got := m.Cross(in)
-	if len(got) != 1 {
-		t.Fatalf("want 1 match, got %d", len(got))
-	}
-	if got[0].FillBase != 100 {
-		t.Fatalf("fill base = %d, want 100", got[0].FillBase)
+	if len(got) != 1 || got[0].FillBase != 100 {
+		t.Fatalf("want 1 planned match of 100, got %+v", got)
 	}
 	// Quote owed = ceil(100 * 45/100) = 45 (maker's ask, not the taker's bid).
 	if got[0].FillQuote != 45 {
 		t.Fatalf("fill quote = %d, want 45", got[0].FillQuote)
 	}
-	// Both fully filled -> removed from the book.
-	if _, ok := s.Get(offerstore.Key{MakerPubkey: in.GetMakerPubkey(), OfferID: "b1"}); ok {
-		t.Fatal("incoming should be fully filled and removed")
+	// NO optimistic mutation for an interactive cross: both orders remain at full size...
+	if activeOf(s, "s1") != 100 {
+		t.Fatalf("interactive resting must NOT be decremented by a cross, got %d", activeOf(s, "s1"))
 	}
-	if activeOf(s, "s1") != 0 {
-		t.Fatal("resting SELL should be fully filled and removed")
+	if e, ok := s.Get(offerstore.Key{MakerPubkey: in.GetMakerPubkey(), OfferID: "b1"}); !ok || e.ActiveAmount != 100 {
+		t.Fatalf("interactive incoming must NOT be decremented by a cross")
+	}
+	// ...and NO trade is recorded (it never settled).
+	if tr := s.TradesFor(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}, 0); len(tr) != 0 {
+		t.Fatalf("interactive cross must record no trade, got %d", len(tr))
 	}
 	_ = mk
 }
 
-// T1: a cross records a trade at the resting order's price, feeding TradesFor + Markets().LastPrice.
-func TestCrossRecordsTrade(t *testing.T) {
+// T1: a COVENANT cross records a trade at the resting order's price, feeding TradesFor +
+// Markets().LastPrice. (Interactive crosses record nothing — see TestCrossInteractivePlansNoSettle.)
+func TestCovenantCrossRecordsTrade(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
-	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true)) // resting ask 0.45 (45/100)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true)) // resting covenant ask 0.45 (settles from a cross)
 	// A higher ask that does NOT cross (0.60 > 0.50 bid) — leaves the pair in the book after s1
 	// fully fills, so Markets() still reports it (in production the deep-seed ladder always does).
 	mustSubmit(t, s, sell(t, mk, "s2", 50, 30, true)) // ask 0.60
@@ -156,12 +180,14 @@ func TestNonCrossingLeavesResting(t *testing.T) {
 	}
 }
 
-func TestPartialFillReRests(t *testing.T) {
+// A COVENANT partial fill decrements the resting order and re-rests the remainder (interactive
+// crosses do not mutate — see TestCrossInteractivePlansNoSettle).
+func TestCovenantPartialFillReRests(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
-	// Resting SELL of 100 A (ask 0.45), partial allowed.
-	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true))
+	// Resting covenant SELL of 100 A (ask 0.45), partial allowed.
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true))
 	// Incoming BUY for only 30 A at bid 0.50.
 	in := buy(t, tk, "b1", 30, 15, true)
 	mustSubmit(t, s, in)
@@ -170,7 +196,7 @@ func TestPartialFillReRests(t *testing.T) {
 	if len(got) != 1 || got[0].FillBase != 30 {
 		t.Fatalf("want 1 match of 30, got %+v", got)
 	}
-	// Resting SELL remainder re-rests at 70; incoming fully filled.
+	// Resting covenant remainder re-rests at 70; incoming fully filled.
 	if rem := activeOf(s, "s1"); rem != 70 {
 		t.Fatalf("resting remainder = %d, want 70", rem)
 	}
