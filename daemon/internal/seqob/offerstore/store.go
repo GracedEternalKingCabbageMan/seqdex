@@ -11,7 +11,10 @@
 package offerstore
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -36,6 +39,7 @@ type Entry struct {
 	SettleTxid   string
 	AnchorConfs  uint32
 	CreatedAt    time.Time
+	heldFill     uint64 // B1: active size captured when a mempool spend zeroed it, so the confirmed fill's trade size isn't lost
 }
 
 // Trade is one recorded cross, captured at MATCH time (SideSwap-style): the relay's
@@ -48,6 +52,15 @@ type Trade struct {
 }
 
 const maxTradesPerPair = 1000 // ring cap per market; oldest dropped
+
+// tradeRec is one line of the durable JSONL trade log: the pairKey plus the trade, so
+// last_price/trades/candles can be replayed after a relay restart (the book itself is ephemeral).
+type tradeRec struct {
+	PK    string    `json:"pk"`
+	TS    time.Time `json:"ts"`
+	Price float64   `json:"price"`
+	Size  uint64    `json:"size"`
+}
 
 // EventType is the kind of book delta.
 type EventType int
@@ -86,6 +99,7 @@ type Store struct {
 	subBuf      int
 	now         func() time.Time
 	trades      map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
+	tradeLog    *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
 }
 
 // RecordTrade appends one executed cross for the resting offer's pair at its execution
@@ -101,16 +115,58 @@ func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
 		return
 	}
 	pk := pairKey(pair)
+	ts := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.trades == nil {
 		s.trades = make(map[string][]Trade)
 	}
-	t := append(s.trades[pk], Trade{TS: s.now(), Price: price, Size: sizeBase})
+	t := append(s.trades[pk], Trade{TS: ts, Price: price, Size: sizeBase})
 	if len(t) > maxTradesPerPair {
 		t = t[len(t)-maxTradesPerPair:]
 	}
 	s.trades[pk] = t
+	// Durably append (best-effort): a log write must never break the match/settle path.
+	if s.tradeLog != nil {
+		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, Price: price, Size: sizeBase}); err == nil {
+			_, _ = s.tradeLog.Write(append(b, '\n'))
+		}
+	}
+}
+
+// EnableTradeLog makes the trade history durable: it replays an existing append-only JSONL log into
+// the in-memory rings, then keeps appending new trades to it. The book itself is ephemeral, but
+// last_price/trades/candles should survive a relay restart. Best-effort; call once at startup.
+func (s *Store) EnableTradeLog(path string) error {
+	if f, err := os.Open(path); err == nil {
+		s.mu.Lock()
+		if s.trades == nil {
+			s.trades = make(map[string][]Trade)
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for sc.Scan() {
+			var r tradeRec
+			if json.Unmarshal(sc.Bytes(), &r) != nil || r.PK == "" || r.Price <= 0 || r.Size == 0 {
+				continue
+			}
+			t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size})
+			if len(t) > maxTradesPerPair {
+				t = t[len(t)-maxTradesPerPair:]
+			}
+			s.trades[r.PK] = t
+		}
+		s.mu.Unlock()
+		_ = f.Close()
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.tradeLog = f
+	s.mu.Unlock()
+	return nil
 }
 
 // TradesFor returns the most recent trades for a pair (up to limit; 0 = all held), newest last.
@@ -652,6 +708,17 @@ func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size ui
 	if size > no.GetBaseAmount() {
 		size = no.GetBaseAmount()
 	}
+	// B1: consumed portion = size before this re-rest (active now, or the size held aside when a mempool
+	// spend zeroed active) minus the re-rested remainder. That portion is a trade.
+	prevActive := e.ActiveAmount
+	if prevActive == 0 {
+		prevActive = e.heldFill
+	}
+	var filled uint64
+	if prevActive > size {
+		filled = prevActive - size
+	}
+	e.heldFill = 0
 	e.ActiveAmount = size
 	e.SettleTxid = ""
 	if size >= no.GetBaseAmount() {
@@ -662,6 +729,9 @@ func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size ui
 	pair := no.GetPair()
 	st := e.orderStatus(k)
 	s.mu.Unlock()
+	if filled > 0 {
+		s.RecordTrade(no, filled) // re-locks internally; safe after Unlock
+	}
 	// Emit created (subscribers re-learn the new outpoint) then status.
 	s.broadcast(Event{Type: EventCreated, Pair: pair, Offer: no})
 	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
@@ -681,6 +751,9 @@ func (s *Store) HoldCovenantForSpend(k Key, spenderTxid string) error {
 		return nil
 	}
 	changed := e.ActiveAmount != 0 || e.SettleTxid != spenderTxid
+	if e.ActiveAmount > 0 {
+		e.heldFill = e.ActiveAmount // B1: remember the size so the confirmed-fill trade isn't lost once active zeroes
+	}
 	e.ActiveAmount = 0
 	e.SettleTxid = spenderTxid
 	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
@@ -704,11 +777,19 @@ func (s *Store) RemoveCovenantFilled(k Key, settleTxid string) error {
 	}
 	e.Status = seqobv1.OfferStatus_OFFER_STATUS_FILLED
 	e.SettleTxid = settleTxid
+	// B1: how much this settlement filled — active now, or the size held aside when a mempool spend
+	// zeroed active earlier (HoldCovenantForSpend). A covenant lift IS a trade; record it below.
+	filled := e.ActiveAmount
+	if filled == 0 {
+		filled = e.heldFill
+	}
+	filledOffer := e.Offer
 	e.ActiveAmount = 0
 	pair := e.Offer.GetPair()
 	st := e.orderStatus(k)
 	s.remove(k)
 	s.mu.Unlock()
+	s.RecordTrade(filledOffer, filled) // re-locks internally; safe after Unlock
 	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
 	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil

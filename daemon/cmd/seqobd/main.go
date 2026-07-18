@@ -73,12 +73,20 @@ func main() {
 		maxExpiry     = flag.Duration("max-expiry", 7*24*time.Hour, "maximum offer expiry horizon")
 		offersPerMin  = flag.Int("offers-per-min", 60, "max offers/min per maker_pubkey")
 		offersPerMinI = flag.Int("offers-per-min-ip", 120, "max offers/min per IP")
+		tradeLog      = flag.String("trade-log", env("SEQOB_TRADE_LOG", ""), "path to an append-only JSONL trade log so last_price/trades/candles survive a relay restart (env SEQOB_TRADE_LOG; empty = in-memory only)")
 	)
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "seqobd ", log.LstdFlags|log.Lmsgprefix)
 
 	store := offerstore.New(nil)
+	if *tradeLog != "" {
+		if err := store.EnableTradeLog(*tradeLog); err != nil {
+			logger.Printf("trade-log %s: %v (continuing in-memory)", *tradeLog, err)
+		} else {
+			logger.Printf("durable trade log: %s", *tradeLog)
+		}
+	}
 
 	vcfg := validator.DefaultConfig()
 	vcfg.MinExpiry = *minExpiry
