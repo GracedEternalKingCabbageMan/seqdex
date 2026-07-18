@@ -61,10 +61,10 @@ func buy(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, parti
 	return o
 }
 
-// covSell is a SELL like sell(), but settled by an on-chain covenant, so an auto-cross settles
-// deterministically (the taker builds the FILL spend) and the matcher DOES commit trade-truth for
-// it. The display price stays want/offer (quote/base); the covenant rate mirrors it. min_lot 1 so
-// any fill clears the floor.
+// covSell is a SELL like sell(), but settled by an on-chain covenant (the taker builds the FILL
+// spend). The matcher treats it the same as any order — pure plan+emit, no trade-truth mutation; the
+// covenant terms are carried on the Match so the taker/settler and the watcher can act. The display
+// price stays want/offer (quote/base); the covenant rate mirrors it. min_lot 1 so any fill clears the floor.
 func covSell(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, partial bool) *seqobv1.Offer {
 	t.Helper()
 	o := sell(t, k, id, base, quote, partial)
