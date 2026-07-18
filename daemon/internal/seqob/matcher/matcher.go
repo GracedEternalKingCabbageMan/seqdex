@@ -241,11 +241,21 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 
 	out := make([]Match, 0, len(plan))
 	for _, p := range plan {
-		// Apply to the resting order and to the incoming order.
-		_ = m.book.ApplyPartialFill(p.key, p.fillBase, "", 0)
-		_ = m.book.ApplyPartialFill(inKey, p.fillBase, "", 0)
-		// Record the cross for last_price / trades / candles (execution price = resting order's price).
-		m.book.RecordTrade(p.e.Offer, p.fillBase)
+		// Trade-truth commit point. ONLY a covenant resting order settles from an auto-cross: the taker
+		// builds + broadcasts the permissionless FILL spend from the carried covenant terms with nobody
+		// else online, so its optimistic decrement + trade record track on-chain reality (the chain
+		// watcher reconciles/reverts). An INTERACTIVE resting order CANNOT settle from a cross —
+		// routeMatches mints an unregistered session id, so any courier co-sign fails; interactive orders
+		// settle only via an explicit StartLift, which commits its own trade-truth on the maker's
+		// SettleAck (B-1). Recording/decrementing an interactive cross here was a pure phantom: a trade
+		// that never happened plus a decrement that shrank (or removed) a still-liftable resting order.
+		// So mutate trade-truth for a covenant resting order only; the Match is still emitted either way
+		// (a covenant taker settles it; an interactive one is superseded by StartLift). (B-2)
+		if p.e.Offer.GetCovenant() != nil {
+			_ = m.book.ApplyPartialFill(p.key, p.fillBase, "", 0)   // resting covenant: decrement (execution price = resting order's price)
+			_ = m.book.ApplyPartialFill(inKey, p.fillBase, "", 0)   // the incoming order's fill against it
+			m.book.RecordTrade(p.e.Offer, p.fillBase)
+		}
 
 		mt := Match{
 			Pair:        incoming.GetPair(),
