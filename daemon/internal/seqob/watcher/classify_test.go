@@ -161,6 +161,10 @@ func (b *fakeBook) RemoveGhost(k offerstore.Key, reason string) error {
 	b.calls = append(b.calls, call{op: "ghost", key: k})
 	return nil
 }
+func (b *fakeBook) HoldGhost(k offerstore.Key, reason string) error {
+	b.calls = append(b.calls, call{op: "holdghost", key: k})
+	return nil
+}
 
 // fakeChain returns a canned CovState per outpoint. terms carry NUMS + a valid
 // 32-byte program so expectFromTerms/Derive succeed; the fake ignores the derived
@@ -225,6 +229,33 @@ func TestReconcileOnce_RoutesAllStates(t *testing.T) {
 	}
 	if got["ghost"].op != "ghost" {
 		t.Fatalf("ghost routing: %+v", got["ghost"])
+	}
+}
+
+// F3: a Ghost of a RE-RESTED covenant (its remainder outpoint vanished — most likely a reorg-undone
+// fill) is HELD (reversible), not permanently invalidated, so it can re-open if the fill re-confirms.
+// An ORIGINAL-funding ghost (never re-rested, so it never really settled) is still removed.
+func TestReconcileOnce_ReRestedGhostIsHeld(t *testing.T) {
+	book := &fakeBook{covs: []CovEntry{
+		{Key: offerstore.Key{MakerPubkey: "mk", OfferID: "rerested"}, Terms: sampleTerms("ee", 0), Active: 60_000_000, ReRested: true},
+		{Key: offerstore.Key{MakerPubkey: "mk", OfferID: "original"}, Terms: sampleTerms("ff", 0), Active: 90_000_000},
+	}}
+	chain := &fakeChain{hash: "tip1", height: 100, states: map[string]CovState{
+		"ee:0": {SpenderTxid: ""}, // remainder gone, no spender -> Ghost
+		"ff:0": {SpenderTxid: ""}, // original gone, no spender -> Ghost
+	}}
+	if _, err := New(chain, book, nil).ReconcileOnce(); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := map[string]call{}
+	for _, c := range book.calls {
+		got[c.key.OfferID] = c
+	}
+	if got["rerested"].op != "holdghost" {
+		t.Fatalf("re-rested ghost must be HELD (reversible), got %+v", got["rerested"])
+	}
+	if got["original"].op != "ghost" {
+		t.Fatalf("original-funding ghost must be removed, got %+v", got["original"])
 	}
 }
 
