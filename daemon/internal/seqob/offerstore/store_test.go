@@ -367,6 +367,54 @@ func TestCovenantReconcile(t *testing.T) {
 	}
 }
 
+// The watcher's covenant record path records a DELTA off the order's LIVE size on each confirmed fill,
+// so the recorded trades sum to the base amount with the correct per-fill sizes — the heart of the
+// on-confirm redesign (matcher no longer records at match). Drives mempool-hold -> partial re-rest
+// (records the consumed 30) -> mempool-hold -> full fill (records the remaining 60).
+func TestCovenantReconcileRecordsDeltaTrades(t *testing.T) {
+	s := New(nil)
+	k := key(t)
+	o := mkCovOffer(t, k, "cov1", "aabb", 0, 90)
+	if _, err := s.Submit(o); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	kk := Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "cov1"}
+	pair := o.GetPair()
+
+	// Partial fill of 30: the mempool hold captures the live size (90), then the confirmed re-rest to a
+	// 60 remainder records exactly the consumed 30 (90 - 60), NOT 0 and NOT the full 90.
+	if err := s.HoldCovenantForSpend(kk, "spend1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RerestCovenantRemainder(kk, "rem1", 1, 60); err != nil {
+		t.Fatal(err)
+	}
+	if trades := s.TradesFor(pair, 0); len(trades) != 1 || trades[0].Size != 30 {
+		t.Fatalf("after partial: want exactly 1 trade of 30, got %+v", trades)
+	}
+
+	// Full fill of the 60 remainder records exactly 60. Total recorded == base (90), no loss, no double.
+	if err := s.HoldCovenantForSpend(kk, "spend2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveCovenantFilled(kk, "fill2"); err != nil {
+		t.Fatal(err)
+	}
+	trades := s.TradesFor(pair, 0)
+	if len(trades) != 2 {
+		t.Fatalf("after full fill: want 2 recorded trades, got %d", len(trades))
+	}
+	var sum uint64
+	sizes := map[uint64]bool{}
+	for _, tr := range trades {
+		sum += tr.Size
+		sizes[tr.Size] = true
+	}
+	if sum != 90 || !sizes[30] || !sizes[60] {
+		t.Fatalf("recorded trades must be {30, 60} summing to base 90, got %+v", trades)
+	}
+}
+
 func TestCovenantSurvivesMakerDisconnect(t *testing.T) {
 	// RemoveByMaker must NOT evict a covenant (the watcher owns covenant removal).
 	s := New(nil)

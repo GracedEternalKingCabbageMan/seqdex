@@ -732,10 +732,12 @@ func (s *Store) HoldCovenantGhost(k Key, reason string) error {
 }
 
 // ReconcileCovenantActive sets a resting covenant order's active size to its
-// on-chain UTXO value. Idempotent. It also RE-OPENS an order whose optimistic
-// match-time decrement never settled (the fill was never confirmed, so the
-// covenant still holds its full value at the tip). No-op for a non-covenant or
-// missing entry.
+// on-chain UTXO value. Idempotent. It also RE-OPENS an order the watcher had HELD
+// for an unconfirmed spend (HoldCovenantForSpend / HoldCovenantGhost) that then
+// dropped or was reorged away — the covenant still holds its value at the tip, so
+// the order becomes fillable again. (The matcher no longer decrements at match, so
+// there is no optimistic match-time decrement to correct.) No-op for a
+// non-covenant or missing entry.
 func (s *Store) ReconcileCovenantActive(k Key, active uint64) error {
 	s.mu.Lock()
 	e, ok := s.entries[k]

@@ -7,21 +7,20 @@
 // ratio compare, the same price floor ValidateRequestAgainstOffer enforces) it
 // computes a fill size (honoring allow_partial / min_fill, and — for a covenant
 // order — the covenant's own min_lot floor on both the fill and the remainder),
-// decrements both orders via offerstore.ApplyPartialFill, and records a Match.
-// Any incoming remainder rests.
+// and emits a Match. Any incoming remainder rests.
 //
-// The matcher is I/O-free: it returns []Match for the caller (the api layer,
-// which owns the websocket connections) to route as From.matched messages. For
-// a COVENANT resting order the maker is offline; the Match carries the covenant
-// terms + this fill's recipe so the counterparty (taker) settles the
-// permissionless FILL spend itself, with nobody online but the taker.
-//
-// Advisory-decrement caveat: for a covenant match the on-chain FILL spend is
-// authoritative (the order is the coin; first spend wins). The relay decrements
-// optimistically at match time so the book reflects the intent; a chain watcher
-// reconciling the book against the actual UTXO set (re-opening an order whose
-// fill never confirmed, or whose anchor was orphaned) is out of scope here and
-// noted as remaining work.
+// The matcher is PURE plan + emit: it commits NO trade-truth. It never decrements
+// an order and never records a trade — a cross is only a trade once it SETTLES
+// on-chain, and only that is recorded, reorg-safely, by the owner of settlement:
+// a covenant fill by the chain watcher on confirmation (a delta off the order's
+// live size), an interactive lift by the maker's SettleAck. Recording/decrementing
+// at match time surfaced phantom trades (an interactive auto-cross never settles)
+// and, once the watcher was enabled, double-counted covenant fills. So the matcher
+// is I/O-free and returns []Match for the caller (the api layer, which owns the
+// websocket connections) to route as From.matched, and nothing more. For a COVENANT
+// resting order the maker is offline; the Match carries the covenant terms + this
+// fill's recipe so the counterparty (taker) settles the permissionless FILL spend
+// itself, with nobody online but the taker.
 package matcher
 
 import (
@@ -43,12 +42,12 @@ func isSubAssetOffer(o *seqobv1.Offer) bool {
 }
 
 // Book is the subset of offerstore.Store the matcher needs (so it can be faked
-// in tests).
+// in tests). The matcher only READS the book (it commits no trade-truth), so this
+// is read-only — ApplyPartialFill/RecordTrade were removed when the matcher became
+// pure plan+emit; trade-truth is owned by the watcher (covenant) and SettleAck.
 type Book interface {
 	SnapshotPairEntries(p *seqobv1.AssetPair, confidential bool) []offerstore.Entry
 	Get(k offerstore.Key) (*offerstore.Entry, bool)
-	ApplyPartialFill(k offerstore.Key, filledBase uint64, settleTxid string, anchorConfs uint32) error
-	RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64)
 }
 
 // Match is one crossing of an incoming order against a resting order.
@@ -243,11 +242,13 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 	for _, p := range plan {
 		// The matcher is PURE plan + emit: it computes the crossing and advertises the Match, but commits
 		// NO trade-truth (no decrement, no RecordTrade). A cross is only a trade once it SETTLES on-chain,
-		// and only that is recorded — reorg-safely — by the party that owns the settlement:
+		// and only that is recorded by the party that owns the settlement:
 		//   - COVENANT resting order: the chain watcher, on the FILL's confirmation (RerestCovenantRemainder /
-		//     RemoveCovenantFilled), reconciling size to chain and un-recording on a Bitcoin reorg (Principle 1).
-		//     The watcher's record is a DELTA off the resting order's live size, so the matcher must NOT
-		//     pre-decrement here — an optimistic decrement makes that delta 0 and the real trade is lost.
+		//     RemoveCovenantFilled), which records a DELTA off the resting order's LIVE size — so the matcher
+		//     must NOT pre-decrement here, or that delta comes out 0 and the real trade is lost. The watcher
+		//     reconciles the BOOK to chain state on a reorg (re-open / hold, Principle 1); the append-only
+		//     trades feed itself is not yet retracted on a reorg, so a confirmed-then-reorged fill can leave a
+		//     stale last_price (display-only, strictly better than the old record-at-match — a documented gap).
 		//   - INTERACTIVE resting order: the maker's SettleAck after the lift broadcasts (B-1).
 		// Recording/decrementing at match time was the phantom-trade + double-count source (an auto-cross
 		// mints an unregistered session for interactive, and double-recorded covenants once the watcher

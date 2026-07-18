@@ -38,8 +38,10 @@ type State int
 const (
 	// StateLive: the advertised outpoint is UNSPENT in the current UTXO set and
 	// matches the covenant program (spk + asset). Keep the order; reconcile its
-	// active size to the on-chain value (correcting any optimistic match-time
-	// decrement that never settled — i.e. re-opening a fill that never confirmed).
+	// active size to the on-chain value — this re-opens an order the watcher had
+	// held for an unconfirmed spend that then dropped/was reorged away (the covenant
+	// still holds its value at the tip). (The matcher no longer decrements at match,
+	// so there is no optimistic decrement to correct.)
 	StateLive State = iota
 	// StatePartialFill: the outpoint was spent by a CONFIRMED fill that re-created
 	// a smaller remainder covenant at index 2k+1. Re-rest the order pointing at the
