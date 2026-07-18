@@ -120,7 +120,7 @@ func legOut(l covenant.CovLeg) map[string]interface{} {
 
 func main() {
 	if len(os.Args) < 2 {
-		die("usage: seqob-settler <plan> [< cross.json]")
+		die("usage: seqob-settler plan [< cross.json] | run [-relay ... -node-rpc host:port -fee-wallet NAME ...]")
 	}
 	switch os.Args[1] {
 	case "plan":
@@ -152,7 +152,9 @@ func main() {
 			die("marshal: %v", err)
 		}
 		fmt.Println(string(out))
+	case "run":
+		runSettler(os.Args[2:])
 	default:
-		die("unknown subcommand %q (want plan)", os.Args[1])
+		die("unknown subcommand %q (want plan or run)", os.Args[1])
 	}
 }
