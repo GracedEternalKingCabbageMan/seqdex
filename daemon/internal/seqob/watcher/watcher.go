@@ -27,9 +27,10 @@ type ChainView interface {
 
 // CovEntry is one resting covenant offer the watcher must reconcile.
 type CovEntry struct {
-	Key    offerstore.Key
-	Terms  *seqobv1.CovenantTerms
-	Active uint64 // book's current active size (advisory; reconciled to chain)
+	Key      offerstore.Key
+	Terms    *seqobv1.CovenantTerms
+	Active   uint64 // book's current active size (advisory; reconciled to chain)
+	ReRested bool   // F3: current outpoint is a remainder from a prior partial fill, not the original funding
 }
 
 // BookController is the covenant-aware subset of the relay's book the watcher
@@ -54,6 +55,10 @@ type BookController interface {
 	// RemoveGhost removes a covenant order whose funding UTXO is gone at the tip
 	// (reorg / never-confirmed): maps to OFFER_STATUS_UTXO_INVALIDATED.
 	RemoveGhost(k offerstore.Key, reason string) error
+	// HoldGhost hides (does NOT remove) a RE-RESTED covenant order whose remainder
+	// outpoint is gone: a Bitcoin reorg may have undone the fill, so keep the entry
+	// so a later pass can re-open it if the fill re-confirms (F3, reversible).
+	HoldGhost(k offerstore.Key, reason string) error
 }
 
 // Logger is the minimal logging surface (satisfied by *log.Logger).
@@ -187,8 +192,20 @@ func (w *Watcher) apply(c CovEntry, v Verdict, st *Stats) {
 		err = w.book.HoldForSpend(k, v.SpenderTxid)
 	case StateGhost:
 		st.Ghost++
-		w.log.Printf("watcher: %s/%s GHOST — %s; removing (anchoring supremacy: UTXO gone at tip)", k.MakerPubkey, k.OfferID, v.Reason)
-		err = w.book.RemoveGhost(k, v.Reason)
+		// F3 / anchoring supremacy: a Ghost is a funding UTXO gone at the tip. For an ORIGINAL funding
+		// (never re-rested) that means it never really existed (never-confirmed / reorged-away before any
+		// fill) — remove it. But for a RE-RESTED order the gone outpoint is a remainder from a prior
+		// partial fill, and its disappearance most likely means a Bitcoin reorg UNDID that fill; the
+		// earlier outpoint is (or will be) restored. Permanently invalidating it would violate Principle 1
+		// (the trade the reorg erased should un-happen, not the order). So HOLD it (hidden, reversible):
+		// if the reorg heals and the fill re-confirms, a later pass sees the remainder again and re-opens it.
+		if c.ReRested {
+			w.log.Printf("watcher: %s/%s GHOST of a re-rested remainder — %s; HOLDING (reorg may restore the fill), not invalidating", k.MakerPubkey, k.OfferID, v.Reason)
+			err = w.book.HoldGhost(k, v.Reason)
+		} else {
+			w.log.Printf("watcher: %s/%s GHOST — %s; removing (anchoring supremacy: UTXO gone at tip)", k.MakerPubkey, k.OfferID, v.Reason)
+			err = w.book.RemoveGhost(k, v.Reason)
+		}
 	}
 	if err != nil {
 		st.Errors++

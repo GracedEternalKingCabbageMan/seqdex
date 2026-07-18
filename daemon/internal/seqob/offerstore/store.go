@@ -40,11 +40,13 @@ type Entry struct {
 	AnchorConfs  uint32
 	CreatedAt    time.Time
 	heldFill     uint64 // B1: active size captured when a mempool spend zeroed it, so the confirmed fill's trade size isn't lost
+	reRested     bool   // F3: this covenant order was re-rested to a remainder outpoint at least once (its funding is no longer the original), so a Ghost of the current outpoint may be a reorg-undone fill whose earlier outpoint is restored — hold it, don't invalidate.
 }
 
-// Trade is one recorded cross, captured at MATCH time (SideSwap-style): the relay's
-// matcher produced a fill at this price/size. Feeds last_price, the trades feed, and
-// candles. Price is quote-per-base, the same convention as displayPrice / best_bid|ask.
+// Trade is one recorded cross, captured at on-chain SETTLEMENT: the chain watcher records a
+// covenant fill on confirmation, and the interactive-lift SettleAck records its fill. (The matcher
+// no longer records at match.) Feeds last_price, the trades feed, and candles. Price is
+// quote-per-base, the same convention as displayPrice / best_bid|ask.
 type Trade struct {
 	TS    time.Time
 	Price float64 // quote per base (matches best_bid/best_ask units)
@@ -682,9 +684,10 @@ func (s *Store) RemoveByMaker(makerPubkey string) int {
 // watcher to reconcile. The returned *CovenantTerms is the live pointer; the
 // watcher only reads it.
 type CovenantEntry struct {
-	Key    Key
-	Terms  *seqobv1.CovenantTerms
-	Active uint64
+	Key      Key
+	Terms    *seqobv1.CovenantTerms
+	Active   uint64
+	ReRested bool // F3: the current outpoint is a remainder from a prior partial fill, not the original funding
 }
 
 // SnapshotCovenants returns every resting offer that settles via a covenant.
@@ -694,10 +697,38 @@ func (s *Store) SnapshotCovenants() []CovenantEntry {
 	out := make([]CovenantEntry, 0)
 	for k, e := range s.entries {
 		if cov := e.Offer.GetCovenant(); cov != nil {
-			out = append(out, CovenantEntry{Key: k, Terms: cov, Active: e.ActiveAmount})
+			out = append(out, CovenantEntry{Key: k, Terms: cov, Active: e.ActiveAmount, ReRested: e.reRested})
 		}
 	}
 	return out
+}
+
+// HoldCovenantGhost hides a re-rested covenant order whose current (remainder) outpoint is GONE at the
+// tip with no spender — most likely a Bitcoin reorg undid the fill (anchoring supremacy). Unlike
+// RemoveGhost (permanent MarkInvalidated), this is REVERSIBLE: active drops to 0 (hidden from matching,
+// so no taker fills a vanished outpoint) but the entry is kept, so if the reorg heals and the fill
+// re-confirms, a later reconcile pass sees the remainder again and re-opens it (F3). No-op for a
+// non-covenant/missing entry.
+func (s *Store) HoldCovenantGhost(k Key, reason string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	changed := e.ActiveAmount != 0
+	if e.ActiveAmount > 0 {
+		e.heldFill = e.ActiveAmount
+	}
+	e.ActiveAmount = 0
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	pair := e.Offer.GetPair()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	}
+	return nil
 }
 
 // ReconcileCovenantActive sets a resting covenant order's active size to its
@@ -751,6 +782,7 @@ func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size ui
 	no.GetCovenant().CovenantTxid = txid
 	no.GetCovenant().CovenantVout = vout
 	e.Offer = no
+	e.reRested = true // F3: mark that this order's funding is now a remainder, not its original outpoint
 	if size > no.GetBaseAmount() {
 		size = no.GetBaseAmount()
 	}

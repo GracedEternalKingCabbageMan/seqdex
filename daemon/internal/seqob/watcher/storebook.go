@@ -17,7 +17,7 @@ func (b *storeBook) SnapshotCovenants() []CovEntry {
 	src := b.s.SnapshotCovenants()
 	out := make([]CovEntry, 0, len(src))
 	for _, c := range src {
-		out = append(out, CovEntry{Key: c.Key, Terms: c.Terms, Active: c.Active})
+		out = append(out, CovEntry{Key: c.Key, Terms: c.Terms, Active: c.Active, ReRested: c.ReRested})
 	}
 	return out
 }
@@ -42,4 +42,8 @@ func (b *storeBook) RemoveGhost(k offerstore.Key, reason string) error {
 	// A ghost's funding UTXO is gone at the tip: map to UTXO_INVALIDATED, the
 	// existing "the maker's coins moved / are unusable" removal.
 	return b.s.MarkInvalidated(k)
+}
+
+func (b *storeBook) HoldGhost(k offerstore.Key, reason string) error {
+	return b.s.HoldCovenantGhost(k, reason)
 }
