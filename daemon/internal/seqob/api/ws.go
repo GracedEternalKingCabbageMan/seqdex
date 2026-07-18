@@ -152,6 +152,8 @@ func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
 		s.wsOfferCancel(c, m.OfferCancel)
 	case *seqobv1.To_StartLift:
 		s.wsStartLift(c, m.StartLift)
+	case *seqobv1.To_SettleAck:
+		s.wsSettleAck(c, m.SettleAck)
 	case *seqobv1.To_SwapMsg:
 		s.wsSwapMsg(c, m.SwapMsg)
 	case *seqobv1.To_ListMarkets:
@@ -387,4 +389,55 @@ func (s *Server) wsSwapMsg(c *wsConn, msg *seqobv1.SwapMsg) {
 	if err := s.sessions.Send(msg.GetSessionId(), role, msg.GetCiphertext()); err != nil {
 		c.sendErr(409, "courier: "+err.Error())
 	}
+}
+
+// wsSettleAck is the interactive-lift settlement commit point. A same-chain lift settles
+// via an opaque SwapMsg courier the relay never parses, so it otherwise never learns the
+// lift settled — leaving the resting order a ghost at full size and the trades feed empty
+// by construction. The MAKER, having co-signed the exact settling PSET, sends this ack
+// after broadcast; on it the relay records the trade at the resting order's price,
+// decrements/finalizes the resting order, arms reorg re-open with the settling txid, and
+// closes the session. MAKER-authenticated: only the session's maker may send it, so a
+// taker cannot grief a live resting order by forging a decrement. The decrement size is
+// the relay's own authoritative TakeAmount (from StartLift), not the maker-reported
+// fill_base, clamped to what is actually resting.
+func (s *Server) wsSettleAck(c *wsConn, sa *seqobv1.SettleAck) {
+	if sa == nil || sa.GetSessionId() == "" {
+		c.sendErr(400, "settle_ack missing session_id")
+		return
+	}
+	sid := sa.GetSessionId()
+	c.mu.Lock()
+	role, ok := c.roles[sid]
+	c.mu.Unlock()
+	if !ok || role != session.RoleMaker {
+		c.sendErr(403, "only the session maker may ack settlement")
+		return
+	}
+	sess, ok := s.sessions.Get(sid)
+	if !ok {
+		c.sendErr(409, "unknown or closed session")
+		return
+	}
+	k := offerstore.Key{MakerPubkey: sess.MakerPubkey, OfferID: sess.OfferID}
+	// Record + decrement only if the resting order is still present. If a prior fill already
+	// removed it, there is nothing to record/decrement — but still close the session so it does
+	// not linger and get deadline-aborted (which would try to re-open an already-settled order).
+	if e, ok := s.store.Get(k); ok {
+		fill := sess.TakeAmount
+		if fill > e.ActiveAmount {
+			fill = e.ActiveAmount // never decrement below the resting size (it shrank via another fill)
+		}
+		if fill > 0 {
+			// Record BEFORE ApplyPartialFill: the latter may remove the entry at full fill, after
+			// which e.Offer (needed for the trade's pair + execution price) is no longer fetchable.
+			s.store.RecordTrade(e.Offer, fill)
+			if err := s.store.ApplyPartialFill(k, fill, sa.GetSettleTxid(), 0); err != nil {
+				c.sendErr(409, "apply fill: "+err.Error())
+				return
+			}
+		}
+	}
+	_ = s.sessions.SetSettleTxid(sid, sa.GetSettleTxid()) // arms reorg re-open (Principle 1)
+	s.sessions.Close(sid)
 }
