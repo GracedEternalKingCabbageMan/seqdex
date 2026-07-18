@@ -262,6 +262,7 @@ func main() {
 func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey, wsURL string, expiry time.Duration) {
 	crypters := make(map[string]*client.Crypter)
 	accepted := make(map[string]bool)
+	takes := make(map[string]uint64) // session -> take_amount, for the settle-ack fill_base (B-1)
 	o := maker.Offer
 	// Reconnect resilience + STAY on the book. Exiting on a WS error lets the supervisor restart us,
 	// which mints a NEW offer_id → a taker who lifted the old id races a replaced offer and gets "no
@@ -331,6 +332,7 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				continue
 			}
 			crypters[lr.GetSessionId()] = cr
+			takes[lr.GetSessionId()] = lr.GetTakeAmount()
 			fmt.Printf("lift requested: session %s offer %s take %d\n",
 				lr.GetSessionId(), lr.GetOfferId(), lr.GetTakeAmount())
 
@@ -338,9 +340,21 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 			sm := from.GetSwapMsg()
 			sid := sm.GetSessionId()
 			if accepted[sid] {
-				fmt.Printf("session %s: SWAP SETTLED (taker couriered SwapComplete)\n", sid)
+				// The taker couriered SwapComplete: the same-chain lift settled on-chain. Ack the relay
+				// so it records the trade + decrements this resting order — the relay never parses the
+				// opaque courier, so without this ack the order lingers as a ghost and the trades feed
+				// stays empty (B-1). Best-effort txid from the completed tx; fill_base is the lift's take.
+				txid, _ := maker.HandleComplete(sm.GetCiphertext(), crypters[sid])
+				if we := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SettleAck{SettleAck: &seqobv1.SettleAck{
+					SessionId: sid, SettleTxid: txid, FillBase: takes[sid],
+				}}}); we != nil {
+					fmt.Printf("session %s: settle-ack write failed: %v; reconnecting\n", sid, we)
+					conn = redial(conn)
+				}
+				fmt.Printf("session %s: SWAP SETTLED (acked relay; txid=%s)\n", sid, txid)
 				delete(accepted, sid) // B3: prune per-session state now the swap is done (serve() runs forever)
 				delete(crypters, sid)
+				delete(takes, sid)
 				continue
 			}
 			cr := crypters[sid]

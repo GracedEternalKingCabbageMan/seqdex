@@ -94,6 +94,21 @@ message SwapMsg {
   bytes  ciphertext = 2;
 }
 
+// Client (the MAKER of a lifted resting order) -> relay: the interactive lift for
+// session_id has settled on-chain at settle_txid, filling fill_base base atoms. The
+// relay is otherwise blind to the opaque SwapMsg courier, so this ack is the ONLY
+// signal that lets it record the trade, decrement the resting order, and close the
+// session (without it the resting order lingers as a ghost and the trades feed stays
+// empty for every interactive lift). MAKER-authenticated (see wsSettleAck): only the
+// session's maker may send it — the maker has no incentive to falsely decrement its
+// own resting order, whereas trusting the taker would let any taker grief a live
+// order. settle_txid is on-chain (public), so this leaks nothing the chain does not.
+message SettleAck {
+  string session_id  = 1;
+  string settle_txid = 2;
+  uint64 fill_base   = 3; // base atoms actually settled (== the lift's take_amount)
+}
+
 enum OfferStatus {
   OFFER_STATUS_UNSPECIFIED      = 0;
   OFFER_STATUS_OPEN             = 1;
@@ -127,6 +142,7 @@ message To {
     Offer       offer_edit         = 103; // re-signed, same offer_id
     OfferCancel offer_cancel       = 104;
     StartLift   start_lift         = 113;
+    SettleAck   settle_ack         = 114; // maker: interactive lift settled (record + decrement + close)
     SwapMsg     swap_msg           = 130; // opaque courier passthrough
     Empty       list_markets       = 150;
   }

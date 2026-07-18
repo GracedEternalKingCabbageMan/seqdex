@@ -247,6 +247,69 @@ func TestWSOpaqueCourierWithLiftNotification(t *testing.T) {
 	}
 }
 
+// TestWSSettleAckRecordsTradeAndDecrements is the B-1 regression: an interactive lift
+// settles via the opaque courier the relay never parses, so the ONLY way the relay learns
+// it settled is the maker's SettleAck. On it, the relay must record the trade and decrement
+// the resting order (previously it did neither, leaving a ghost order + an empty trades feed).
+// It must also reject a settle_ack from anyone but the session maker.
+func TestWSSettleAckRecordsTradeAndDecrements(t *testing.T) {
+	ts, store := newServer(t)
+	mk := key(t)
+	o := mkSignedOffer(t, mk, "aaaa") // base_amount 100, pair gold/usdx
+
+	makerConn := dialWS(t, ts)
+	defer makerConn.Close()
+	sendTo(t, makerConn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}})
+	if st := readFrom(t, makerConn); st.GetOrderStatus() == nil {
+		t.Fatalf("expected order_status after submit, got %+v", st)
+	}
+
+	tk := key(t)
+	takerConn := dialWS(t, ts)
+	defer takerConn.Close()
+	sendTo(t, takerConn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
+		OfferId: "aaaa", MakerPubkey: o.GetMakerPubkey(), TakeAmount: 50,
+		TakerSessionPubkey: tk.PubKey().SerializeCompressed(),
+	}}})
+	lr := readFrom(t, makerConn).GetLiftRequested()
+	if lr == nil {
+		t.Fatalf("expected lift_requested at maker")
+	}
+	sessionID := lr.GetSessionId()
+	_ = readFrom(t, takerConn) // drain lift_accepted
+
+	// A TAKER may NOT ack settlement — only the session maker. Expect a 403 error frame.
+	sendTo(t, takerConn, &seqobv1.To{Msg: &seqobv1.To_SettleAck{SettleAck: &seqobv1.SettleAck{
+		SessionId: sessionID, SettleTxid: "aa", FillBase: 50,
+	}}})
+	if ef := readFrom(t, takerConn); ef.GetError() == nil {
+		t.Fatalf("expected error frame for a taker-sent settle_ack, got %+v", ef)
+	}
+
+	// The MAKER acks: the relay records the trade at the resting price and decrements the order.
+	sendTo(t, makerConn, &seqobv1.To{Msg: &seqobv1.To_SettleAck{SettleAck: &seqobv1.SettleAck{
+		SessionId: sessionID, SettleTxid: "deadbeef", FillBase: 50,
+	}}})
+
+	// The handler is async and sends no reply on success, so poll the store to convergence.
+	restKey := offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "aaaa"}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		trades := store.TradesFor(o.GetPair(), 10)
+		e, ok := store.Get(restKey)
+		if len(trades) >= 1 && ok && e.ActiveAmount == 50 {
+			if trades[len(trades)-1].Size != 50 {
+				t.Fatalf("recorded trade size = %d, want 50", trades[len(trades)-1].Size)
+			}
+			return // recorded + decremented: B-1 satisfied
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("settle_ack did not record+decrement in time: trades=%d ok=%v entry=%+v", len(trades), ok, e)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // --- helpers ---
 
 func dialWS(t *testing.T, ts *httptest.Server) *websocket.Conn {
