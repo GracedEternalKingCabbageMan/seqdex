@@ -381,6 +381,9 @@ func fillQuote(resting *seqobv1.Offer, fillBase uint64) uint64 {
 	p := new(big.Int).Mul(u(fillBase), u(num))
 	p.Add(p, u(den-1))
 	p.Quo(p, u(den))
+	if !p.IsUint64() {
+		return 0 // B-6: quote doesn't fit uint64 — p.Uint64() would silently wrap to a wrong amount; reject the match instead
+	}
 	return p.Uint64()
 }
 
