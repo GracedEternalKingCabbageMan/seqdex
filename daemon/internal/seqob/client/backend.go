@@ -111,7 +111,14 @@ func psetHasConfidentialOutput(psetB64 string) bool {
 // extracts the tx; on a non-PSET or not-yet-finalizable input (e.g. the test stub's
 // placeholder string) it returns "" and the caller acks without the txid — the relay's
 // trade record + decrement do not depend on it (it only enriches OrderStatus + reorg watch).
-func txidFromSignedPset(psetB64 string) string {
+func txidFromSignedPset(psetB64 string) (txid string) {
+	// F7: the input is the taker's SwapComplete.transaction — attacker-controlled bytes. A panic in
+	// psetv2 on malformed input must not crash the maker's single serve() goroutine; recover to "".
+	defer func() {
+		if recover() != nil {
+			txid = ""
+		}
+	}()
 	ptx, err := psetv2.NewPsetFromBase64(psetB64)
 	if err != nil {
 		return ""
