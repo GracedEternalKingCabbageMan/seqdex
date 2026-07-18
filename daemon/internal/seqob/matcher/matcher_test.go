@@ -122,42 +122,36 @@ func TestCrossInteractivePlansNoSettle(t *testing.T) {
 	_ = mk
 }
 
-// T1: a COVENANT cross records a trade at the resting order's price, feeding TradesFor +
-// Markets().LastPrice. (Interactive crosses record nothing — see TestCrossInteractivePlansNoSettle.)
-func TestCovenantCrossRecordsTrade(t *testing.T) {
+// A COVENANT cross is PLANNED (the Match carries the fill + covenant terms) but the matcher commits NO
+// trade-truth. A cross becomes a trade only once it SETTLES on-chain, and it is recorded then — reorg-
+// safely — by the chain watcher (RerestCovenantRemainder / RemoveCovenantFilled off the order's live
+// size). Recording at match would double-count with the watcher and surface trades that never settled.
+func TestCovenantCrossPlansNoMutation(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
-	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true)) // resting covenant ask 0.45 (settles from a cross)
-	// A higher ask that does NOT cross (0.60 > 0.50 bid) — leaves the pair in the book after s1
-	// fully fills, so Markets() still reports it (in production the deep-seed ladder always does).
-	mustSubmit(t, s, sell(t, mk, "s2", 50, 30, true)) // ask 0.60
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true)) // resting covenant ask 0.45
 	in := buy(t, tk, "b1", 100, 50, true)
 	mustSubmit(t, s, in)
-	if got := m.Cross(in); len(got) != 1 {
-		t.Fatalf("want 1 match, got %d", len(got))
+
+	got := m.Cross(in)
+	if len(got) != 1 || got[0].FillBase != 100 {
+		t.Fatalf("want 1 planned match of 100, got %+v", got)
 	}
-	pair := &seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}
-	trades := s.TradesFor(pair, 0)
-	if len(trades) != 1 {
-		t.Fatalf("want 1 recorded trade, got %d", len(trades))
+	if got[0].RestingCovenant == nil {
+		t.Fatal("covenant terms must be carried on the match (the taker/settler + watcher need them)")
 	}
-	if trades[0].Price != 0.45 {
-		t.Fatalf("trade price = %v, want 0.45 (resting ask)", trades[0].Price)
+	// NO trade recorded and NO decrement at match — trade-truth is committed on settlement, not here.
+	if tr := s.TradesFor(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}, 0); len(tr) != 0 {
+		t.Fatalf("covenant cross must record no trade at match, got %d", len(tr))
 	}
-	if trades[0].Size != 100 {
-		t.Fatalf("trade size = %d, want 100 (filled base)", trades[0].Size)
+	if activeOf(s, "s1") != 100 {
+		t.Fatalf("resting covenant must NOT be decremented at match, got %d", activeOf(s, "s1"))
 	}
-	// Markets().LastPrice picks up the newest cross.
-	var last float64
-	for _, mk2 := range s.Markets() {
-		if mk2.GetPair().GetBaseAsset() == assetA && mk2.GetPair().GetQuoteAsset() == assetB {
-			last = mk2.GetLastPrice()
-		}
+	if e, ok := s.Get(offerstore.Key{MakerPubkey: in.GetMakerPubkey(), OfferID: "b1"}); !ok || e.ActiveAmount != 100 {
+		t.Fatalf("incoming must NOT be decremented at match")
 	}
-	if last != 0.45 {
-		t.Fatalf("Markets().LastPrice = %v, want 0.45", last)
-	}
+	_ = mk
 }
 
 func TestNonCrossingLeavesResting(t *testing.T) {
@@ -180,9 +174,9 @@ func TestNonCrossingLeavesResting(t *testing.T) {
 	}
 }
 
-// A COVENANT partial fill decrements the resting order and re-rests the remainder (interactive
-// crosses do not mutate — see TestCrossInteractivePlansNoSettle).
-func TestCovenantPartialFillReRests(t *testing.T) {
+// A partial COVENANT cross plans the partial fill (FillBase=30) but still mutates nothing at match; the
+// watcher re-rests the on-chain remainder once the FILL confirms. (The size stays full until then.)
+func TestCovenantPartialCrossPlansNoMutation(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
@@ -194,14 +188,11 @@ func TestCovenantPartialFillReRests(t *testing.T) {
 
 	got := m.Cross(in)
 	if len(got) != 1 || got[0].FillBase != 30 {
-		t.Fatalf("want 1 match of 30, got %+v", got)
+		t.Fatalf("want 1 planned match of 30, got %+v", got)
 	}
-	// Resting covenant remainder re-rests at 70; incoming fully filled.
-	if rem := activeOf(s, "s1"); rem != 70 {
-		t.Fatalf("resting remainder = %d, want 70", rem)
-	}
-	if activeOf(s, "b1") != 0 {
-		t.Fatalf("incoming should be fully filled")
+	// No mutation at match: the resting covenant stays at full size until the FILL settles on-chain.
+	if rem := activeOf(s, "s1"); rem != 100 {
+		t.Fatalf("resting covenant must NOT be decremented at match, got %d", rem)
 	}
 	_ = mk
 }
@@ -350,9 +341,8 @@ func TestCovenantMinLotRemainderTrim(t *testing.T) {
 	if len(got) != 1 || got[0].FillBase != 85 {
 		t.Fatalf("want a trimmed fill of 85, got %+v", got)
 	}
-	if activeOf(s, "cov1") != 5 {
-		t.Fatalf("covenant remainder = %d, want 5 (>= min_lot)", activeOf(s, "cov1"))
-	}
+	// The trim is a PLANNING guarantee (the FILL leaf enforces the >= min_lot remainder). The matcher
+	// does not decrement at match; the on-chain remainder (5) is re-rested by the watcher on settlement.
 }
 
 func TestCrossRailBridgeMatch(t *testing.T) {

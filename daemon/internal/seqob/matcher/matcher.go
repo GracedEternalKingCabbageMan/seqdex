@@ -241,21 +241,19 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 
 	out := make([]Match, 0, len(plan))
 	for _, p := range plan {
-		// Trade-truth commit point. ONLY a covenant resting order settles from an auto-cross: the taker
-		// builds + broadcasts the permissionless FILL spend from the carried covenant terms with nobody
-		// else online, so its optimistic decrement + trade record track on-chain reality (the chain
-		// watcher reconciles/reverts). An INTERACTIVE resting order CANNOT settle from a cross —
-		// routeMatches mints an unregistered session id, so any courier co-sign fails; interactive orders
-		// settle only via an explicit StartLift, which commits its own trade-truth on the maker's
-		// SettleAck (B-1). Recording/decrementing an interactive cross here was a pure phantom: a trade
-		// that never happened plus a decrement that shrank (or removed) a still-liftable resting order.
-		// So mutate trade-truth for a covenant resting order only; the Match is still emitted either way
-		// (a covenant taker settles it; an interactive one is superseded by StartLift). (B-2)
-		if p.e.Offer.GetCovenant() != nil {
-			_ = m.book.ApplyPartialFill(p.key, p.fillBase, "", 0)   // resting covenant: decrement (execution price = resting order's price)
-			_ = m.book.ApplyPartialFill(inKey, p.fillBase, "", 0)   // the incoming order's fill against it
-			m.book.RecordTrade(p.e.Offer, p.fillBase)
-		}
+		// The matcher is PURE plan + emit: it computes the crossing and advertises the Match, but commits
+		// NO trade-truth (no decrement, no RecordTrade). A cross is only a trade once it SETTLES on-chain,
+		// and only that is recorded — reorg-safely — by the party that owns the settlement:
+		//   - COVENANT resting order: the chain watcher, on the FILL's confirmation (RerestCovenantRemainder /
+		//     RemoveCovenantFilled), reconciling size to chain and un-recording on a Bitcoin reorg (Principle 1).
+		//     The watcher's record is a DELTA off the resting order's live size, so the matcher must NOT
+		//     pre-decrement here — an optimistic decrement makes that delta 0 and the real trade is lost.
+		//   - INTERACTIVE resting order: the maker's SettleAck after the lift broadcasts (B-1).
+		// Recording/decrementing at match time was the phantom-trade + double-count source (an auto-cross
+		// mints an unregistered session for interactive, and double-recorded covenants once the watcher
+		// was enabled). Leaving the order at full size until settlement can briefly over-advertise a covenant
+		// to two takers, but on-chain double-spend enforces a single fill and the watcher reconciles size on
+		// the first FILL it sees (mempool -> HoldCovenantForSpend). (B-2 / on-confirm recording)
 
 		mt := Match{
 			Pair:        incoming.GetPair(),
