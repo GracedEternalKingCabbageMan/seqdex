@@ -401,12 +401,40 @@ func (l *clnLNLeg) CancelHold(paymentHash []byte) error {
 		map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
 }
 
+// localScids lists the short_channel_ids of this node's LIVE channels, for
+// forcing into an invoice's routehints. On a slow-confirming chain (testnet4)
+// a PUBLIC channel can stay un-gossiped for hours (announcement needs depth 6),
+// during which a payer relying on gossip cannot route even to a DIRECT peer
+// ("Ran out of routes to try"). Exposing the channels explicitly makes every
+// invoice self-routing regardless of announcement state.
+func (l *clnLNLeg) localScids() []string {
+	var res struct {
+		Channels []struct {
+			State string `json:"state"`
+			Scid  string `json:"short_channel_id"`
+		} `json:"channels"`
+	}
+	if err := l.rpc.call(&res, "listpeerchannels", map[string]interface{}{}); err != nil {
+		return nil
+	}
+	var scids []string
+	for _, c := range res.Channels {
+		if c.State == "CHANNELD_NORMAL" && c.Scid != "" {
+			scids = append(scids, c.Scid)
+		}
+	}
+	return scids
+}
+
 func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry uint32, label, description string) (string, error) {
 	params := map[string]interface{}{
 		"amount_msat": amountMsat,
 		"label":       label,
 		"description": description,
 		"preimage":    hex.EncodeToString(preimage),
+	}
+	if scids := l.localScids(); len(scids) > 0 {
+		params["exposeprivatechannels"] = scids
 	}
 	if cltvExpiry != 0 {
 		params["cltv"] = cltvExpiry
