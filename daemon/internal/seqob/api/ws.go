@@ -241,6 +241,19 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 		return
 	}
 	if _, err := s.store.Submit(o); err != nil {
+		// A DURABLE offer (cross-chain / lightning / covenant) survives its maker's WS drop, so a
+		// reconnecting settlement agent re-posts a REFRESHED (re-signed, new expiry) copy against the
+		// still-resting key. Treat that as an EDIT + re-register (so lifts route to the reconnected
+		// agent) rather than a 409 — this is what keeps the durable book populated across WS churn.
+		if errors.Is(err, offerstore.ErrExists) {
+			if eerr := s.store.Edit(o); eerr != nil {
+				c.sendErr(409, "submit(refresh): "+eerr.Error())
+				return
+			}
+			s.registerMaker(c, o.GetMakerPubkey())
+			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
+			return
+		}
 		c.sendErr(409, "submit: "+err.Error())
 		return
 	}
