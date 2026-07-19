@@ -277,6 +277,12 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 	}
 
 	// Pay the maker's hold by bare hash; blocks until the maker settles.
+	// Emit H at the moment we commit funds so a caller that is killed mid-pay (e.g. an LSP whose
+	// exec timeout fires during PayHold) can reconcile: it greps this H and asks the paying node
+	// `listsendpays H` before telling the user nothing was spent, instead of prompting a double-pay.
+	if p.Log != nil {
+		p.Log("pureln taker: paying maker hold on H=%s (funds now committed)", hex.EncodeToString(hashH))
+	}
 	revealed, err := p.Ops.PayHold(hashH, terms.MakerLNNodeID, holdAmt, p.FinalCltv, secret)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_hold", err.Error())
