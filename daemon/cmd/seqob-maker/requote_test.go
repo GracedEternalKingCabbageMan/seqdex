@@ -126,3 +126,31 @@ func TestPostCancel(t *testing.T) {
 		t.Errorf("want an error on HTTP 409, got nil")
 	}
 }
+
+// The requote-exit delay: margin before expiry, floored for near-expired offers,
+// zero (disarmed) when the offer has no expiry.
+func TestRequoteDelay(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	if d := requoteDelay(0, now); d != 0 {
+		t.Fatalf("no-expiry offer must not arm a requote exit, got %v", d)
+	}
+	// 2h out -> exit at expiry-60s.
+	if d := requoteDelay(uint64(now.Add(2*time.Hour).Unix()), now); d != 2*time.Hour-requoteExitMargin {
+		t.Fatalf("2h expiry: got %v", d)
+	}
+	// Already inside the margin (or expired) -> floor, never negative.
+	if d := requoteDelay(uint64(now.Add(10*time.Second).Unix()), now); d != 5*time.Second {
+		t.Fatalf("near-expiry floor: got %v", d)
+	}
+}
+
+// offerRejected: only a validator rejection (400 "invalid offer: ...") means the
+// offer is off-book; rate limits (429) and conflicts (409) are not requote-exits.
+func TestOfferRejected(t *testing.T) {
+	if !offerRejected(400, "invalid offer: offer already expired") {
+		t.Fatal("expired rejection must trigger a requote exit")
+	}
+	if offerRejected(429, "rate limited") || offerRejected(409, "submit: offer already resting") || offerRejected(400, "decode To: bad json") {
+		t.Fatal("non-rejection errors must not trigger a requote exit")
+	}
+}
