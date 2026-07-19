@@ -13,6 +13,7 @@ package offerstore
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -246,8 +247,13 @@ func keyOf(o *seqobv1.Offer) Key {
 	return Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()}
 }
 
+// ErrExists is returned by Submit when the (maker_pubkey, offer_id) key is already
+// resting. Callers refreshing a still-resting DURABLE offer (a reconnecting cross /
+// lightning settlement agent re-posts a re-signed copy) should Edit instead of erroring.
+var ErrExists = errors.New("offer already resting")
+
 // Submit verifies the offer's signature and inserts it as a new OPEN order.
-// It is an error to Submit a key that already exists (use Edit to re-sign).
+// It is an error (ErrExists) to Submit a key that already exists (use Edit to re-sign).
 func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 	if err := offer.VerifyOffer(o); err != nil {
 		return Key{}, fmt.Errorf("offer signature: %w", err)
@@ -259,7 +265,7 @@ func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 	s.mu.Lock()
 	if _, ok := s.entries[k]; ok {
 		s.mu.Unlock()
-		return Key{}, fmt.Errorf("offer %s/%s already exists", k.MakerPubkey, k.OfferID)
+		return Key{}, fmt.Errorf("offer %s/%s: %w", k.MakerPubkey, k.OfferID, ErrExists)
 	}
 	e := &Entry{
 		Offer:        o,
@@ -637,20 +643,31 @@ func (s *Store) SweepExpired() int {
 	return len(expired)
 }
 
-// RemoveByMaker drops every resting INTERACTIVE offer for makerPubkey, emitting a
-// removal event per offer. Called when a maker's websocket disconnects: in the
-// interactive book the maker must be online to co-sign a lift, so once it is gone
-// its offers are unliftable and must not linger as un-fillable "ghosts".
+// RemoveByMaker drops every resting INTERACTIVE SAME-CHAIN offer for makerPubkey,
+// emitting a removal event per offer. Called when a maker's websocket disconnects:
+// an interactive same-chain co-sign offer needs the maker ONLINE to co-sign a lift,
+// so once its connection drops the offer is unliftable and must not linger as an
+// un-fillable "ghost".
 //
-// COVENANT offers are the deliberate exception and are NOT evicted: they are
-// funded on-chain and fillable permissionlessly with the maker OFFLINE (that is
-// the whole point of the passive CLOB), so a covenant order must survive its
-// maker's disconnect. Returns the number removed.
+// DURABLE settlement types are the deliberate exception and are NOT evicted, because a
+// lift does not need this maker's live co-sign at disconnect time:
+//   - COVENANT offers: funded on-chain, fillable permissionlessly with the maker OFFLINE
+//     (the whole point of the passive CLOB).
+//   - CROSS-CHAIN (BTC<->asset) and LIGHTNING/sub-asset offers: serviced by the maker's
+//     always-online settlement agent (seqob-maker), which reconnects and re-registers.
+//     A transient WS blip must NOT evict these — that emptied the cross book (BTC vanished
+//     from the DEX). Ghost-safety holds regardless: a taker's pre-lock terms handshake
+//     fails fast and spends nothing if no agent answers, and the TTL sweep removes truly
+//     abandoned offers. See durable-cross-offer design.
+//
+// Returns the number removed.
 func (s *Store) RemoveByMaker(makerPubkey string) int {
 	s.mu.Lock()
 	victims := make([]Key, 0)
 	for k, e := range s.entries {
-		if k.MakerPubkey == makerPubkey && e.Offer.GetCovenant() == nil {
+		// Evict ONLY interactive same-chain co-sign offers (they need the maker online now). A same-chain
+		// COVENANT offer carries a covenant and is permissionless, so it is spared alongside cross/lightning.
+		if k.MakerPubkey == makerPubkey && e.Offer.GetSameChain() != nil && e.Offer.GetCovenant() == nil {
 			victims = append(victims, k)
 		}
 	}

@@ -1,6 +1,7 @@
 package offerstore
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -429,5 +430,68 @@ func TestCovenantSurvivesMakerDisconnect(t *testing.T) {
 	}
 	if _, ok := s.Get(Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "cov1"}); !ok {
 		t.Fatalf("covenant offer must survive maker disconnect")
+	}
+}
+
+func mkCrossOffer(t *testing.T, k *btcec.PrivateKey, id string, expires uint64) *seqobv1.Offer {
+	t.Helper()
+	o := &seqobv1.Offer{
+		OfferId:       id,
+		SchemaVersion: 1,
+		Pair:          &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "BTC"},
+		TradeDir:      seqobv1.TradeDir_TRADE_DIR_SELL,
+		BaseAmount:    100,
+		OfferAmount:   100,
+		OfferAsset:    "gold",
+		WantAmount:    45,
+		WantAsset:     "BTC",
+		AllowPartial:  true,
+		CreatedAtUnix: 1750000000,
+		ExpiresAtUnix: expires,
+		Settlement:    &seqobv1.Offer_CrossChain{CrossChain: &seqobv1.CrossChainTerms{}},
+	}
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return o
+}
+
+func TestCrossSurvivesMakerDisconnect(t *testing.T) {
+	// A BTC<->asset cross offer is serviced by the maker's always-online settlement agent, which
+	// reconnects after a WS blip. RemoveByMaker must NOT evict it (evicting it on every transient drop
+	// emptied the cross book and vanished BTC from the DEX). Only interactive same-chain co-sign offers
+	// — which genuinely need the maker online to lift — are evicted.
+	s := New(nil)
+	k := key(t)
+	cross := mkCrossOffer(t, k, "x1", 1799999999)
+	same := mkOffer(t, k, "s1", 1799999999) // interactive same-chain: MUST still be evicted
+	if _, err := s.Submit(cross); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Submit(same); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.RemoveByMaker(cross.GetMakerPubkey()); n != 1 {
+		t.Fatalf("RemoveByMaker evicted %d offers; want 1 (the same-chain one only)", n)
+	}
+	if _, ok := s.Get(Key{MakerPubkey: cross.GetMakerPubkey(), OfferID: "x1"}); !ok {
+		t.Fatalf("cross offer must survive maker disconnect")
+	}
+	if _, ok := s.Get(Key{MakerPubkey: same.GetMakerPubkey(), OfferID: "s1"}); ok {
+		t.Fatalf("interactive same-chain offer must be evicted on disconnect")
+	}
+}
+
+func TestSubmitDuplicateReturnsErrExists(t *testing.T) {
+	// A reconnecting durable-offer agent re-posts the same (maker, offer_id) key; Submit must return
+	// ErrExists so the WS layer refreshes it via Edit + re-register instead of 409ing the maker off.
+	s := New(nil)
+	k := key(t)
+	o := mkCrossOffer(t, k, "x1", 1799999999)
+	if _, err := s.Submit(o); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Submit(o); !errors.Is(err, ErrExists) {
+		t.Fatalf("duplicate Submit err = %v; want ErrExists", err)
 	}
 }
