@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -264,6 +265,14 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 	accepted := make(map[string]bool)
 	takes := make(map[string]uint64) // session -> take_amount, for the settle-ack fill_base (B-1)
 	o := maker.Offer
+	// Exit-for-requote (see requote_exit.go). A co-sign session quiet for 10
+	// minutes is treated as abandoned (taker vanished after SwapAccept) so a
+	// stuck session can never pin a stale quote on the book forever.
+	var liveSessions, lastAccept atomic.Int64
+	idle := func() bool {
+		return liveSessions.Load() == 0 || time.Since(time.Unix(lastAccept.Load(), 0)) > 10*time.Minute
+	}
+	armRequoteExit(o, idle)
 	// Reconnect resilience + STAY on the book. Exiting on a WS error lets the supervisor restart us,
 	// which mints a NEW offer_id → a taker who lifted the old id races a replaced offer and gets "no
 	// maker co-sign". So we reconnect and re-post the SAME offer_id (refreshed window + re-sign). Two
@@ -355,6 +364,8 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				delete(accepted, sid) // B3: prune per-session state now the swap is done (serve() runs forever)
 				delete(crypters, sid)
 				delete(takes, sid)
+				liveSessions.Add(-1)
+				requoteExitIfPending(idle)
 				continue
 			}
 			cr := crypters[sid]
@@ -373,6 +384,8 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				continue
 			}
 			accepted[sid] = true
+			liveSessions.Add(1)
+			lastAccept.Store(time.Now().Unix())
 			fmt.Printf("session %s: couriered SwapAccept (%d bytes); awaiting taker broadcast\n", sid, len(sealedAccept))
 
 		case from.GetOrderStatus() != nil:
@@ -387,7 +400,9 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 			// off-book — the relay validates a submit ASYNC and reports rejection here, not as a write
 			// error. Re-post it (rate-limited, so a persistent-error loop can't storm the relay) so we
 			// don't sit silently unliftable on a still-open connection.
-			repost(conn, "after relay error")
+			if !repost(conn, "after relay error") && offerRejected(e.GetCode(), e.GetMessage()) {
+				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			}
 		}
 	}
 }
@@ -941,6 +956,8 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
 	filled := false
+	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
+	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -1054,6 +1071,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 					if settled && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
+					requoteExitIfPending(idle)
 				}()
 				if reverse {
 					// BUY: the maker holds the secret and funds the BTC leg first.
@@ -1125,6 +1143,9 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			if offerRejected(e.GetCode(), e.GetMessage()) {
+				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			}
 		}
 	}
 }

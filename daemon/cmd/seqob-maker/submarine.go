@@ -154,6 +154,8 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
 	filled := false
+	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
+	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -244,6 +246,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					if settled && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
+					requoteExitIfPending(idle)
 				}()
 				if o.GetLightning().GetLnDirection() == offer.LnBTCForAsset {
 					// REVERSE (maker-secret): the maker locks the asset + issues a
@@ -329,6 +332,9 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			if offerRejected(e.GetCode(), e.GetMessage()) {
+				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			}
 		}
 	}
 }

@@ -139,6 +139,8 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
 	filled := false
+	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
+	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -248,6 +250,7 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					if settled && !partial && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
+					requoteExitIfPending(idle)
 				}()
 
 				// The maker builds the BTC-leg swap with a hash-only lock (it learns P
@@ -318,6 +321,9 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			if offerRejected(e.GetCode(), e.GetMessage()) {
+				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			}
 		}
 	}
 }
