@@ -41,7 +41,7 @@ func cmdXPln(args []string) {
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg) (required)")
 	btcAsset := fs.String("btc-asset", "", "counter-leg SETTLEMENT asset id (hex); empty = policy asset / real BTC-LN. Set to route the counter leg over a 2nd issued asset (asset<->asset). MUST match the maker")
-	quoteAssetFlag := fs.String("quote-asset", "", "QUOTE asset id (hex) of the market; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for an asset<->asset market (e.g. -asset EURX -quote-asset OILX); defaults -btc-asset to it")
+	quoteAssetFlag := fs.String("quote-asset", "", "QUOTE asset id (hex) of the market; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for an asset<->asset market. Numeraire on the QUOTE side to match the maker + the wallet's canonicalPair (e.g. -asset OILX -quote-asset EURX, i.e. OILX priced in EURX); defaults -btc-asset to it")
 	finalCltv := fs.Uint("final-cltv", 18, "final-hop cltv delta when paying the maker's hold")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	holdWait := fs.Duration("hold-wait", 2*time.Minute, "max wait for the maker to register its hold after we send the invoice")
