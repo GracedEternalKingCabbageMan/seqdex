@@ -84,7 +84,8 @@ func main() {
 	max0conf := flag.Uint64("max-0conf", 0, "lightning: 0-conf LP-fronting cap (asset atoms). Trades whose on-chain asset leg is <= this settle INSTANTLY (skip the anchor-bury wait); the maker/taker fronts the Bitcoin-reorg risk. Advertised in the offer's LightningTerms. 0 = disabled (always anchor-gate).")
 	onchainCltv := flag.Uint("onchain-cltv", 240, "lightning: advisory CLTV (blocks) in the resting LightningTerms (the load-bearing T_seq is minted per-lift)")
 	assetLnSocket := flag.String("asset-ln-socket", "", "pureln: the maker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg; required for -mode pureln)")
-	btcAsset := flag.String("btc-asset", "", "pureln: BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in)")
+	btcAsset := flag.String("btc-asset", "", "pureln: counter-leg SETTLEMENT asset id (hex); empty = policy asset / real BTC-LN. Set to route the counter leg over a 2nd issued asset (asset<->asset pure-LN)")
+	quoteAsset := flag.String("quote-asset", "", "pureln: QUOTE asset id (hex) the offer advertises; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for a truthful asset<->asset market (e.g. base=EURX -quote-asset=OILX); defaults -btc-asset to the same id so settlement routes over it")
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
 	requote := flag.Bool("requote", false, "cross/lightning/pureln: after each settled fill, reconnect dropped channel peers and re-post a FRESH offer (same offer id) instead of cancelling and exiting; keeps a live quote without a manual restart (default off = quote once then exit)")
 	flag.Parse()
@@ -136,12 +137,19 @@ func main() {
 	}
 
 	if pureln {
+		// asset<->asset: -quote-asset advertises the true quote AND (unless -btc-asset is set
+		// explicitly) routes the settlement counter-leg over that same asset, so one flag makes a
+		// truthful EURX/OILX market instead of the old BTC-sentinel disguise.
+		effBtcAsset := *btcAsset
+		if effBtcAsset == "" {
+			effBtcAsset = *quoteAsset
+		}
 		runPureLNMaker(pureLNMakerConfig{
 			relay: *relay, makerKey: makerKey, makerPubHex: makerPubHex,
 			makerPubKey: makerKey.PubKey().SerializeCompressed(),
 			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
 			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
-			assetLnSock: *assetLnSocket, btcLnSock: *lnSocket, btcAsset: *btcAsset,
+			assetLnSock: *assetLnSocket, btcLnSock: *lnSocket, btcAsset: effBtcAsset, quoteAsset: *quoteAsset,
 			holdTimeout: *holdTimeout, onchainCltv: uint32(*onchainCltv),
 			reverse: strings.ToLower(*side) == "sell", // sell = maker gives the asset (holds BTC); buy = maker acquires (holds asset)
 			requote: *requote,

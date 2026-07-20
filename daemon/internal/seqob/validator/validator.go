@@ -302,10 +302,21 @@ func (v *Validator) checkLightning(o *seqobv1.Offer) error {
 	}
 	p := o.GetPair()
 	baseBTC, quoteBTC := offer.IsBTCSentinel(p.GetBaseAsset()), offer.IsBTCSentinel(p.GetQuoteAsset())
-	if baseBTC == quoteBTC {
+	// Pure-LN (ln_direction 2/3) is two Lightning HTLCs bound by ONE preimage — the mechanism is
+	// asset-agnostic, so a pure-LN market may be asset<->asset (both sides real Sequentia assets, e.g.
+	// EURX/OILX) as well as asset<->BTC. Submarine (0/1) and sub-asset (4/5) settle a REAL BTC leg, so
+	// they keep the "exactly one BTC-sentinel side, and it is the quote" convention. (An out-of-range
+	// direction takes the strict branch and is rejected by the ln_direction range check below.)
+	if d := lt.GetLnDirection(); d == 2 || d == 3 {
+		if baseBTC && quoteBTC {
+			return fmt.Errorf("pure-LN pair cannot be BTC<->BTC")
+		}
+		if baseBTC {
+			return fmt.Errorf("pure-LN pair base must be an asset (base=asset, quote=asset or BTC)")
+		}
+	} else if baseBTC == quoteBTC {
 		return fmt.Errorf("lightning pair must have exactly one BTC-sentinel side")
-	}
-	if !quoteBTC {
+	} else if !quoteBTC {
 		return fmt.Errorf("lightning pair must be base=asset, quote=%s", offer.BTCSentinel)
 	}
 	// Advisory HTLC keys are raw compressed pubkey bytes (LightningTerms uses bytes,

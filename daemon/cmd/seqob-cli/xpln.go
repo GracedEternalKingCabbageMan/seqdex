@@ -40,7 +40,8 @@ func cmdXPln(args []string) {
 	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg) (required)")
-	btcAsset := fs.String("btc-asset", "", "BTC-leg asset id (hex); empty = policy asset / real BTC-LN. Set to route the BTC leg over a 2nd issued asset (regtest stand-in). MUST match the maker's -btc-asset")
+	btcAsset := fs.String("btc-asset", "", "counter-leg SETTLEMENT asset id (hex); empty = policy asset / real BTC-LN. Set to route the counter leg over a 2nd issued asset (asset<->asset). MUST match the maker")
+	quoteAssetFlag := fs.String("quote-asset", "", "QUOTE asset id (hex) of the market; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for an asset<->asset market (e.g. -asset EURX -quote-asset OILX); defaults -btc-asset to it")
 	finalCltv := fs.Uint("final-cltv", 18, "final-hop cltv delta when paying the maker's hold")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	holdWait := fs.Duration("hold-wait", 2*time.Minute, "max wait for the maker to register its hold after we send the invoice")
@@ -57,6 +58,18 @@ func cmdXPln(args []string) {
 		fatal("xpln requires -asset-ln-socket (asset leg) and -ln-socket (BTC leg)")
 	}
 
+	// asset<->asset pure-LN: the market QUOTE is a real asset id and the settlement counter-leg routes
+	// over it (defaulting -btc-asset). Empty -quote-asset keeps the classic asset<->BTC (quote = the BTC
+	// sentinel, counter leg = real BTC-LN over -ln-socket).
+	quoteAsset := *quoteAssetFlag
+	if quoteAsset == "" {
+		quoteAsset = offer.BTCSentinel
+	}
+	effBtcAsset := *btcAsset
+	if effBtcAsset == "" && !offer.IsBTCSentinel(quoteAsset) {
+		effBtcAsset = quoteAsset
+	}
+
 	// The taker's side selects which maker offer it matches: buying the asset
 	// needs an offer where the maker GIVES it (LnBTCLNForAssetLN); selling needs
 	// an offer where the maker ACQUIRES it (LnAssetLNForBTCLN).
@@ -70,7 +83,7 @@ func cmdXPln(args []string) {
 
 	// 1. Find + verify a matching pure-LN offer.
 	var book seqobv1.PublicBook
-	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, offer.BTCSentinel), &book); err != nil {
+	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, quoteAsset), &book); err != nil {
 		fatal("get book: %v", err)
 	}
 	var target *seqobv1.Offer
@@ -95,7 +108,7 @@ func cmdXPln(args []string) {
 
 	assetAtoms := target.GetBaseAmount()
 	btcSats := target.GetWantAmount()
-	if target.GetOfferAsset() == offer.BTCSentinel {
+	if target.GetOfferAsset() == quoteAsset {
 		btcSats = target.GetOfferAmount()
 	}
 	seqMsat, btcMsat := assetAtoms*1000, btcSats*1000
@@ -166,8 +179,8 @@ func cmdXPln(args []string) {
 	}
 
 	var btcLeg xchain.LNLeg = xchain.NewCLNLNLeg(*lnSocket)
-	if *btcAsset != "" {
-		btcLeg = xchain.NewCLNAssetLNLeg(*lnSocket, *btcAsset)
+	if effBtcAsset != "" {
+		btcLeg = xchain.NewCLNAssetLNLeg(*lnSocket, effBtcAsset)
 	}
 	swap := xchain.NewPureLNSwap(
 		xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),

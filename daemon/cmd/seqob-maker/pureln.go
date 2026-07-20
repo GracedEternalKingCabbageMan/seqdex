@@ -47,7 +47,8 @@ type pureLNMakerConfig struct {
 	offerID     string
 	assetLnSock string // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
 	btcLnSock   string // the maker's SeqLN-on-Bitcoin lightning-rpc (BTC leg)
-	btcAsset    string // BTC-leg asset id (hex); empty = the policy asset / a real BTC-LN node. Set to route the "BTC" leg over a 2nd issued asset (regtest stand-in).
+	btcAsset    string // counter-leg SETTLEMENT asset id (hex); empty = the policy asset / a real BTC-LN node. Set to route the counter leg over a 2nd issued asset (asset<->asset pure-LN).
+	quoteAsset  string // pure-LN QUOTE asset id (hex) the offer ADVERTISES; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for a truthful asset<->asset market (e.g. EURX/OILX).
 	holdTimeout time.Duration
 	reverse     bool // true = SELL the asset (maker gives asset; holds BTC); false = BUY (maker acquires asset; holds asset)
 	onchainCltv uint32
@@ -71,10 +72,15 @@ func (cfg pureLNMakerConfig) plnDirection() (client.PlnDirection, uint32) {
 // in the E2E Terms message.
 func buildPureLNOffer(cfg pureLNMakerConfig, holdLnNodeID string) *seqobv1.Offer {
 	_, lnDir := cfg.plnDirection()
+	// The QUOTE (counter) leg: a real Sequentia asset id for an asset<->asset pure-LN market
+	// (e.g. EURX/OILX), or the BTC sentinel for the classic asset<->BTC pure-LN. The SETTLEMENT
+	// leg is routed over cfg.btcAsset (which main.go defaults to this same id for asset<->asset), so
+	// the offer now advertises its true pair instead of masquerading every counter-leg as "BTC".
+	quoteAsset := orDefault(cfg.quoteAsset, offer.BTCSentinel)
 	o := &seqobv1.Offer{
 		OfferId:           orDefault(cfg.offerID, randstr.Hex(16)),
 		SchemaVersion:     1,
-		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
+		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: quoteAsset},
 		BaseAmount:        cfg.assetAmt,
 		AllowPartial:      false, // whole-swap lifts, one at a time
 		CreatedAtUnix:     uint64(time.Now().Unix()),
@@ -93,10 +99,10 @@ func buildPureLNOffer(cfg pureLNMakerConfig, holdLnNodeID string) *seqobv1.Offer
 	if cfg.reverse {
 		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_SELL // the maker gives up the asset
 		o.OfferAsset, o.OfferAmount = cfg.asset, cfg.assetAmt
-		o.WantAsset, o.WantAmount = offer.BTCSentinel, cfg.btcSats
+		o.WantAsset, o.WantAmount = quoteAsset, cfg.btcSats
 	} else {
 		o.TradeDir = seqobv1.TradeDir_TRADE_DIR_BUY // the maker acquires the asset
-		o.OfferAsset, o.OfferAmount = offer.BTCSentinel, cfg.btcSats
+		o.OfferAsset, o.OfferAmount = quoteAsset, cfg.btcSats
 		o.WantAsset, o.WantAmount = cfg.asset, cfg.assetAmt
 	}
 	return o
