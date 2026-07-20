@@ -85,7 +85,7 @@ func main() {
 	onchainCltv := flag.Uint("onchain-cltv", 240, "lightning: advisory CLTV (blocks) in the resting LightningTerms (the load-bearing T_seq is minted per-lift)")
 	assetLnSocket := flag.String("asset-ln-socket", "", "pureln: the maker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg; required for -mode pureln)")
 	btcAsset := flag.String("btc-asset", "", "pureln: counter-leg SETTLEMENT asset id (hex); empty = policy asset / real BTC-LN. Set to route the counter leg over a 2nd issued asset (asset<->asset pure-LN)")
-	quoteAsset := flag.String("quote-asset", "", "pureln: QUOTE asset id (hex) the offer advertises; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for a truthful asset<->asset market (e.g. base=EURX -quote-asset=OILX); defaults -btc-asset to the same id so settlement routes over it")
+	quoteAsset := flag.String("quote-asset", "", "pureln: QUOTE asset id (hex) the offer advertises; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for a truthful asset<->asset market. Put the NUMERAIRE on the QUOTE side so the market key matches the wallet's canonicalPair (e.g. base=OILX -quote-asset=EURX, i.e. OILX priced in EURX) — the wallet queries <base>/<quote> in exactly that orientation, so a reversed pair rests in a market the wallet never reads. Defaults -btc-asset to the quote id so settlement routes over it")
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
 	requote := flag.Bool("requote", false, "cross/lightning/pureln: after each settled fill, reconnect dropped channel peers and re-post a FRESH offer (same offer id) instead of cancelling and exiting; keeps a live quote without a manual restart (default off = quote once then exit)")
 	flag.Parse()
@@ -139,7 +139,8 @@ func main() {
 	if pureln {
 		// asset<->asset: -quote-asset advertises the true quote AND (unless -btc-asset is set
 		// explicitly) routes the settlement counter-leg over that same asset, so one flag makes a
-		// truthful EURX/OILX market instead of the old BTC-sentinel disguise.
+		// truthful OILX/EURX market (base=commodity, quote=numeraire) instead of the old BTC-sentinel
+		// disguise. Keep the numeraire as the quote so the market key matches the wallet's canonicalPair.
 		effBtcAsset := *btcAsset
 		if effBtcAsset == "" {
 			effBtcAsset = *quoteAsset
