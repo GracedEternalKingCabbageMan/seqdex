@@ -56,12 +56,20 @@ func cmdXFundSeq(args []string) {
 		fatal("-seq-rpc: %v", err)
 	}
 	seqChain := xchain.NewChain(seqRPC, *seqWallet)
+	// NewSwapBitcoin builds a Bitcoin backend eagerly (it needs chain params), but LockSEQLeg only ever
+	// touches the SEQ side — so a params-only dummy BTC chain (never dialed) lets us fund the SEQ leg
+	// without a bitcoind. testnet4 params match the live parent chain.
+	params, err := xchain.BitcoinChainParams("testnet4")
+	if err != nil {
+		fatal("chain params: %v", err)
+	}
+	dummyBtc := xchain.NewBitcoinChain(xchain.NewRPC("127.0.0.1", 1, "x", "x"), "", params)
 
 	// Build the HTLC on H (claim=maker with P, refund=taker after T_seq) and fund it from the taker's own
 	// asset wallet. LockSEQLeg re-derives the redeem script exactly as the maker will, waits for the funding
 	// tx to confirm in a Sequentia block, and returns the funded leg. A slow-confirm returns the leg WITH an
 	// error so we can still print the refundable outpoint.
-	swap := xchain.NewSwapBitcoin(nil, seqChain, xchain.NewHashLockFromHash(hashH))
+	swap := xchain.NewSwapBitcoin(dummyBtc, seqChain, xchain.NewHashLockFromHash(hashH))
 	leg, blockHash, err := swap.LockSEQLeg(makerClaimPub, refundKey.PubKey(), atomsToCoinsCli(*seqAmount), *asset, uint32(*seqLocktime))
 	if leg == nil {
 		fatal("fund SEQ HTLC from the taker's wallet: %v", err)
