@@ -163,13 +163,29 @@ func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
 	}
 }
 
+// subKey is the per-connection subscription key. It includes the book NAMESPACE
+// (transparent vs confidential) so a client may hold BOTH a transparent and a
+// confidential subscription to the same pair without one replacing the other.
+func subKey(pair *seqobv1.AssetPair) string {
+	k := pair.GetBaseAsset() + "/" + pair.GetQuoteAsset()
+	if pair.GetConfidential() {
+		k += "|conf"
+	}
+	return k
+}
+
 func (s *Server) wsSubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 	if pair == nil {
 		c.sendErr(400, "market_subscribe missing pair")
 		return
 	}
-	pk := pair.GetBaseAsset() + "/" + pair.GetQuoteAsset()
-	snap, id, ch := s.store.Subscribe(pair)
+	// The subscribe request carries the book namespace (AssetPair.confidential): false
+	// (default) is the transparent book, true the separate blinded book. The snapshot and
+	// every delta are filtered to it, matching REST (?confidential=) and the matcher, so a
+	// transparent-book UI never renders a confidential offer and vice-versa.
+	confidential := pair.GetConfidential()
+	pk := subKey(pair)
+	snap, id, ch := s.store.Subscribe(pair, confidential)
 	stop := make(chan struct{})
 
 	c.mu.Lock()
@@ -218,7 +234,7 @@ func (s *Server) wsUnsubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 	if pair == nil {
 		return
 	}
-	pk := pair.GetBaseAsset() + "/" + pair.GetQuoteAsset()
+	pk := subKey(pair) // namespace-scoped, matching wsSubscribe
 	c.mu.Lock()
 	if stop, ok := c.subs[pk]; ok {
 		stop()

@@ -79,16 +79,23 @@ const (
 
 // Event is a single book delta delivered to subscribers.
 type Event struct {
-	Type   EventType
-	Pair   *seqobv1.AssetPair
-	Offer  *seqobv1.Offer       // set for EventCreated
-	Ref    *seqobv1.OfferRef    // set for EventRemoved
-	Status *seqobv1.OrderStatus // set for EventStatus
+	Type EventType
+	Pair *seqobv1.AssetPair
+	// Confidential is the delta's book NAMESPACE (the resting offer's confidential flag),
+	// carried here because EventRemoved/EventStatus reference an offer by key only (no Offer
+	// pointer) yet must still be filtered to their namespace. Subscribers see only deltas whose
+	// Confidential matches their own — the same disjoint transparent/blinded split SnapshotPair
+	// and the matcher enforce.
+	Confidential bool
+	Offer        *seqobv1.Offer       // set for EventCreated
+	Ref          *seqobv1.OfferRef    // set for EventRemoved
+	Status       *seqobv1.OrderStatus // set for EventStatus
 }
 
 type subscriber struct {
-	pair string // pairKey filter, or "" for all pairs
-	ch   chan Event
+	pair         string // pairKey filter, or "" for all pairs
+	confidential bool   // book namespace this subscriber is bound to (only matching-namespace deltas are delivered)
+	ch           chan Event
 }
 
 // Store is the in-memory order book.
@@ -275,7 +282,7 @@ func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 	}
 	s.put(k, e)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return k, nil
 }
 
@@ -307,9 +314,11 @@ func (s *Store) Edit(o *seqobv1.Offer) error {
 	}
 	s.put(k, e)
 	s.mu.Unlock()
-	// Emit a removed+created pair so subscribers converge regardless of pair change.
-	s.broadcast(Event{Type: EventRemoved, Pair: old.Offer.GetPair(), Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	// Emit a removed+created pair so subscribers converge regardless of pair change. Each
+	// delta carries its OWN offer's namespace: a namespace change (re-signed transparent<->
+	// confidential) must remove from the old book and create in the new one.
+	s.broadcast(Event{Type: EventRemoved, Pair: old.Offer.GetPair(), Confidential: old.Offer.GetConfidential(), Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return nil
 }
 
@@ -333,9 +342,10 @@ func (s *Store) Cancel(c *seqobv1.OfferCancel) error {
 		return fmt.Errorf("offer %s/%s not found", k.MakerPubkey, k.OfferID)
 	}
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	s.remove(k)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil
 }
 
@@ -395,11 +405,11 @@ func (s *Store) SnapshotPair(p *seqobv1.AssetPair, confidential bool) []*seqobv1
 	return out
 }
 
-func (s *Store) snapshotLocked(pk string) []*seqobv1.Offer {
+func (s *Store) snapshotLocked(pk string, confidential bool) []*seqobv1.Offer {
 	set := s.pairs[pk]
 	out := make([]*seqobv1.Offer, 0, len(set))
 	for k := range set {
-		if e, ok := s.entries[k]; ok {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
 			out = append(out, e.Offer)
 		}
 	}
@@ -545,6 +555,7 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 	e.SettleTxid = settleTxid
 	e.AnchorConfs = anchorConfs
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	if e.ActiveAmount == 0 && anchorConfs >= e.Offer.GetMinAnchorDepth() {
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_FILLED
 	} else {
@@ -557,9 +568,9 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 	}
 	s.mu.Unlock()
 
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	if filled {
-		s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	}
 	return nil
 }
@@ -579,11 +590,12 @@ func (s *Store) dropWithStatus(k Key, status seqobv1.OfferStatus) error {
 	}
 	e.Status = status
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.remove(k)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
-	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil
 }
 
@@ -607,7 +619,7 @@ func (s *Store) Reopen(o *seqobv1.Offer, restoreActive uint64) error {
 	e := &Entry{Offer: o, Status: status, ActiveAmount: restoreActive, CreatedAt: s.now()}
 	s.put(k, e)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return nil
 }
 
@@ -625,6 +637,7 @@ func (s *Store) SweepExpired() int {
 	}
 	type ev struct {
 		pair *seqobv1.AssetPair
+		conf bool
 		st   *seqobv1.OrderStatus
 		ref  *seqobv1.OfferRef
 	}
@@ -632,13 +645,13 @@ func (s *Store) SweepExpired() int {
 	for _, k := range expired {
 		e := s.entries[k]
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_EXPIRED
-		evs = append(evs, ev{pair: e.Offer.GetPair(), st: e.orderStatus(k), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), st: e.orderStatus(k), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 		s.remove(k)
 	}
 	s.mu.Unlock()
 	for _, e := range evs {
-		s.broadcast(Event{Type: EventStatus, Pair: e.pair, Status: e.st})
-		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
+		s.broadcast(Event{Type: EventStatus, Pair: e.pair, Confidential: e.conf, Status: e.st})
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
 	}
 	return len(expired)
 }
@@ -673,17 +686,18 @@ func (s *Store) RemoveByMaker(makerPubkey string) int {
 	}
 	type ev struct {
 		pair *seqobv1.AssetPair
+		conf bool
 		ref  *seqobv1.OfferRef
 	}
 	evs := make([]ev, 0, len(victims))
 	for _, k := range victims {
 		e := s.entries[k]
-		evs = append(evs, ev{pair: e.Offer.GetPair(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 		s.remove(k)
 	}
 	s.mu.Unlock()
 	for _, e := range evs {
-		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
 	}
 	return len(victims)
 }
@@ -740,10 +754,11 @@ func (s *Store) HoldCovenantGhost(k Key, reason string) error {
 	e.ActiveAmount = 0
 	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.mu.Unlock()
 	if changed {
-		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	}
 	return nil
 }
@@ -775,10 +790,11 @@ func (s *Store) ReconcileCovenantActive(k Key, active uint64) error {
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
 	}
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.mu.Unlock()
 	if changed {
-		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	}
 	return nil
 }
@@ -824,14 +840,15 @@ func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size ui
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
 	}
 	pair := no.GetPair()
+	conf := no.GetConfidential()
 	st := e.orderStatus(k)
 	s.mu.Unlock()
 	if filled > 0 {
 		s.RecordTrade(no, filled) // re-locks internally; safe after Unlock
 	}
 	// Emit created (subscribers re-learn the new outpoint) then status.
-	s.broadcast(Event{Type: EventCreated, Pair: pair, Offer: no})
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	s.broadcast(Event{Type: EventCreated, Pair: pair, Confidential: conf, Offer: no})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	return nil
 }
 
@@ -855,10 +872,11 @@ func (s *Store) HoldCovenantForSpend(k Key, spenderTxid string) error {
 	e.SettleTxid = spenderTxid
 	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.mu.Unlock()
 	if changed {
-		s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	}
 	return nil
 }
@@ -883,12 +901,13 @@ func (s *Store) RemoveCovenantFilled(k Key, settleTxid string) error {
 	filledOffer := e.Offer
 	e.ActiveAmount = 0
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.remove(k)
 	s.mu.Unlock()
 	s.RecordTrade(filledOffer, filled) // re-locks internally; safe after Unlock
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
-	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil
 }
 
@@ -906,10 +925,15 @@ func (s *Store) RunExpirySweeper(interval time.Duration, stop <-chan struct{}) {
 	}
 }
 
-// Subscribe registers a delta subscriber. If pairFilter is non-nil, only deltas
-// for that pair are delivered. It returns the current snapshot for the pair (or
-// all pairs if pairFilter is nil), a subscription id, and the delta channel.
-func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair) ([]*seqobv1.Offer, int, <-chan Event) {
+// Subscribe registers a delta subscriber bound to a book NAMESPACE: confidential=false is
+// the transparent book, confidential=true the separate blinded book. Both the returned
+// snapshot and every subsequent delta are filtered to that namespace, so a transparent
+// subscriber never sees a confidential offer and vice-versa — the same disjoint split
+// SnapshotPair serves over REST and the matcher enforces on crossing. If pairFilter is
+// non-nil, only deltas for that pair are delivered; a nil pairFilter subscribes to every
+// pair (still within the requested namespace). Returns the current snapshot, a subscription
+// id, and the delta channel.
+func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair, confidential bool) ([]*seqobv1.Offer, int, <-chan Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := s.nextSub
@@ -918,16 +942,18 @@ func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair) ([]*seqobv1.Offer, int,
 	if pairFilter != nil {
 		pk = pairKey(pairFilter)
 	}
-	sub := &subscriber{pair: pk, ch: make(chan Event, s.subBuf)}
+	sub := &subscriber{pair: pk, confidential: confidential, ch: make(chan Event, s.subBuf)}
 	s.subs[id] = sub
 
 	var snap []*seqobv1.Offer
 	if pk != "" {
-		snap = s.snapshotLocked(pk)
+		snap = s.snapshotLocked(pk, confidential)
 	} else {
 		snap = make([]*seqobv1.Offer, 0, len(s.entries))
 		for _, e := range s.entries {
-			snap = append(snap, e.Offer)
+			if e.Offer.GetConfidential() == confidential {
+				snap = append(snap, e.Offer)
+			}
 		}
 	}
 	return snap, id, sub.ch
@@ -993,6 +1019,12 @@ func (s *Store) broadcast(ev Event) {
 	s.mu.RLock()
 	subs := make([]*subscriber, 0, len(s.subs))
 	for _, sub := range s.subs {
+		// Namespace filter: a delta only reaches subscribers bound to its OWN book
+		// (transparent vs confidential), so the two books stay disjoint over the delta
+		// stream exactly as they are over the snapshot (SnapshotPair) and the matcher.
+		if sub.confidential != ev.Confidential {
+			continue
+		}
 		if sub.pair == "" || sub.pair == pk {
 			subs = append(subs, sub)
 		}
