@@ -298,6 +298,26 @@ func RefundSubAssetSellBTC(ops SubAssetSellMakerOps, leg *xchain.LegLock, refund
 
 // --- taker ------------------------------------------------------------------
 
+// SubAssetSellState is the taker-side crash-recovery snapshot handed to
+// TakerSubAssetSellParams.OnState. It carries H, the full BTC HTLC terms (everything the
+// wallet needs to claim on-chain with its device key) and — once known — the revealed
+// preimage P. A holder of a Phase=="paid" snapshot can reconstruct the settled swap result
+// even if this process dies before RunTakerSubAssetSell returns (the whole point: close the
+// window where the asset is paid + the maker settles but the caller never captures P).
+type SubAssetSellState struct {
+	Phase          string // "verified" (BTC HTLC checked; asset NOT yet paid) | "paid" (P learned)
+	HashH          []byte
+	Preimage       []byte // nil until Phase == "paid"
+	BtcTxid        string
+	BtcVout        uint32
+	BtcAmount      uint64
+	BtcRedeemHex   string
+	BtcLocktime    uint32 // T_btc
+	TakerClaimPub  []byte
+	MakerRefundPub []byte
+	MakerLNNodeID  string
+}
+
 type TakerSubAssetSellParams struct {
 	// NewTakerOps binds the settlement engine to the maker's H once Terms arrive — the
 	// BTC-leg hashlock must embed H for VerifyBTCLeg/ClaimBTCLeg to recompute + match it.
@@ -314,8 +334,15 @@ type TakerSubAssetSellParams struct {
 	// pays the asset over LN, and RETURNS P + the HTLC terms WITHOUT claiming on-chain — the
 	// wallet holds the matching privkey and claims itself. Keeps the LSP non-custodial.
 	ExternalClaimPub []byte
-	Timing           XcTiming
-	Log              func(format string, args ...interface{})
+	// OnState, when non-nil, is invoked at each crash-recovery checkpoint so the caller can
+	// persist the swap's recoverable state: once right AFTER the maker's BTC HTLC is verified
+	// (Phase "verified", Preimage nil — the asset is not yet paid) and again right AFTER the
+	// asset is paid and the maker reveals P (Phase "paid", Preimage set). Purely additive: a
+	// nil OnState changes nothing. Lets the CLI mirror the BUY's -state-file so a taker crash
+	// after paying (but before the caller captures P) can still be recovered.
+	OnState func(SubAssetSellState)
+	Timing  XcTiming
+	Log     func(format string, args ...interface{})
 }
 
 type TakerSubAssetSellResult struct {
@@ -339,6 +366,13 @@ type TakerSubAssetSellResult struct {
 func (p *TakerSubAssetSellParams) logf(f string, a ...interface{}) {
 	if p.Log != nil {
 		p.Log(f, a...)
+	}
+}
+
+// onState invokes the optional persist callback (no-op when nil).
+func (p *TakerSubAssetSellParams) onState(s SubAssetSellState) {
+	if p.OnState != nil {
+		p.OnState(s)
 	}
 }
 
@@ -448,6 +482,27 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	}
 	p.logf("subasset-sell taker: maker BTC HTLC %s verified (%d sats, T_btc=%d); paying the asset over LN", terms.Leg.Txid, p.BtcAmount, tBtc)
 
+	// Crash-recovery checkpoints: snapshot the full BTC HTLC terms now (asset NOT yet paid),
+	// and again with P once the asset is paid. All res.* terms are populated by this point.
+	// A nil OnState is a no-op; this lets the CLI persist a -state-file so a crash after paying
+	// can still be recovered by the caller (the whole fund-safety point of this callback).
+	persistState := func(phase string, preimage []byte) {
+		p.onState(SubAssetSellState{
+			Phase:          phase,
+			HashH:          res.HashH,
+			Preimage:       preimage,
+			BtcTxid:        res.BtcTxid,
+			BtcVout:        res.BtcVout,
+			BtcAmount:      p.BtcAmount,
+			BtcRedeemHex:   res.BtcRedeemHex,
+			BtcLocktime:    res.BtcLocktime,
+			TakerClaimPub:  res.TakerClaimPub,
+			MakerRefundPub: res.MakerRefundPub,
+			MakerLNNodeID:  res.MakerLNNodeID,
+		})
+	}
+	persistState("verified", nil) // asset not yet paid; Preimage nil
+
 	// 3. Pay the maker's held asset by bare hash over LN (device co-signs). Blocks until
 	//    the maker settles, returning P. If the maker never settles, the LN payment fails
 	//    back and nothing is lost.
@@ -459,6 +514,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 		return res, fmt.Errorf("subasset-sell taker: settled preimage does not hash to H")
 	}
 	res.Preimage = preimage
+	persistState("paid", preimage) // P learned; asset is paid — enough to reconstruct the settled result
 
 	// Device-claim (LSP-side) mode: we hold no claim privkey. Return P + the HTLC terms so
 	// the wallet claims the BTC on-chain itself with its device key. The LSP stays custody-free.
