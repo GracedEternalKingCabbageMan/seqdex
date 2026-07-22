@@ -893,13 +893,12 @@ func runCrossMaker(cfg crossMakerConfig) {
 	if err := os.MkdirAll(cfg.stateDir, 0o700); err != nil {
 		fatal("create -xstate-dir %s: %v", cfg.stateDir, err)
 	}
-
-	// Resume any non-terminal cross session a prior (crashed or supervisor-cycled) instance left on disk,
-	// IN THE BACKGROUND so serving continues. Without this the maker re-launches in plain serve mode and
-	// silently strands every pending session's on-chain settle — the asset HTLC is never claimed and the
-	// counterparty never learns P (the exact stall that blocked the bridge E2E). Reuses the same recovery
-	// the -resume one-shot uses; safe to run alongside serving (new lifts create fresh disjoint sessions).
-	go drivePendingCrossSessions(cfg.stateDir, btcChain, seqChain, cfg.spendFee)
+	// NOTE: pending-session resume is deliberately NOT done per-maker here. The fleet shares ONE
+	// -xstate-dir, so having every serving maker scan+resume on startup would make 144 makers herd on the
+	// same sessions (redundant claims/refunds, broadcast conflicts). Recovery is driven instead by a SINGLE
+	// dedicated `-mode cross -resume` settler loop (drivePendingCrossSessions, via resumeCrossSessions) that
+	// re-drives every non-terminal session to claim-or-refund. That is what unstrands a maker cycled by the
+	// supervisor between recording the taker's asset leg and claiming it — the stall that blocked the E2E.
 
 	wsURL := "ws" + strings.TrimPrefix(cfg.relay, "http") + "/v1/ws"
 	ws := &crossWS{}
