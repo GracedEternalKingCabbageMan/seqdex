@@ -55,6 +55,20 @@ func mkSignedOffer(t *testing.T, k *btcec.PrivateKey, id string) *seqobv1.Offer 
 	return o
 }
 
+// mkSignedOfferNS builds a signed offer in the requested book namespace: confidential=false
+// is the transparent book, true the separate blinded book. The confidential flag is part of
+// the canonical signed bytes, so it is set BEFORE signing.
+func mkSignedOfferNS(t *testing.T, k *btcec.PrivateKey, id string, confidential bool) *seqobv1.Offer {
+	t.Helper()
+	o := mkSignedOffer(t, k, id)
+	o.Confidential = confidential
+	o.MakerSig = nil
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
 func postProto(t *testing.T, url string, m proto.Message) *http.Response {
 	t.Helper()
 	b, err := protojson.Marshal(m)
@@ -171,6 +185,78 @@ func TestWSSnapshotAndDelta(t *testing.T) {
 	delta := readFrom(t, c)
 	if delta.GetPublicOrderCreated() == nil || delta.GetPublicOrderCreated().GetOfferId() != "bbbb" {
 		t.Fatalf("expected created delta for bbbb, got %+v", delta)
+	}
+}
+
+// TestWSNamespaceIsolation is the S7 regression: the market_subscribe snapshot + deltas must
+// be filtered to the subscription's book NAMESPACE, so a transparent subscriber NEVER receives
+// a confidential offer's snapshot/create and vice-versa — matching REST (?confidential=) and
+// the matcher (which refuses cross-namespace crossing). Before the fix both books were served
+// interleaved to every subscriber.
+func TestWSNamespaceIsolation(t *testing.T) {
+	ts, store := newServer(t)
+	k := key(t)
+
+	// Pre-existing offers, one per namespace, injected directly into the shared store so the
+	// snapshot sent at subscribe time exercises the namespace split (store.Submit only checks
+	// the signature; it does not require the validator's confidential-book preconditions).
+	if _, err := store.Submit(mkSignedOfferNS(t, k, "t-pre", false)); err != nil {
+		t.Fatalf("submit t-pre: %v", err)
+	}
+	if _, err := store.Submit(mkSignedOfferNS(t, k, "c-pre", true)); err != nil {
+		t.Fatalf("submit c-pre: %v", err)
+	}
+
+	transparentPair := &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}
+	confidentialPair := &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx", Confidential: true}
+
+	// A transparent subscriber: its snapshot must contain ONLY the transparent offer.
+	connT := dialWS(t, ts)
+	defer connT.Close()
+	sendTo(t, connT, &seqobv1.To{Msg: &seqobv1.To_MarketSubscribe{MarketSubscribe: transparentPair}})
+	snapT := readFrom(t, connT).GetPublicBook()
+	if snapT == nil || len(snapT.GetOffers()) != 1 || snapT.GetOffers()[0].GetOfferId() != "t-pre" {
+		t.Fatalf("transparent snapshot must be exactly [t-pre], got %+v", snapT.GetOffers())
+	}
+
+	// A confidential subscriber: its snapshot must contain ONLY the confidential offer.
+	connC := dialWS(t, ts)
+	defer connC.Close()
+	sendTo(t, connC, &seqobv1.To{Msg: &seqobv1.To_MarketSubscribe{MarketSubscribe: confidentialPair}})
+	snapC := readFrom(t, connC).GetPublicBook()
+	if snapC == nil || len(snapC.GetOffers()) != 1 || snapC.GetOffers()[0].GetOfferId() != "c-pre" {
+		t.Fatalf("confidential snapshot must be exactly [c-pre], got %+v", snapC.GetOffers())
+	}
+
+	// Deltas, submitted in a fixed order that makes the namespace filter falsifiable:
+	//   c-x (confidential), t-x (transparent), c-y (confidential).
+	// The transparent stream, filtered, is [t-x]; the confidential stream is [c-x, c-y].
+	if _, err := store.Submit(mkSignedOfferNS(t, k, "c-x", true)); err != nil {
+		t.Fatalf("submit c-x: %v", err)
+	}
+	if _, err := store.Submit(mkSignedOfferNS(t, k, "t-x", false)); err != nil {
+		t.Fatalf("submit t-x: %v", err)
+	}
+	if _, err := store.Submit(mkSignedOfferNS(t, k, "c-y", true)); err != nil {
+		t.Fatalf("submit c-y: %v", err)
+	}
+
+	// Transparent subscriber's FIRST delta must be t-x. c-x was submitted before t-x, so if the
+	// confidential offer leaked into this stream it would arrive first and this assertion fails.
+	dt := readFrom(t, connT).GetPublicOrderCreated()
+	if dt == nil || dt.GetOfferId() != "t-x" {
+		t.Fatalf("transparent subscriber first delta must be t-x (confidential c-x must not leak), got %+v", dt)
+	}
+
+	// Confidential subscriber's stream must be exactly [c-x, c-y]. Its SECOND delta being c-y —
+	// not the transparent t-x submitted between them — proves the transparent offer was filtered out.
+	d1 := readFrom(t, connC).GetPublicOrderCreated()
+	if d1 == nil || d1.GetOfferId() != "c-x" {
+		t.Fatalf("confidential subscriber first delta must be c-x, got %+v", d1)
+	}
+	d2 := readFrom(t, connC).GetPublicOrderCreated()
+	if d2 == nil || d2.GetOfferId() != "c-y" {
+		t.Fatalf("confidential subscriber second delta must be c-y (transparent t-x must not leak), got %+v", d2)
 	}
 }
 

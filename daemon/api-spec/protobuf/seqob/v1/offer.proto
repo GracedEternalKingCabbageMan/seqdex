@@ -12,6 +12,12 @@ package seqob.v1;
 message AssetPair {
   string base_asset  = 1; // hex asset id; for cross-chain/LN one side is the BTC sentinel id
   string quote_asset = 2;
+  // Book NAMESPACE selector, used ONLY on a market_subscribe/market_unsubscribe: false
+  // (default) is the transparent book, true is the separate confidential/blinded book, so a
+  // WS subscriber's snapshot + deltas stay in ONE namespace — the same disjoint split REST
+  // serves via ?confidential= and the matcher enforces on crossing. Ignored on an Offer's
+  // pair (an offer's own `confidential` field governs which book it rests in).
+  bool confidential = 3;
 }
 
 enum TradeDir {

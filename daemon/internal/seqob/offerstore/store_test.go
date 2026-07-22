@@ -108,7 +108,7 @@ func TestSnapshotPlusDeltas(t *testing.T) {
 	if _, err := s.Submit(o1); err != nil {
 		t.Fatal(err)
 	}
-	snap, id, ch := s.Subscribe(pair)
+	snap, id, ch := s.Subscribe(pair, false)
 	defer s.Unsubscribe(id)
 	if len(snap) != 1 {
 		t.Fatalf("snapshot len = %d, want 1", len(snap))
