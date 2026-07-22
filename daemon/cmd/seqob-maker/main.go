@@ -517,10 +517,20 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 	btcChain := xchain.NewBitcoinChain(btcRPC, btcWallet, params)
 	btcChain.SetFeeRate(btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, seqWallet)
+	drivePendingCrossSessions(dir, btcChain, seqChain, spendFee)
+}
 
+// drivePendingCrossSessions scans dir for non-terminal cross sessions and re-drives each to settlement
+// (claim on the counterparty's reveal, or refund after CLTV), each in its own goroutine, then waits. Shared
+// core of BOTH the explicit -resume one-shot AND the automatic resume pass every serve startup runs — so a
+// supervised restart no longer strands a pending session (whose asset HTLC otherwise never gets claimed and
+// the counterparty never learns P). Non-fatal: an unreadable dir/record is logged and skipped, never killing
+// the caller — the live serving maker depends on that.
+func drivePendingCrossSessions(dir string, btcChain *xchain.BitcoinChain, seqChain *xchain.Chain, spendFee uint64) {
 	entries, err := ioutil.ReadDir(dir)
 	if err != nil {
-		fatal("read -xstate-dir %s: %v", dir, err)
+		fmt.Printf("resume: read -xstate-dir %s: %v (nothing to resume)\n", dir, err)
+		return
 	}
 	var pending []string
 	for _, e := range entries {
@@ -883,6 +893,13 @@ func runCrossMaker(cfg crossMakerConfig) {
 	if err := os.MkdirAll(cfg.stateDir, 0o700); err != nil {
 		fatal("create -xstate-dir %s: %v", cfg.stateDir, err)
 	}
+
+	// Resume any non-terminal cross session a prior (crashed or supervisor-cycled) instance left on disk,
+	// IN THE BACKGROUND so serving continues. Without this the maker re-launches in plain serve mode and
+	// silently strands every pending session's on-chain settle — the asset HTLC is never claimed and the
+	// counterparty never learns P (the exact stall that blocked the bridge E2E). Reuses the same recovery
+	// the -resume one-shot uses; safe to run alongside serving (new lifts create fresh disjoint sessions).
+	go drivePendingCrossSessions(cfg.stateDir, btcChain, seqChain, cfg.spendFee)
 
 	wsURL := "ws" + strings.TrimPrefix(cfg.relay, "http") + "/v1/ws"
 	ws := &crossWS{}
