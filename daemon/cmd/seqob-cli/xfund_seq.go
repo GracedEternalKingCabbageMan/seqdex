@@ -32,6 +32,7 @@ func cmdXFundSeq(args []string) {
 	seqRPCURL := fs.String("seq-rpc", "", "Sequentia node RPC URL http://user:pass@host:port (required)")
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet holding the asset that funds the HTLC (required)")
 	refundPrivHex := fs.String("refund-priv", "", "the taker's OWN asset refund privkey (32-byte hex); its pubkey MUST equal the taker_seq_refund_pub given to the LSP (required)")
+	noWait := fs.Bool("no-wait", false, "return as soon as the HTLC is broadcast (0-conf, empty block_hash) so the caller relays the leg to the maker immediately, before the LSP's courier session idles through a SEQ block; the maker polls VerifySEQLeg until it confirms")
 	_ = fs.Parse(args)
 
 	if *asset == "" || *makerClaimPubHex == "" || *hashHex == "" || *seqAmount == 0 || *seqLocktime == 0 || *seqRPCURL == "" || *seqWallet == "" || *refundPrivHex == "" {
@@ -70,7 +71,15 @@ func cmdXFundSeq(args []string) {
 	// tx to confirm in a Sequentia block, and returns the funded leg. A slow-confirm returns the leg WITH an
 	// error so we can still print the refundable outpoint.
 	swap := xchain.NewSwapBitcoin(dummyBtc, seqChain, xchain.NewHashLockFromHash(hashH))
-	leg, blockHash, err := swap.LockSEQLeg(makerClaimPub, refundKey.PubKey(), atomsToCoinsCli(*seqAmount), *asset, uint32(*seqLocktime))
+	var leg *xchain.LegLock
+	var blockHash string
+	if *noWait {
+		// 0-conf: broadcast + return immediately so the caller relays the funded leg to the maker BEFORE the
+		// LSP's courier session idles out through a SEQ block (the maker polls VerifySEQLeg until it confirms).
+		leg, err = swap.LockSEQLegNoWait(makerClaimPub, refundKey.PubKey(), atomsToCoinsCli(*seqAmount), *asset, uint32(*seqLocktime))
+	} else {
+		leg, blockHash, err = swap.LockSEQLeg(makerClaimPub, refundKey.PubKey(), atomsToCoinsCli(*seqAmount), *asset, uint32(*seqLocktime))
+	}
 	if leg == nil {
 		fatal("fund SEQ HTLC from the taker's wallet: %v", err)
 	}

@@ -110,12 +110,32 @@ func (s *Swap) LockBTCLeg(claimPub, refundPub []byte, amountCoins string, lockti
 // on-chain (paper principle 7). It mines one Sequentia block and returns the
 // funded leg plus the hash of the block that confirmed it (for the ordering
 // check). The caller must then call VerifySeqLegSafe before treating it as safe.
-func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, string, error) {
+// lockSEQLegBroadcast builds the SEQ HTLC on H and funds (broadcasts) it, returning the funded leg WITHOUT
+// waiting for confirmation. Shared by LockSEQLeg (which then waits for the anchored block) and
+// LockSEQLegNoWait (which returns immediately so the caller can relay the leg at 0-conf).
+func (s *Swap) lockSEQLegBroadcast(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, error) {
 	script, err := s.seqLeg.HTLCScript(claimPub, refundPub, locktime)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	funded, err := s.seq.LockHTLC(script, amountCoins, assetLabel)
+	if err != nil {
+		return nil, err
+	}
+	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, nil
+}
+
+// LockSEQLegNoWait funds the SEQ HTLC and returns as soon as it is broadcast (no confirmation wait, empty
+// block hash). Used by the bridged-SELL taker so it can relay the funded asset leg to the maker IMMEDIATELY
+// — the maker polls VerifySEQLeg until the leg confirms — instead of holding the LSP's courier session idle
+// through a whole SEQ block, which is what intermittently dropped the relay (the maker then never learned
+// the leg and could not claim).
+func (s *Swap) LockSEQLegNoWait(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, error) {
+	return s.lockSEQLegBroadcast(claimPub, refundPub, amountCoins, assetLabel, locktime)
+}
+
+func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, string, error) {
+	leg, err := s.lockSEQLegBroadcast(claimPub, refundPub, amountCoins, assetLabel, locktime)
 	if err != nil {
 		return nil, "", err
 	}
@@ -129,7 +149,7 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 	// caller fails with "not confirmed (no blockhash)" the instant the leg is funded.
 	var blockHash string
 	for i := 0; i < 90; i++ { // up to ~3 min at 2s
-		if blockHash, err = s.seq.BlockHashOfTx(funded.TxID); err == nil && blockHash != "" {
+		if blockHash, err = s.seq.BlockHashOfTx(leg.Funded.TxID); err == nil && blockHash != "" {
 			break
 		}
 		time.Sleep(2 * time.Second)
@@ -138,10 +158,9 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 		// The leg IS funded on-chain at this point: return it WITH the error so
 		// the caller can persist the outpoint/script/locktime and refund after
 		// the CLTV instead of orphaning coins behind an unknowable redeem script.
-		return &LegLock{Script: script, Funded: funded, Locktime: locktime}, "",
-			fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", funded.TxID, err)
+		return leg, "", fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", leg.Funded.TxID, err)
 	}
-	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, blockHash, nil
+	return leg, blockHash, nil
 }
 
 // AnchorEvidence captures what VerifySeqLegSafe checked, for proof/printing.
