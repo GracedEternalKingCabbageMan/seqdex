@@ -9,7 +9,10 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"strings"
 	"time"
 
@@ -21,6 +24,52 @@ import (
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
 )
+
+// xsubasSellBtcHtlc mirrors the CLI's success-JSON btc_htlc block so a recovering reader
+// can reconstruct the settled result verbatim (the wallet claims the BTC on-chain from it).
+type xsubasSellBtcHtlc struct {
+	Txid              string `json:"txid"`
+	Vout              uint32 `json:"vout"`
+	Amount            uint64 `json:"amount"`
+	RedeemScript      string `json:"redeem_script"`
+	TBtc              uint32 `json:"t_btc"`
+	TakerClaimPubkey  string `json:"taker_claim_pubkey"`
+	MakerRefundPubkey string `json:"maker_refund_pubkey"`
+}
+
+// xsubasSellState is the SELL taker's crash-recovery record. It is NOT a refund record like
+// the BUY's (the SELL taker never funds the BTC HTLC — the maker does): it is the material an
+// LSP needs to reconstruct the settled result (P + the BTC HTLC terms for the wallet to claim)
+// if this process dies AFTER paying the asset but before the JSON success line is captured.
+// Phase "verified" is written before paying (P unknown); Phase "paid" adds P. The BUY refund
+// record and this SELL recovery record are deliberately separate structs.
+type xsubasSellState struct {
+	CreatedAt     string             `json:"created_at"`
+	UpdatedAt     string             `json:"updated_at"`
+	Phase         string             `json:"phase"` // "verified" (asset NOT yet paid) | "paid" (P learned)
+	Asset         string             `json:"asset,omitempty"`
+	HashH         string             `json:"hash_h"`
+	Preimage      string             `json:"preimage,omitempty"` // set once Phase == "paid"
+	MakerLNNodeID string             `json:"maker_ln_node_id,omitempty"`
+	BtcHtlc       *xsubasSellBtcHtlc `json:"btc_htlc"`
+}
+
+// save writes the state ATOMICALLY (temp file + rename) so a crash mid-write can never leave
+// a torn/partial file for the recovering LSP to misread. It RETURNS an error instead of
+// calling fatal: the OnState callback must never abort the swap or suppress the primary JSON
+// output. Losing this recovery aid is not fund-fatal (the LSP falls back to querying the node
+// for the settled payment), but killing the swap after paying would be.
+func (st *xsubasSellState) save(path string) error {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := ioutil.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
 
 func cmdXSubAsSell(args []string) {
 	fs := newFlagSet("xsubas-sell")
@@ -38,6 +87,7 @@ func cmdXSubAsSell(args []string) {
 	claimPrivHex := fs.String("btc-claim-priv", "", "device BTC claim privkey (32-byte hex); generated if empty (the key that claims the BTC — never given to the LSP)")
 	claimPubHex := fs.String("btc-claim-pub", "", "device BTC claim PUBKEY (33-byte hex). LSP-side/device-claim mode: drive the courier + pay the asset, then return P + the HTLC terms WITHOUT claiming — the wallet holds the matching privkey and claims itself. Mutually exclusive with -btc-claim-priv.")
 	jsonOut := fs.Bool("json", false, "emit one JSON line {settled,preimage,hash_h,maker_ln_node_id,btc_htlc{...}} for programmatic (LSP) callers")
+	stateFile := fs.String("state-file", "", "crash-recovery state file (written atomically). After verifying the maker's BTC HTLC this taker writes H + the full BTC HTLC terms, and after paying the asset it adds the preimage P, so an LSP can reconstruct the settled result if this process crashes after paying but before the JSON line is captured. Empty = disabled (does not change the JSON output).")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	payWait := fs.Duration("pay-wait", 15*time.Minute, "max wait for the asset LN payment to settle")
 	_ = fs.Parse(args)
@@ -162,6 +212,7 @@ func cmdXSubAsSell(args []string) {
 		return from.GetSwapMsg().GetCiphertext(), nil
 	}
 
+	createdAt := time.Now().UTC().Format(time.RFC3339)
 	res, err := client.RunTakerSubAssetSell(client.TakerSubAssetSellParams{
 		// Bind the BTC-leg swap to the maker's H once Terms arrive (VerifyBTCLeg/
 		// ClaimBTCLeg recompute against it); a fresh asset LN leg pays the invoice.
@@ -179,8 +230,39 @@ func cmdXSubAsSell(args []string) {
 		SpendFeeSats:     *spendFee,
 		BtcClaimKey:      claimKey,
 		ExternalClaimPub: externalClaimPub,
-		Timing:           client.XcTiming{TermsWait: *termsWait, BtcFundWait: *termsWait, SeqLockWait: *payWait},
-		Log:              func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
+		// Persist the crash-recovery state atomically at each checkpoint (verified, then paid).
+		// Best-effort: a write failure is logged to stderr but NEVER aborts the swap or touches
+		// the JSON output (that primary path still emits P). Disabled when -state-file is empty.
+		OnState: func(s client.SubAssetSellState) {
+			if *stateFile == "" {
+				return
+			}
+			st := &xsubasSellState{
+				CreatedAt:     createdAt,
+				UpdatedAt:     time.Now().UTC().Format(time.RFC3339),
+				Phase:         s.Phase,
+				Asset:         *asset,
+				HashH:         hex.EncodeToString(s.HashH),
+				MakerLNNodeID: s.MakerLNNodeID,
+				BtcHtlc: &xsubasSellBtcHtlc{
+					Txid:              s.BtcTxid,
+					Vout:              s.BtcVout,
+					Amount:            s.BtcAmount,
+					RedeemScript:      s.BtcRedeemHex,
+					TBtc:              s.BtcLocktime,
+					TakerClaimPubkey:  hex.EncodeToString(s.TakerClaimPub),
+					MakerRefundPubkey: hex.EncodeToString(s.MakerRefundPub),
+				},
+			}
+			if len(s.Preimage) > 0 {
+				st.Preimage = hex.EncodeToString(s.Preimage)
+			}
+			if err := st.save(*stateFile); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not persist sub-asset-SELL state to %s: %v\n", *stateFile, err)
+			}
+		},
+		Timing: client.XcTiming{TermsWait: *termsWait, BtcFundWait: *termsWait, SeqLockWait: *payWait},
+		Log:    func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
 	}, send, recv)
 	if err != nil {
 		if *jsonOut {

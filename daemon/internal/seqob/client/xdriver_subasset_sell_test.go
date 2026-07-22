@@ -203,3 +203,81 @@ func TestSubAssetSellHandshake(t *testing.T) {
 		t.Fatalf("BTC claimed with the wrong preimage")
 	}
 }
+
+// TestSubAssetSellOnState pins the crash-recovery callback: OnState must fire exactly twice —
+// "verified" (BTC HTLC terms known, P still nil) then "paid" (P set and hashing to H) — and the
+// "paid" snapshot must carry everything needed to reconstruct the settled result.
+func TestSubAssetSellOnState(t *testing.T) {
+	P := sha256.Sum256([]byte("sell-onstate-secret"))
+	st := &sellState{secret: P[:]}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const assetAtoms = uint64(50_000)
+	const btcSats = uint64(2_000)
+	const tBtc = uint32(200)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = RunMakerSubAssetSell(MakerSubAssetSellParams{
+			NewMakerOps: func(preimage []byte) SubAssetSellMakerOps { return &fakeSellMakerOps{st: st} },
+			Crypter:     mc,
+			BtcAmount:   btcSats,
+			AssetAmount: assetAtoms,
+			BtcLocktime: tBtc,
+			MinBTCConf:  1,
+			HoldTimeout: 3 * time.Second,
+			Preimage:    P[:],
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	// OnState fires synchronously on THIS (taker) goroutine, so a plain slice is race-free.
+	var states []SubAssetSellState
+	takerRes, takerErr := RunTakerSubAssetSell(TakerSubAssetSellParams{
+		NewTakerOps: func(hashH []byte) SubAssetSellTakerOps { return &fakeSellTakerOps{st: st} },
+		Crypter:     tc,
+		BtcAmount:   btcSats,
+		AssetAmount: assetAtoms,
+		MinBTCConf:  1,
+		OnState:     func(s SubAssetSellState) { states = append(states, s) },
+		Timing:      XcTiming{TermsWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if len(states) != 2 {
+		t.Fatalf("want 2 OnState calls (verified, paid), got %d: %+v", len(states), states)
+	}
+
+	// (1) verified: terms known, asset NOT yet paid (no preimage).
+	v := states[0]
+	if v.Phase != "verified" {
+		t.Fatalf("first phase = %q, want verified", v.Phase)
+	}
+	if len(v.Preimage) != 0 {
+		t.Fatalf("verified snapshot must not carry a preimage")
+	}
+	if v.BtcTxid == "" || v.BtcAmount != btcSats || v.BtcLocktime != tBtc ||
+		len(v.HashH) != 32 || len(v.TakerClaimPub) == 0 || len(v.MakerRefundPub) == 0 {
+		t.Fatalf("verified snapshot missing BTC HTLC terms: %+v", v)
+	}
+
+	// (2) paid: P set, hashes to H, terms unchanged — enough to reconstruct the settled result.
+	p := states[1]
+	if p.Phase != "paid" {
+		t.Fatalf("second phase = %q, want paid", p.Phase)
+	}
+	if got := sha256.Sum256(p.Preimage); hex.EncodeToString(got[:]) != hex.EncodeToString(p.HashH) {
+		t.Fatalf("paid snapshot preimage does not hash to H")
+	}
+	if hex.EncodeToString(p.Preimage) != hex.EncodeToString(takerRes.Preimage) {
+		t.Fatalf("paid snapshot preimage != the returned preimage")
+	}
+	if p.BtcTxid != v.BtcTxid || p.BtcAmount != v.BtcAmount || p.BtcLocktime != v.BtcLocktime {
+		t.Fatalf("paid snapshot BTC terms drifted from verified: %+v vs %+v", p, v)
+	}
+}
