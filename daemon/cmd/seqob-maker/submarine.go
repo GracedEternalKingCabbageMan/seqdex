@@ -222,7 +222,15 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 
 			go func(sid string, in chan []byte) {
 				settled := false
+				var settleTxid string
 				defer func() {
+					// Record the executed fill FIRST, before requote/cancel touch the still-resting
+					// offer: the relay records the trade (last_price + chart for the asset/BTC pair)
+					// and decrements/finalizes the order. Maker-signed + offer-keyed, so it lands even
+					// though the courier session may already be gone.
+					if settled {
+						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), settleTxid)
+					}
 					// -requote: re-post a fresh quote while still holding the in-flight slot
 					// (racing lifts are refused as "busy" until it is live -> no double-post).
 					// The asset leg is on-chain; only the BTC-LN leg has channel peers to
@@ -305,6 +313,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					return
 				}
 				settled = true
+				settleTxid = res.SeqClaimTxid
 				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN, claimed the asset in %s\n",
 					sid, res.SeqClaimTxid)
 			}(sid, in)

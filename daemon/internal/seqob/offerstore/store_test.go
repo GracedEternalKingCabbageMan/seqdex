@@ -229,6 +229,111 @@ func TestPartialFillThenFilled(t *testing.T) {
 	}
 }
 
+// TestRecordSettledFillRecordsDecrementsAndGuardsReplay is the P2.8 core: a durable
+// cross/LN lift reports settlement off the courier path via RecordSettledFill, and the
+// relay must record the trade at the resting order's price and decrement the order —
+// exactly what the interactive SettleAck does, but keyed to the offer and replay-guarded
+// by a strictly-increasing nonce (the offer_id is reused across -requote).
+func TestRecordSettledFillRecordsDecrementsAndGuardsReplay(t *testing.T) {
+	s := New(nil)
+	k := key(t)
+	o := mkOffer(t, k, "aaaa", 1750003600) // SELL gold/usdx, base 100, want 45 -> price 0.45, min_anchor_depth 0
+	kk, err := s.Submit(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair := o.GetPair()
+
+	// A partial settled fill of 40: records a trade of 40 at 0.45 and decrements to 60.
+	if err := s.RecordSettledFill(kk, 40, "txid1", 0, 1); err != nil {
+		t.Fatalf("record settled (partial): %v", err)
+	}
+	trades := s.TradesFor(pair, 0)
+	if len(trades) != 1 || trades[0].Size != 40 || trades[0].Price != 0.45 {
+		t.Fatalf("want one trade {size:40, price:0.45}, got %+v", trades)
+	}
+	if e, ok := s.Get(kk); !ok || e.ActiveAmount != 60 || e.Status != seqobv1.OfferStatus_OFFER_STATUS_PARTIAL {
+		t.Fatalf("after partial settled fill: %+v ok=%v", e, ok)
+	}
+
+	// Replay of the same (or lower) nonce is rejected — no second trade, no over-decrement.
+	if err := s.RecordSettledFill(kk, 40, "txid1", 0, 1); err == nil {
+		t.Fatalf("expected stale-nonce rejection on replay")
+	}
+	if trades := s.TradesFor(pair, 0); len(trades) != 1 {
+		t.Fatalf("replay must not record a second trade, got %d", len(trades))
+	}
+
+	// The remaining 60 settles (higher nonce, min_anchor_depth 0 -> FILLED + removed).
+	if err := s.RecordSettledFill(kk, 60, "txid2", 0, 2); err != nil {
+		t.Fatalf("record settled (rest): %v", err)
+	}
+	if _, ok := s.Get(kk); ok {
+		t.Fatalf("fully-settled offer should be removed from the book")
+	}
+	if total := s.TradesFor(pair, 0); len(total) != 2 || total[1].Size != 60 {
+		t.Fatalf("want two trades totalling base 100, got %+v", total)
+	}
+
+	// A settled report for an already-gone offer is a safe no-op (still nonce-guarded).
+	if err := s.RecordSettledFill(kk, 10, "txid3", 0, 3); err != nil {
+		t.Fatalf("settled fill on a removed offer should be a no-op, got %v", err)
+	}
+	if trades := s.TradesFor(pair, 0); len(trades) != 2 {
+		t.Fatalf("no-op settled fill must not record a trade, got %d", len(trades))
+	}
+}
+
+// TestRecordSettledFillAnchorGatesFinalize proves anchor_confs is honored end to end: a
+// whole fill reported at/above the offer's min_anchor_depth reaches FILLED and is removed,
+// while the same fill reported BELOW the bar records the trade but is held (active 0, not
+// removed). This is the wiring that lets a min_anchor_depth>0 offer finalize at all — the
+// maker reports its finality bar in one shot (anchor_confs = min_anchor_depth); previously
+// the relay hard-coded 0 confs, so such an offer could never reach FILLED.
+func TestRecordSettledFillAnchorGatesFinalize(t *testing.T) {
+	mkAnchored := func(t *testing.T, s *Store, k *btcec.PrivateKey, id string) (Key, *seqobv1.AssetPair) {
+		t.Helper()
+		o := mkOffer(t, k, id, 1750003600)
+		o.MinAnchorDepth = 2
+		o.MakerSig = nil
+		if err := offer.SignOffer(o, k); err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		kk, err := s.Submit(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return kk, o.GetPair()
+	}
+
+	// At the bar (confs 2 >= min_anchor_depth 2): FILLED + removed, trade recorded.
+	s := New(nil)
+	kk, pair := mkAnchored(t, s, key(t), "atbar")
+	if err := s.RecordSettledFill(kk, 100, "txid1", 2, 1); err != nil {
+		t.Fatalf("record settled (at bar): %v", err)
+	}
+	if _, ok := s.Get(kk); ok {
+		t.Fatalf("fill at/above the anchor bar should finalize and be removed")
+	}
+	if tr := s.TradesFor(pair, 0); len(tr) != 1 || tr[0].Size != 100 {
+		t.Fatalf("want one trade of 100 at/above the bar, got %+v", tr)
+	}
+
+	// Below the bar (confs 1 < min_anchor_depth 2): trade recorded, but held (active 0, not removed).
+	s2 := New(nil)
+	kk2, pair2 := mkAnchored(t, s2, key(t), "belowbar")
+	if err := s2.RecordSettledFill(kk2, 100, "txid1", 1, 1); err != nil {
+		t.Fatalf("record settled (below bar): %v", err)
+	}
+	e, ok := s2.Get(kk2)
+	if !ok || e.ActiveAmount != 0 || e.Status == seqobv1.OfferStatus_OFFER_STATUS_FILLED {
+		t.Fatalf("below the anchor bar the fill must record but not finalize: %+v ok=%v", e, ok)
+	}
+	if tr := s2.TradesFor(pair2, 0); len(tr) != 1 || tr[0].Size != 100 {
+		t.Fatalf("want one trade of 100 recorded below the bar, got %+v", tr)
+	}
+}
+
 func TestReopenRestoresOrder(t *testing.T) {
 	s := New(nil)
 	k := key(t)

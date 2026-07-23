@@ -186,6 +186,13 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 			go func(sid string, in chan []byte) {
 				settled := false
 				defer func() {
+					// Record the executed fill FIRST, before requote/cancel touch the still-resting
+					// offer: the relay records the trade (last_price + chart for the asset/BTC pair)
+					// and decrements/finalizes the order. The maker received the asset over LN and the
+					// taker claims the BTC on-chain, so there is no maker-held settling txid.
+					if settled {
+						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), "")
+					}
 					if settled && cfg.requote {
 						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
 							if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {

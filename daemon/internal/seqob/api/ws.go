@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/session"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/validator"
@@ -154,6 +155,8 @@ func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
 		s.wsStartLift(c, m.StartLift)
 	case *seqobv1.To_SettleAck:
 		s.wsSettleAck(c, m.SettleAck)
+	case *seqobv1.To_SettledTrade:
+		s.wsSettledTrade(c, m.SettledTrade)
 	case *seqobv1.To_SwapMsg:
 		s.wsSwapMsg(c, m.SwapMsg)
 	case *seqobv1.To_ListMarkets:
@@ -461,7 +464,10 @@ func (s *Server) wsSettleAck(c *wsConn, sa *seqobv1.SettleAck) {
 			// Record BEFORE ApplyPartialFill: the latter may remove the entry at full fill, after
 			// which e.Offer (needed for the trade's pair + execution price) is no longer fetchable.
 			s.store.RecordTrade(e.Offer, fill)
-			if err := s.store.ApplyPartialFill(k, fill, sa.GetSettleTxid(), 0); err != nil {
+			// anchor_confs the maker declares for the settling tx (0 keeps the 0-conf-tolerant
+			// default). A fill with anchor_confs >= min_anchor_depth reaches FILLED; previously
+			// this was hard-coded 0, so a min_anchor_depth>0 offer could never finalize.
+			if err := s.store.ApplyPartialFill(k, fill, sa.GetSettleTxid(), sa.GetAnchorConfs()); err != nil {
 				c.sendErr(409, "apply fill: "+err.Error())
 				return
 			}
@@ -469,4 +475,35 @@ func (s *Server) wsSettleAck(c *wsConn, sa *seqobv1.SettleAck) {
 	}
 	_ = s.sessions.SetSettleTxid(sid, sa.GetSettleTxid()) // arms reorg re-open (Principle 1)
 	s.sessions.Close(sid)
+}
+
+// wsSettledTrade is the durable-settlement commit point for CROSS-CHAIN and LIGHTNING
+// lifts. Unlike a same-chain lift (fast, its co-sign session still live at settlement),
+// a cross/LN swap can finish long after the courier session was swept (its on-chain /
+// Lightning leg outlives the co-sign deadline) or after the maker reconnected (dropping
+// the in-memory session role) — so a session-scoped SettleAck is unreachable. Instead the
+// maker sends this MAKER-SIGNED, offer-keyed record: the relay verifies the signature
+// against the resting offer's maker_pubkey, records the trade at the resting order's price,
+// and decrements/finalizes the order (advancing anchor_confs). Without it a BTC/LN-only pair
+// reports last_price 0 with an empty chart — every cross/LN fill went unrecorded. It leaks
+// nothing the chain does not (settle_txid is public), and the maker has no incentive to
+// falsely decrement its own resting order. Reorg retraction is a separate concern.
+func (s *Server) wsSettledTrade(c *wsConn, st *seqobv1.SettledTrade) {
+	if st == nil || st.GetOfferId() == "" || st.GetMakerPubkey() == "" {
+		c.sendErr(400, "settled_trade missing offer_id/maker_pubkey")
+		return
+	}
+	// Maker-signed and self-standing: the signature over {offer_id, maker_pubkey, fill_base,
+	// settle_txid, anchor_confs, nonce} authenticates the report without a live session, and
+	// keying the store op to (maker_pubkey, offer_id) means only the offer's own maker can
+	// record/decrement its fill (a forged report for another maker's offer needs that maker's key).
+	if err := offer.VerifySettledTrade(st); err != nil {
+		c.sendErr(400, "invalid settled_trade: "+err.Error())
+		return
+	}
+	k := offerstore.Key{MakerPubkey: st.GetMakerPubkey(), OfferID: st.GetOfferId()}
+	if err := s.store.RecordSettledFill(k, st.GetFillBase(), st.GetSettleTxid(), st.GetAnchorConfs(), st.GetNonce()); err != nil {
+		c.sendErr(409, "record settled trade: "+err.Error())
+		return
+	}
 }

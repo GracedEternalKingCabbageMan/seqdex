@@ -107,6 +107,30 @@ message SettleAck {
   string session_id  = 1;
   string settle_txid = 2;
   uint64 fill_base   = 3; // base atoms actually settled (== the lift's take_amount)
+  uint32 anchor_confs = 4; // Bitcoin-anchor confirmations the maker declares for settle_txid; a fill with anchor_confs >= min_anchor_depth reaches FILLED (0 keeps the 0-conf-tolerant default)
+}
+
+// Client (the MAKER of a resting CROSS-CHAIN or LIGHTNING offer) -> relay: a lift of
+// this offer SETTLED off the opaque courier path, filling fill_base base atoms at
+// settle_txid with anchor_confs Bitcoin-anchor confirmations. It is the SettleAck
+// analogue for durable settlement types, but keyed to the OFFER (not a session) and
+// MAKER-SIGNED rather than session-authorized: a cross/LN swap can finish AFTER the
+// short co-sign session was swept (its on-chain / Lightning leg outlives the courier
+// deadline) or after the maker reconnected (dropping the in-memory session role), so
+// a session-scoped ack is unreachable at settlement time. The relay verifies sig
+// against maker_pubkey, then records the trade at the RESTING order's price and
+// decrements/finalizes it (advancing anchor_confs so a min_anchor_depth>0 offer can
+// reach FILLED). nonce is strictly increasing (defeats replay of an old settled-trade
+// against a re-posted same offer_id, which -requote reuses). Reorg retraction of a
+// recorded trade is handled separately (the anchor/covenant watcher).
+message SettledTrade {
+  string offer_id     = 1;
+  string maker_pubkey = 2;
+  uint64 fill_base    = 3; // base atoms settled (a partial fill for an allow_partial offer, else the whole size)
+  string settle_txid  = 4; // on-chain settling txid (empty / informational for a pure-Lightning fill)
+  uint32 anchor_confs = 5; // Bitcoin-anchor confirmations of settle_txid the maker declares final (0 for pure-LN)
+  uint64 nonce        = 6; // strictly-increasing replay guard (wall-clock ns), like OfferCancel
+  bytes  sig          = 7; // by maker_pubkey over {offer_id, maker_pubkey, fill_base, settle_txid, anchor_confs, nonce}
 }
 
 enum OfferStatus {
@@ -143,6 +167,7 @@ message To {
     OfferCancel offer_cancel       = 104;
     StartLift   start_lift         = 113;
     SettleAck   settle_ack         = 114; // maker: interactive lift settled (record + decrement + close)
+    SettledTrade settled_trade     = 115; // maker: durable cross/LN lift settled (session-independent, maker-signed record + decrement)
     SwapMsg     swap_msg           = 130; // opaque courier passthrough
     Empty       list_markets       = 150;
   }

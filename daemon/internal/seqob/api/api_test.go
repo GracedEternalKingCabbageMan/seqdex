@@ -396,6 +396,65 @@ func TestWSSettleAckRecordsTradeAndDecrements(t *testing.T) {
 	}
 }
 
+// TestWSSettledTradeRecordsCrossLNFillSessionIndependent is the P2.8 core: a durable
+// cross-chain / Lightning lift settles off the opaque courier path, so the relay learns of
+// it only from the maker's SettledTrade. Unlike SettleAck it must NOT depend on a live
+// session/role — the swap can finish after the co-sign session was swept or the maker
+// reconnected — so this test rests the offer over REST and reports settlement on a FRESH WS
+// connection with no session at all. The relay must record the trade + decrement the order,
+// and reject a tampered (bad-signature) report without touching the book.
+func TestWSSettledTradeRecordsCrossLNFillSessionIndependent(t *testing.T) {
+	ts, store := newServer(t)
+	mk := key(t)
+	o := mkSignedOffer(t, mk, "aaaa") // base 100, pair gold/usdx, want 45 -> price 0.45
+
+	if resp := postProto(t, ts.URL+"/v1/offers", o); resp.StatusCode != http.StatusOK {
+		t.Fatalf("submit offer: status %d", resp.StatusCode)
+	}
+
+	// Report settlement on a connection that never opened a lift session (no role): the
+	// maker-signed, offer-keyed SettledTrade must still record the trade and decrement.
+	conn := dialWS(t, ts)
+	defer conn.Close()
+	st := &seqobv1.SettledTrade{OfferId: "aaaa", FillBase: 40, SettleTxid: "deadbeef", Nonce: 1}
+	if err := offer.SignSettledTrade(st, mk); err != nil {
+		t.Fatal(err)
+	}
+	sendTo(t, conn, &seqobv1.To{Msg: &seqobv1.To_SettledTrade{SettledTrade: st}})
+
+	restKey := offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: "aaaa"}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		trades := store.TradesFor(o.GetPair(), 10)
+		e, ok := store.Get(restKey)
+		if len(trades) >= 1 && ok && e.ActiveAmount == 60 {
+			if trades[len(trades)-1].Size != 40 {
+				t.Fatalf("recorded trade size = %d, want 40", trades[len(trades)-1].Size)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("settled_trade did not record+decrement in time: trades=%d ok=%v entry=%+v", len(trades), ok, e)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A tampered report (a signed field mutated after signing) is rejected with an error
+	// frame and must not decrement the resting order.
+	bad := &seqobv1.SettledTrade{OfferId: "aaaa", FillBase: 60, Nonce: 2}
+	if err := offer.SignSettledTrade(bad, mk); err != nil {
+		t.Fatal(err)
+	}
+	bad.FillBase = 10 // invalidate the signature
+	sendTo(t, conn, &seqobv1.To{Msg: &seqobv1.To_SettledTrade{SettledTrade: bad}})
+	if ef := readFrom(t, conn); ef.GetError() == nil {
+		t.Fatalf("expected an error frame for a tampered settled_trade, got %+v", ef)
+	}
+	if e, ok := store.Get(restKey); !ok || e.ActiveAmount != 60 {
+		t.Fatalf("rejected settled_trade must not change the book: %+v ok=%v", e, ok)
+	}
+}
+
 // --- helpers ---
 
 func dialWS(t *testing.T, ts *httptest.Server) *websocket.Conn {

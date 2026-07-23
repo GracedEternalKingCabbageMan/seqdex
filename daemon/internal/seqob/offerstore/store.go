@@ -100,16 +100,17 @@ type subscriber struct {
 
 // Store is the in-memory order book.
 type Store struct {
-	mu          sync.RWMutex
-	entries     map[Key]*Entry
-	pairs       map[string]map[Key]bool // pairKey -> set of keys
-	subs        map[int]*subscriber
-	nextSub     int
-	cancelNonce map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
-	subBuf      int
-	now         func() time.Time
-	trades      map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
-	tradeLog    *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
+	mu           sync.RWMutex
+	entries      map[Key]*Entry
+	pairs        map[string]map[Key]bool // pairKey -> set of keys
+	subs         map[int]*subscriber
+	nextSub      int
+	cancelNonce  map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
+	settledNonce map[Key]uint64 // highest settled-trade nonce seen per key (replay defense; offer_id is reused across -requote)
+	subBuf       int
+	now          func() time.Time
+	trades       map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
+	tradeLog     *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
 }
 
 // RecordTrade appends one executed cross for the resting offer's pair at its execution
@@ -237,12 +238,13 @@ func New(now func() time.Time) *Store {
 		now = time.Now
 	}
 	return &Store{
-		entries:     make(map[Key]*Entry),
-		pairs:       make(map[string]map[Key]bool),
-		subs:        make(map[int]*subscriber),
-		cancelNonce: make(map[Key]uint64),
-		subBuf:      256,
-		now:         now,
+		entries:      make(map[Key]*Entry),
+		pairs:        make(map[string]map[Key]bool),
+		subs:         make(map[int]*subscriber),
+		cancelNonce:  make(map[Key]uint64),
+		settledNonce: make(map[Key]uint64),
+		subBuf:       256,
+		now:          now,
 	}
 }
 
@@ -573,6 +575,48 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 		s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	}
 	return nil
+}
+
+// RecordSettledFill records a settled CROSS-CHAIN / LIGHTNING fill reported by the
+// offer's maker (the SettledTrade wire message; the caller has already verified the
+// maker signature and that maker_pubkey == k.MakerPubkey). It is the durable-settlement
+// analogue of the interactive SettleAck path — record the trade at the RESTING order's
+// price, then decrement/finalize the order (advancing anchorConfs so a min_anchor_depth>0
+// offer can reach FILLED) — but keyed to the offer instead of a live session, because a
+// cross/LN swap can finish after the courier session was swept or the maker reconnected.
+//
+// The nonce must strictly exceed the highest settled-fill nonce seen for this key: -requote
+// re-posts the SAME offer_id, so a stale settled-trade must not decrement the fresh quote.
+// If the offer already left the book (a prior fill removed it), this is a no-op returning nil
+// (there is nothing to price or decrement); the nonce is still advanced so the stale copy
+// cannot later apply. Reorg retraction of the recorded trade is handled separately.
+func (s *Store) RecordSettledFill(k Key, fillBase uint64, settleTxid string, anchorConfs uint32, nonce uint64) error {
+	s.mu.Lock()
+	if nonce != 0 && nonce <= s.settledNonce[k] {
+		s.mu.Unlock()
+		return fmt.Errorf("stale settled-trade nonce")
+	}
+	if nonce != 0 {
+		s.settledNonce[k] = nonce
+	}
+	e, ok := s.entries[k]
+	if !ok {
+		s.mu.Unlock()
+		return nil // offer already gone (a prior fill removed it): nothing to price or decrement
+	}
+	fill := fillBase
+	if fill > e.ActiveAmount {
+		fill = e.ActiveAmount // never decrement below the resting size (it shrank via another fill)
+	}
+	restingOffer := e.Offer // capture under the lock: ApplyPartialFill may remove the entry at full fill
+	s.mu.Unlock()
+	if fill == 0 {
+		return nil
+	}
+	// Record BEFORE ApplyPartialFill (which may remove the entry, after which the pair/price is
+	// no longer fetchable). Both re-lock internally; this mirrors wsSettleAck's ordering.
+	s.RecordTrade(restingOffer, fill)
+	return s.ApplyPartialFill(k, fill, settleTxid, anchorConfs)
 }
 
 // MarkInvalidated drops an offer because the maker could not co-sign (coins
