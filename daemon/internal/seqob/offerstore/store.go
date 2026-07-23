@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -42,6 +43,7 @@ type Entry struct {
 	CreatedAt    time.Time
 	heldFill     uint64 // B1: active size captured when a mempool spend zeroed it, so the confirmed fill's trade size isn't lost
 	reRested     bool   // F3: this covenant order was re-rested to a remainder outpoint at least once (its funding is no longer the original), so a Ghost of the current outpoint may be a reorg-undone fill whose earlier outpoint is restored — hold it, don't invalidate.
+	demoted      bool   // P3.10: this INTERACTIVE offer pushed the maker's committed capital in its offer_asset past the soft cap (likely phantom depth). Advisory; still resting/liftable.
 }
 
 // Trade is one recorded cross, captured at on-chain SETTLEMENT: the chain watcher records a
@@ -52,17 +54,26 @@ type Trade struct {
 	TS    time.Time
 	Price float64 // quote per base (matches best_bid/best_ask units)
 	Size  uint64  // base atoms filled
+	// Txid is the settling tx this trade was recorded for (empty for a match-time or
+	// txid-less record). It lets a Bitcoin-driven reorg RETRACT the phantom trade
+	// (RetractTrade) so a reorged-away fill no longer leaves a stale last_price (P3.9).
+	Txid string
 }
 
 const maxTradesPerPair = 1000 // ring cap per market; oldest dropped
 
 // tradeRec is one line of the durable JSONL trade log: the pairKey plus the trade, so
 // last_price/trades/candles can be replayed after a relay restart (the book itself is ephemeral).
+// A record with RetractTxid set is a RETRACTION (P3.9): on replay it removes any already-
+// replayed trades with that txid for that pair, so a reorged-away fill does not resurrect
+// after a restart. The append-only log stays append-only (no rewrite on a reorg).
 type tradeRec struct {
-	PK    string    `json:"pk"`
-	TS    time.Time `json:"ts"`
-	Price float64   `json:"price"`
-	Size  uint64    `json:"size"`
+	PK          string    `json:"pk"`
+	TS          time.Time `json:"ts"`
+	Price       float64   `json:"price"`
+	Size        uint64    `json:"size"`
+	Txid        string    `json:"txid,omitempty"`
+	RetractTxid string    `json:"retract_txid,omitempty"`
 }
 
 // EventType is the kind of book delta.
@@ -90,33 +101,51 @@ type Event struct {
 	Offer        *seqobv1.Offer       // set for EventCreated
 	Ref          *seqobv1.OfferRef    // set for EventRemoved
 	Status       *seqobv1.OrderStatus // set for EventStatus
+	// Seq is the monotonic per-subscription sequence number of this delta (P3.8),
+	// stamped at delivery time. A subscriber that sees Seq skip a value missed a
+	// dropped delta and must re-snapshot. 0 until stamped.
+	Seq uint64
 }
 
 type subscriber struct {
 	pair         string // pairKey filter, or "" for all pairs
 	confidential bool   // book namespace this subscriber is bound to (only matching-namespace deltas are delivered)
 	ch           chan Event
+	// seq is the per-subscription delta counter (P3.8). It is incremented for EVERY
+	// event ROUTED to this subscriber — delivered OR dropped — so a dropped delta
+	// leaves a hole in the delivered sequence that the subscriber (and the WS
+	// forwarder) detect as a gap. Atomic: concurrent broadcasts may route here.
+	seq atomic.Uint64
 }
 
 // Store is the in-memory order book.
 type Store struct {
-	mu           sync.RWMutex
-	entries      map[Key]*Entry
-	pairs        map[string]map[Key]bool // pairKey -> set of keys
-	subs         map[int]*subscriber
-	nextSub      int
-	cancelNonce  map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
-	settledNonce map[Key]uint64 // highest settled-trade nonce seen per key (replay defense; offer_id is reused across -requote)
-	subBuf       int
-	now          func() time.Time
-	trades       map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
-	tradeLog     *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
+	mu             sync.RWMutex
+	entries        map[Key]*Entry
+	pairs          map[string]map[Key]bool // pairKey -> set of keys
+	subs           map[int]*subscriber
+	nextSub        int
+	cancelNonce    map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
+	settledNonce   map[Key]uint64 // highest settled-trade nonce seen per key (replay defense; offer_id is reused across -requote)
+	subBuf         int
+	now            func() time.Time
+	trades         map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
+	tradeLog       *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
+	interactiveCap uint64             // P3.10: per-maker soft cap on committed capital per offer_asset (0 = disabled). An interactive offer that pushes the maker's cumulative offer_amount in an asset past this is demoted.
 }
 
 // RecordTrade appends one executed cross for the resting offer's pair at its execution
 // price (displayPrice of the resting order). Called by the matcher when a fill is produced.
 // Best-effort + non-blocking: bad inputs are ignored, never an error on the match path.
 func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
+	s.RecordTradeTx(restingOffer, sizeBase, "")
+}
+
+// RecordTradeTx is RecordTrade with the SETTLING TXID attached, so a later Bitcoin
+// reorg can retract this exact trade (RetractTrade). Callers with a settle txid (the
+// interactive-lift SettleAck, cross/LN SettledTrade) pass it; a txid-less record ("")
+// behaves exactly like RecordTrade.
+func (s *Store) RecordTradeTx(restingOffer *seqobv1.Offer, sizeBase uint64, txid string) {
 	if restingOffer == nil || sizeBase == 0 {
 		return
 	}
@@ -131,7 +160,7 @@ func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
 	if s.trades == nil {
 		s.trades = make(map[string][]Trade)
 	}
-	t := append(s.trades[pk], Trade{TS: ts, Price: price, Size: sizeBase})
+	t := append(s.trades[pk], Trade{TS: ts, Price: price, Size: sizeBase, Txid: txid})
 	if len(t) > maxTradesPerPair {
 		t = t[len(t)-maxTradesPerPair:]
 	}
@@ -142,10 +171,47 @@ func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
 	// book behind the trade-log write on the match/settle hot path. os.File appends (O_APPEND) are atomic
 	// and Write is goroutine-safe, so concurrent appends are fine. Best-effort — a log error never breaks.
 	if logf != nil {
-		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, Price: price, Size: sizeBase}); err == nil {
+		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, Price: price, Size: sizeBase, Txid: txid}); err == nil {
 			_, _ = logf.Write(append(b, '\n'))
 		}
 	}
+}
+
+// RetractTrade removes every recorded trade for pair whose settling tx is txid, then
+// durably appends a RETRACTION to the JSONL so the trade does not resurrect on a
+// restart replay (P3.9). It is the trade-feed half of reorg-undo: when a Bitcoin
+// reorg orphans a settling tx, the fill un-happened, so the phantom trade print, its
+// contribution to last_price (the newest ring entry), and its candle volume must go.
+// The append-only log stays append-only (no rewrite). Returns the number removed.
+// No-op for an empty txid (a txid-less trade cannot be targeted).
+func (s *Store) RetractTrade(pair *seqobv1.AssetPair, txid string) int {
+	if pair == nil || txid == "" {
+		return 0
+	}
+	pk := pairKey(pair)
+	ts := s.now()
+	s.mu.Lock()
+	ring := s.trades[pk]
+	kept := ring[:0:0]
+	removed := 0
+	for _, tr := range ring {
+		if tr.Txid == txid {
+			removed++
+			continue
+		}
+		kept = append(kept, tr)
+	}
+	if removed > 0 {
+		s.trades[pk] = kept
+	}
+	logf := s.tradeLog
+	s.mu.Unlock()
+	if removed > 0 && logf != nil {
+		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, RetractTxid: txid}); err == nil {
+			_, _ = logf.Write(append(b, '\n'))
+		}
+	}
+	return removed
 }
 
 // EnableTradeLog makes the trade history durable: it replays an existing append-only JSONL log into
@@ -164,12 +230,25 @@ func (s *Store) EnableTradeLog(path string) error {
 			line, rerr := rd.ReadBytes('\n')
 			if len(line) > 0 {
 				var r tradeRec
-				if json.Unmarshal(line, &r) == nil && r.PK != "" && r.Price > 0 && r.Size != 0 {
-					t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size})
-					if len(t) > maxTradesPerPair {
-						t = t[len(t)-maxTradesPerPair:]
+				if json.Unmarshal(line, &r) == nil && r.PK != "" {
+					if r.RetractTxid != "" {
+						// A reorg retraction (P3.9): drop any already-replayed trades with this
+						// txid so a reorged-away fill does not resurrect after a restart.
+						ring := s.trades[r.PK]
+						kept := ring[:0:0]
+						for _, tr := range ring {
+							if tr.Txid != r.RetractTxid {
+								kept = append(kept, tr)
+							}
+						}
+						s.trades[r.PK] = kept
+					} else if r.Price > 0 && r.Size != 0 {
+						t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size, Txid: r.Txid})
+						if len(t) > maxTradesPerPair {
+							t = t[len(t)-maxTradesPerPair:]
+						}
+						s.trades[r.PK] = t
 					}
-					s.trades[r.PK] = t
 				}
 			}
 			if rerr != nil {
@@ -203,7 +282,7 @@ func (s *Store) compactTradeLog(path string) {
 	s.mu.RLock()
 	for pk, ring := range s.trades {
 		for _, tr := range ring {
-			if b, mErr := json.Marshal(tradeRec{PK: pk, TS: tr.TS, Price: tr.Price, Size: tr.Size}); mErr == nil {
+			if b, mErr := json.Marshal(tradeRec{PK: pk, TS: tr.TS, Price: tr.Price, Size: tr.Size, Txid: tr.Txid}); mErr == nil {
 				_, _ = f.Write(append(b, '\n'))
 			}
 		}
@@ -248,6 +327,57 @@ func New(now func() time.Time) *Store {
 	}
 }
 
+// SetInteractiveCap sets the P3.10 soft per-maker committed-capital cap: an
+// INTERACTIVE offer whose offer_amount pushes the maker's cumulative committed
+// capital in that offer_asset past n is DEMOTED (flagged as likely phantom depth,
+// but still resting/liftable). 0 (the default) disables demotion. Covenant offers
+// are funded on-chain and never demoted. Set at startup.
+func (s *Store) SetInteractiveCap(n uint64) {
+	s.mu.Lock()
+	s.interactiveCap = n
+	s.mu.Unlock()
+}
+
+// CommittedInteractiveCapital returns the maker's cumulative committed capital in
+// offerAsset across its LIVE interactive (non-covenant) offers — the sum of their
+// offer_amounts. It is the soft-accounting quantity the relay uses to spot phantom
+// depth (many resting offers drawing on the same coins), exported so a UI/monitor can
+// read it. Covenant offers are excluded (funded on-chain, no oversell).
+func (s *Store) CommittedInteractiveCapital(makerPubkey, offerAsset string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.committedInteractiveLocked(makerPubkey, offerAsset)
+}
+
+// committedInteractiveLocked sums live interactive offer_amounts for (maker, asset).
+// Caller holds s.mu.
+func (s *Store) committedInteractiveLocked(makerPubkey, offerAsset string) uint64 {
+	var total uint64
+	for k, e := range s.entries {
+		if k.MakerPubkey != makerPubkey || e.Offer.GetCovenant() != nil {
+			continue
+		}
+		if e.Offer.GetOfferAsset() != offerAsset {
+			continue
+		}
+		total += e.Offer.GetOfferAmount()
+	}
+	return total
+}
+
+// SetSubBuf sets the per-subscriber delta-channel capacity for subscribers created
+// AFTER this call (the default is 256). Lower it to make a buffer overflow — and the
+// resulting delta-sequence gap (P3.8) — deterministic in tests, or raise it for a
+// bursty deployment. Call before Subscribe.
+func (s *Store) SetSubBuf(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.mu.Lock()
+	s.subBuf = n
+	s.mu.Unlock()
+}
+
 func pairKey(p *seqobv1.AssetPair) string {
 	return p.GetBaseAsset() + "/" + p.GetQuoteAsset()
 }
@@ -283,6 +413,15 @@ func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 		CreatedAt:    s.now(),
 	}
 	s.put(k, e)
+	// P3.10 soft oversell: for an INTERACTIVE offer, once the maker's cumulative
+	// committed capital in this offer_asset (now including this offer) exceeds the soft
+	// cap, flag this marginal offer as demoted (likely phantom depth). Computed after
+	// put() so committedInteractiveLocked includes this offer. Covenant offers exempt.
+	if s.interactiveCap > 0 && o.GetCovenant() == nil {
+		if s.committedInteractiveLocked(k.MakerPubkey, o.GetOfferAsset()) > s.interactiveCap {
+			e.demoted = true
+		}
+	}
 	s.mu.Unlock()
 	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return k, nil
@@ -623,6 +762,22 @@ func (s *Store) RecordSettledFill(k Key, fillBase uint64, settleTxid string, anc
 // moved). Maps to SideSwap HistStatus UTXO_INVALIDATED; no on-chain cost.
 func (s *Store) MarkInvalidated(k Key) error {
 	return s.dropWithStatus(k, seqobv1.OfferStatus_OFFER_STATUS_UTXO_INVALIDATED)
+}
+
+// RetireIncoming removes an order the RELAY itself retires immediately after
+// accepting it, per the order's time-in-force (an IOC remainder, or a FOK /
+// POST_ONLY that must not rest). Unlike Cancel it needs no maker-signed nonce (the
+// relay is enforcing the maker's own stated option on its own just-accepted order),
+// and unlike MarkInvalidated it carries the caller's terminal status (CANCELLED).
+// No-op (nil) if the entry is already gone (e.g. a concurrent fill removed it).
+func (s *Store) RetireIncoming(k Key, status seqobv1.OfferStatus) error {
+	s.mu.Lock()
+	if _, ok := s.entries[k]; !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	return s.dropWithStatus(k, status)
 }
 
 func (s *Store) dropWithStatus(k Key, status seqobv1.OfferStatus) error {
@@ -1052,6 +1207,7 @@ func (e *Entry) orderStatus(k Key) *seqobv1.OrderStatus {
 		ActiveAmount: e.ActiveAmount,
 		SettleTxid:   e.SettleTxid,
 		AnchorConfs:  e.AnchorConfs,
+		Demoted:      e.demoted,
 	}
 }
 
@@ -1075,9 +1231,16 @@ func (s *Store) broadcast(ev Event) {
 	}
 	s.mu.RUnlock()
 	for _, sub := range subs {
+		// Stamp a per-subscriber sequence number and increment for EVERY routed event
+		// (P3.8), so a dropped delta (buffer full -> default) leaves a hole the
+		// subscriber detects as a gap and re-snapshots. Copy the Event per subscriber
+		// since each gets its own Seq.
+		e := ev
+		e.Seq = sub.seq.Add(1)
 		select {
-		case sub.ch <- ev:
+		case sub.ch <- e:
 		default:
+			// Dropped: the seq is consumed, so the next delivered delta shows a gap.
 		}
 	}
 }

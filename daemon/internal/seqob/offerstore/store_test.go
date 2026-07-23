@@ -2,6 +2,7 @@ package offerstore
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -73,6 +74,162 @@ func key(t *testing.T) *btcec.PrivateKey {
 		t.Fatal(err)
 	}
 	return k
+}
+
+// TestInteractiveOversellDemotion covers P3.10 soft accounting: an interactive
+// offer that pushes a maker's cumulative committed capital in an asset past the soft
+// cap is DEMOTED (advisory), earlier offers stay non-demoted, and covenant offers are
+// exempt (funded on-chain, never counted or demoted).
+func TestInteractiveOversellDemotion(t *testing.T) {
+	s := New(nil)
+	s.SetInteractiveCap(150) // soft cap: 150 atoms of committed 'gold' per maker
+	k := key(t)
+
+	o1 := mkOffer(t, k, "o1", 1799999999) // SELL, offer_asset gold, offer_amount 100
+	maker := o1.GetMakerPubkey()
+	if _, err := s.Submit(o1); err != nil {
+		t.Fatalf("submit o1: %v", err)
+	}
+	if c := s.CommittedInteractiveCapital(maker, "gold"); c != 100 {
+		t.Fatalf("committed after o1 = %d, want 100", c)
+	}
+	if st, _ := s.OrderStatusOf(Key{MakerPubkey: maker, OfferID: "o1"}); st.GetDemoted() {
+		t.Fatal("o1 (100 <= 150 cap) must not be demoted")
+	}
+
+	o2 := mkOffer(t, k, "o2", 1799999999) // another 100 -> cumulative 200 > 150
+	if _, err := s.Submit(o2); err != nil {
+		t.Fatalf("submit o2: %v", err)
+	}
+	if c := s.CommittedInteractiveCapital(maker, "gold"); c != 200 {
+		t.Fatalf("committed after o2 = %d, want 200", c)
+	}
+	if st, _ := s.OrderStatusOf(Key{MakerPubkey: maker, OfferID: "o2"}); !st.GetDemoted() {
+		t.Fatal("o2 (pushes committed to 200 > 150) must be demoted")
+	}
+	if st, _ := s.OrderStatusOf(Key{MakerPubkey: maker, OfferID: "o1"}); st.GetDemoted() {
+		t.Fatal("o1 must remain non-demoted (only the marginal over-cap offer is flagged)")
+	}
+
+	// A covenant offer for the same maker+asset is EXEMPT: never counted, never demoted.
+	cov := mkCovOffer(t, k, "cov", "txcov", 0, 1000) // offer_asset gold, offer_amount 1000
+	if _, err := s.Submit(cov); err != nil {
+		t.Fatalf("submit cov: %v", err)
+	}
+	if c := s.CommittedInteractiveCapital(maker, "gold"); c != 200 {
+		t.Fatalf("covenant must not count toward committed capital, got %d", c)
+	}
+	if st, _ := s.OrderStatusOf(Key{MakerPubkey: maker, OfferID: "cov"}); st.GetDemoted() {
+		t.Fatal("a covenant offer must never be demoted")
+	}
+}
+
+// TestRetractTradeRemovesTradeAndFixesLastPrice covers the trade-feed half of P3.9
+// reorg-undo: retracting a settle txid removes its trade(s) from the ring, so
+// last_price (the newest ring entry) falls back to the surviving trade.
+func TestRetractTradeRemovesTradeAndFixesLastPrice(t *testing.T) {
+	s := New(nil)
+	k := key(t)
+	pair := &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}
+	// ask 0.45 (want/offer = 45/100); a second offer at 0.60 for a distinct last price.
+	sellA := mkOffer(t, k, "s1", 1799999999) // 0.45
+	sellB := mkOffer(t, k, "s2", 1799999999)
+	sellB.WantAmount = 60
+	sellB.MakerSig = nil
+	if err := offer.SignOffer(sellB, k); err != nil {
+		t.Fatal(err)
+	}
+	s.RecordTradeTx(sellA, 10, "txA") // price 0.45
+	s.RecordTradeTx(sellB, 20, "txB") // price 0.60 (newest -> last_price)
+	if last := lastPrice(s, pair); last != 0.60 {
+		t.Fatalf("last_price before retract = %v, want 0.60", last)
+	}
+	if n := s.RetractTrade(pair, "txB"); n != 1 {
+		t.Fatalf("retract removed %d, want 1", n)
+	}
+	tr := s.TradesFor(pair, 0)
+	if len(tr) != 1 || tr[0].Txid != "txA" {
+		t.Fatalf("after retract want only txA, got %+v", tr)
+	}
+	if last := lastPrice(s, pair); last != 0.45 {
+		t.Fatalf("last_price after retract = %v, want 0.45 (fell back to txA)", last)
+	}
+	if n := s.RetractTrade(pair, "nope"); n != 0 {
+		t.Fatalf("retracting a non-existent txid removed %d, want 0", n)
+	}
+}
+
+// TestRetractTradeSurvivesRestart covers the durability half of P3.9: a retraction is
+// appended to the JSONL, so a relay restart's replay does not resurrect the reorged
+// trade.
+func TestRetractTradeSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trades.jsonl")
+	pair := &seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}
+	k := key(t)
+	sell := mkOffer(t, k, "s1", 1799999999)
+
+	s1 := New(nil)
+	if err := s1.EnableTradeLog(path); err != nil {
+		t.Fatal(err)
+	}
+	s1.RecordTradeTx(sell, 10, "txA")
+	s1.RecordTradeTx(sell, 20, "txB")
+	if n := s1.RetractTrade(pair, "txB"); n != 1 {
+		t.Fatalf("retract removed %d, want 1", n)
+	}
+
+	// Restart: a fresh store replaying the same log must contain only txA.
+	s2 := New(nil)
+	if err := s2.EnableTradeLog(path); err != nil {
+		t.Fatal(err)
+	}
+	tr := s2.TradesFor(pair, 0)
+	if len(tr) != 1 || tr[0].Txid != "txA" {
+		t.Fatalf("after restart want only txA, got %+v", tr)
+	}
+}
+
+// lastPrice reads a pair's last_price — the newest trade in the ring, exactly the
+// source Markets().LastPrice reads.
+func lastPrice(s *Store, pair *seqobv1.AssetPair) float64 {
+	tr := s.TradesFor(pair, 0)
+	if len(tr) == 0 {
+		return 0
+	}
+	return tr[len(tr)-1].Price
+}
+
+// TestSubscriberDeltaSeqGap covers P3.8 delta sequencing: each delivered delta carries
+// a monotonic per-subscription Seq, and a delta DROPPED on a buffer overflow leaves a
+// hole in the delivered sequence — the gap the WS forwarder turns into a Resync.
+func TestSubscriberDeltaSeqGap(t *testing.T) {
+	s := New(nil)
+	s.SetSubBuf(2) // tiny buffer so a 3rd un-drained delta overflows deterministically
+	k := key(t)
+	_, id, ch := s.Subscribe(&seqobv1.AssetPair{BaseAsset: "gold", QuoteAsset: "usdx"}, false)
+	defer s.Unsubscribe(id)
+
+	sub := func(idStr string) {
+		if _, err := s.Submit(mkOffer(t, k, idStr, 1799999999)); err != nil {
+			t.Fatalf("submit %s: %v", idStr, err)
+		}
+	}
+	// Two creates fill the buffer (seq 1, 2); a third overflows and is DROPPED (seq 3).
+	sub("o1")
+	sub("o2")
+	sub("o3") // dropped: buffer full
+	if e := recv(t, ch); e.Seq != 1 {
+		t.Fatalf("first delta seq = %d, want 1", e.Seq)
+	}
+	if e := recv(t, ch); e.Seq != 2 {
+		t.Fatalf("second delta seq = %d, want 2", e.Seq)
+	}
+	// The buffer has drained; a fourth create fits (seq 4). Its delivery shows a GAP
+	// (expected 3, got 4) — seq 3 was dropped.
+	sub("o4")
+	if e := recv(t, ch); e.Seq != 4 {
+		t.Fatalf("post-overflow delta seq = %d, want 4 (seq 3 dropped -> gap)", e.Seq)
+	}
 }
 
 func TestSubmitVerifiesAndSnapshot(t *testing.T) {

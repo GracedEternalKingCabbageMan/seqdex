@@ -26,6 +26,28 @@ enum TradeDir {
   TRADE_DIR_BUY  = 2; // maker buys base
 }
 
+// TimeInForce is the incoming order's execution option for the CONTINUOUS auto-cross
+// (offer_submit -> the book-walking matcher). It falls out of price-time-priority
+// book-walking; Market/Limit are unchanged (GTC). Additive; the proto3 default 0 =
+// GTC preserves every existing offer's behavior.
+enum TimeInForce {
+  // GTC (good-till-cancel / Limit): cross what you can at the limit price or better,
+  // then REST the unfilled remainder as a maker order until filled/cancelled/expired.
+  // A non-allow_partial GTC order is all-or-nothing-then-REST (unchanged behavior).
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  // IOC (immediate-or-cancel): cross what you can NOW, then CANCEL the remainder — it
+  // never rests. A Market order is IOC at any price.
+  TIME_IN_FORCE_IOC = 1;
+  // FOK (fill-or-kill): all-or-nothing IMMEDIATELY. If the crossing liquidity cannot
+  // fill the WHOLE incoming at once, execute NOTHING and cancel (never rest a partially
+  // unfilled order). Differs from a non-allow_partial GTC only in that it CANCELS
+  // instead of resting.
+  TIME_IN_FORCE_FOK = 2;
+  // POST_ONLY: rest-only. If the incoming would TAKE (cross) any resting order, REJECT
+  // it (execute nothing, do not rest); otherwise rest as a pure maker order.
+  TIME_IN_FORCE_POST_ONLY = 3;
+}
+
 // Offer is the signed, self-contained intent. The authoritative exchange ratio
 // is want_amount/offer_amount (integers); there is deliberately no float price
 // field in the signed bytes (clients derive a display price). Offers are keyed
@@ -65,6 +87,12 @@ message Offer {
   // endpoint. Declared now so adding LN is additive, not a schema migration.
   string maker_ln_node_pubkey = 17;
   repeated string ln_connect_hints = 18;
+
+  // Execution option for the continuous auto-cross (see TimeInForce). Additive;
+  // default 0 = GTC (rest the remainder) so Market/Limit are unchanged. IOC cancels
+  // the remainder, FOK is all-or-nothing-then-cancel, POST_ONLY rejects if it would
+  // take. Part of the signed canonical bytes, so it is authenticated by maker_sig.
+  TimeInForce time_in_force = 24;
 
   // Confidential book namespace. When true, this offer rests in the SEPARATE
   // BLINDED book and may ONLY cross another confidential offer, so BOTH swap legs

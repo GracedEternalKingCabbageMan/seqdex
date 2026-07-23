@@ -59,9 +59,28 @@ type Session struct {
 	makerInbox chan *seqobv1.SwapMsg
 	done       chan struct{}
 
-	mu         sync.Mutex
-	settleTxid string
-	closeOnce  sync.Once
+	mu           sync.Mutex
+	settleTxid   string
+	settledOffer *seqobv1.Offer // cached at settle time so a reorg orphan can re-insert it (P3.9)
+	settledFill  uint64         // base atoms filled by the settlement (the size to restore on re-open)
+	closeOnce    sync.Once
+}
+
+// SettledOffer returns the resting offer cached when the interactive lift settled, so
+// the reorg re-open hook can re-insert it (the store removed it on full fill). nil if
+// the session never settled.
+func (s *Session) SettledOffer() *seqobv1.Offer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settledOffer
+}
+
+// SettledFill returns the base atoms the settlement filled (the ActiveAmount to
+// restore when a reorg re-opens the offer).
+func (s *Session) SettledFill() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settledFill
 }
 
 // Inbox returns the channel of frames destined for the given role.
@@ -231,15 +250,42 @@ func (r *Router) Send(sessionID string, from Role, ciphertext []byte) error {
 // SetSettleTxid records the settling tx for a session and registers it with the
 // reorg watcher so an orphaned anchor re-opens the order (Principle 1).
 func (r *Router) SetSettleTxid(sessionID, txid string) error {
+	return r.ArmReorgReopen(sessionID, txid, nil, 0)
+}
+
+// ArmReorgReopen records the settling tx AND caches the settled offer + fill size,
+// then registers the tx with the reorg watcher so an orphaned Bitcoin anchor
+// re-opens the exact order (Principle 1 / P3.9). The interactive-lift store op
+// REMOVES the resting offer on a full fill, so onReopen cannot re-insert it without
+// this cached copy; the fill size is the ActiveAmount to restore. A nil offer keeps
+// the old behavior (arm the watch only).
+func (r *Router) ArmReorgReopen(sessionID, txid string, o *seqobv1.Offer, fill uint64) error {
 	s, ok := r.Get(sessionID)
 	if !ok {
 		return errors.New("unknown session")
 	}
 	s.mu.Lock()
 	s.settleTxid = txid
+	if o != nil {
+		s.settledOffer = o
+		s.settledFill = fill
+	}
 	s.mu.Unlock()
-	r.reorg.WatchSettlement(sessionID, txid, func() { r.OnAnchorOrphaned(sessionID) })
+	// Re-open from the CAPTURED session, not the live map: wsSettleAck Close()s the
+	// session immediately after settlement (removing it from the map), yet the reorg
+	// may fire minutes/blocks later. The captured *Session still carries the cached
+	// offer + fill needed to re-insert the order (P3.9).
+	r.reorg.WatchSettlement(sessionID, txid, func() { r.reopen(s) })
 	return nil
+}
+
+// reopen invokes the OnReopen hook for a (possibly already-closed) session. Used by
+// the reorg watcher's orphan callback: the settlement Close()d the session, so we
+// re-open from the captured session object rather than the live session map.
+func (r *Router) reopen(s *Session) {
+	if r.onReopen != nil {
+		r.onReopen(s)
+	}
 }
 
 // OnAnchorOrphaned is invoked when a settled tx's anchor is orphaned. It closes

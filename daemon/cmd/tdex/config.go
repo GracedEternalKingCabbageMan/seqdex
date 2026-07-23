@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/btcsuite/btcd/btcutil"
 	"github.com/aejkcs50/seqdex/daemon/pkg/tdexdconnect"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/urfave/cli/v2"
 	"github.com/vulpemventures/go-elements/network"
 )

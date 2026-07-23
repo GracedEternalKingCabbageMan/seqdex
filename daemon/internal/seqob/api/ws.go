@@ -26,7 +26,17 @@ type wsConn struct {
 	subs        map[string]func() // pairKey -> stop forwarder
 	roles       map[string]session.Role
 	makerPubkey string
+
+	// closed is closed exactly once when this connection is torn down, so its session
+	// pumps and ping loop stop promptly (a lingering pump would steal a re-attached
+	// session's courier frames, P3.8).
+	closed    chan struct{}
+	closeOnce sync.Once
 }
+
+// stop signals every goroutine bound to this connection (session pumps, ping loop)
+// to exit. Idempotent.
+func (c *wsConn) stop() { c.closeOnce.Do(func() { close(c.closed) }) }
 
 // writeWait bounds a single WS write. Without it, a maker whose OS receive buffer is full
 // blocks WriteMessage forever while holding writeMu — and because routeMatches/notifyMaker
@@ -34,6 +44,15 @@ type wsConn struct {
 // could wedge a submitter (head-of-line blocking). A deadline turns that into a fast error
 // the caller cleans up instead of a silent hang.
 const writeWait = 10 * time.Second
+
+// P3.8 keepalive: the relay pings every pingPeriod and expects a pong (or any read)
+// within pongWait, else the read deadline fires and the dead connection is reaped.
+// Without this a half-open TCP connection (peer vanished, no FIN) would pin the
+// maker's offers as unliftable ghosts until their TTL. pingPeriod < pongWait.
+const (
+	pongWait   = 60 * time.Second
+	pingPeriod = 50 * time.Second
+)
 
 func (c *wsConn) send(from *seqobv1.From) error {
 	b, err := jsonMarshal.Marshal(from)
@@ -94,11 +113,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := &wsConn{
-		conn:  conn,
-		subs:  make(map[string]func()),
-		roles: make(map[string]session.Role),
+		conn:   conn,
+		subs:   make(map[string]func()),
+		roles:  make(map[string]session.Role),
+		closed: make(chan struct{}),
 	}
 	defer s.closeConn(c)
+
+	// P3.8 keepalive: bound reads by a deadline the pong handler (and any inbound
+	// frame) extends, and ping on a ticker so a half-open peer is reaped instead of
+	// pinning its offers forever.
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	go s.pingLoop(c)
 
 	for {
 		_, data, err := conn.ReadMessage()
@@ -114,6 +143,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// Any inbound frame proves the peer is alive: push the read deadline out (a
+		// chatty client that never pongs stays connected).
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 		var to seqobv1.To
 		if err := jsonUnmarshal.Unmarshal(data, &to); err != nil {
 			c.sendErr(400, "decode To: "+err.Error())
@@ -123,7 +155,26 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// pingLoop pings the peer every pingPeriod until the connection is torn down, so a
+// half-open TCP connection (peer gone with no FIN) trips the read deadline and is
+// reaped. WriteControl is safe to call concurrently with the single-writer send().
+func (s *Server) pingLoop(c *wsConn) {
+	t := time.NewTicker(pingPeriod)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-t.C:
+			if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) closeConn(c *wsConn) {
+	c.stop() // stop session pumps + ping loop first so they don't steal re-attach frames
 	c.mu.Lock()
 	for _, stop := range c.subs {
 		stop()
@@ -153,6 +204,8 @@ func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
 		s.wsOfferCancel(c, m.OfferCancel)
 	case *seqobv1.To_StartLift:
 		s.wsStartLift(c, m.StartLift)
+	case *seqobv1.To_SessionReattach:
+		s.wsSessionReattach(c, m.SessionReattach)
 	case *seqobv1.To_SettleAck:
 		s.wsSettleAck(c, m.SettleAck)
 	case *seqobv1.To_SettledTrade:
@@ -207,6 +260,7 @@ func (s *Server) wsSubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 }
 
 func (s *Server) forwardDeltas(c *wsConn, ch <-chan offerstore.Event, stop <-chan struct{}) {
+	var lastSeq uint64
 	for {
 		select {
 		case <-stop:
@@ -219,13 +273,23 @@ func (s *Server) forwardDeltas(c *wsConn, ch <-chan offerstore.Event, stop <-cha
 			switch ev.Type {
 			case offerstore.EventCreated:
 				from = &seqobv1.From{Msg: &seqobv1.From_PublicOrderCreated{PublicOrderCreated: ev.Offer}}
-			case offerstore.EventRemoved:
-				from = &seqobv1.From{Msg: &seqobv1.From_PublicOrderRemoved{PublicOrderRemoved: ev.Ref}}
 			case offerstore.EventStatus:
 				from = &seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: ev.Status}}
+			case offerstore.EventRemoved:
+				from = &seqobv1.From{Msg: &seqobv1.From_PublicOrderRemoved{PublicOrderRemoved: ev.Ref}}
 			default:
 				continue
 			}
+			// P3.8 delta sequencing: the store stamps a monotonic per-subscription Seq and
+			// increments it for every routed event (delivered OR dropped), so a hole here means
+			// the relay dropped a delta on a buffer overflow and this subscriber's view is
+			// stale. Tell it to re-snapshot (Resync) BEFORE the out-of-order delta, then carry
+			// the seq on the delta so the client can also self-detect.
+			if lastSeq != 0 && ev.Seq != lastSeq+1 {
+				_ = c.send(&seqobv1.From{Msg: &seqobv1.From_Resync{Resync: &seqobv1.Resync{Pair: ev.Pair, NextSeq: ev.Seq}}})
+			}
+			lastSeq = ev.Seq
+			from.Seq = ev.Seq
 			if err := c.send(from); err != nil {
 				return
 			}
@@ -279,12 +343,17 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 	// Register this connection as the maker's reachable endpoint for live lifts.
 	s.registerMaker(c, o.GetMakerPubkey())
 
-	// Continuous matching: cross the freshly-rested order against the resting
-	// opposite side, routing From.matched to the counterparties. For a covenant
-	// resting order the offline maker needs no round-trip; the taker (this
-	// connection) is told the covenant terms and settles the FILL spend itself.
-	matches := s.matcher.Cross(o)
-	s.routeMatches(c, matches)
+	// Continuous matching under the order's time-in-force: cross the freshly-rested
+	// order against the resting opposite side, routing From.matched to the
+	// counterparties. For a covenant resting order the offline maker needs no
+	// round-trip; the taker (this connection) is told the covenant terms and settles
+	// the FILL spend itself. The disposition retires the incoming per IOC/FOK/POST_ONLY.
+	res := s.matcher.CrossOrder(o)
+	s.routeMatches(c, res.Matches)
+	if s.applyDisposition(o, res) {
+		_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: cancelledStatus(o)}})
+		return
+	}
 
 	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 }
@@ -362,6 +431,54 @@ func (s *Server) wsStartLift(c *wsConn, sl *seqobv1.StartLift) {
 	}}})
 }
 
+// wsSessionReattach re-binds a RECONNECTED websocket to a still-live lift session
+// after a WS drop (P3.8). The role was bound to the OLD socket, so without this the
+// fresh WS 403s on the first swap_msg. The participant re-proves control of the
+// session key the relay already holds for the claimed role (the maker's offer key,
+// or the taker's ephemeral session pubkey), so no new trust is introduced.
+func (s *Server) wsSessionReattach(c *wsConn, ra *seqobv1.SessionReattach) {
+	if ra == nil || ra.GetSessionId() == "" {
+		c.sendErr(400, "session_reattach missing session_id")
+		return
+	}
+	sid, role := ra.GetSessionId(), ra.GetRole()
+	sess, ok := s.sessions.Get(sid)
+	if !ok {
+		c.sendErr(409, "unknown or closed session")
+		return
+	}
+	var sessRole session.Role
+	var keyBytes []byte
+	switch role {
+	case "maker":
+		sessRole = session.RoleMaker
+		keyBytes = makerPubkeyBytes(sess.MakerPubkey) // the maker's offer key doubles as its session key
+	case "taker":
+		sessRole = session.RoleTaker
+		keyBytes = sess.TakerSessionPubkey
+	default:
+		c.sendErr(400, "session_reattach role must be \"taker\" or \"maker\"")
+		return
+	}
+	if len(keyBytes) == 0 {
+		c.sendErr(409, "no bound session key for role "+role)
+		return
+	}
+	if err := offer.VerifyReattach(sid, role, keyBytes, ra.GetSig()); err != nil {
+		c.sendErr(403, "reattach auth: "+err.Error())
+		return
+	}
+	// Re-bind: attach the role so this connection again receives couriered frames, and
+	// (for a maker) re-register it as the maker's reachable endpoint for further lifts.
+	s.attach(c, sess, sessRole)
+	if sessRole == session.RoleMaker {
+		s.registerMaker(c, sess.MakerPubkey)
+	}
+	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_SessionReattached{SessionReattached: &seqobv1.SessionReattached{
+		SessionId: sid, Role: role,
+	}}})
+}
+
 // notifyMaker is the session.Router hook: when a taker lifts an offer, deliver a
 // From.lift_requested to the maker's live connection (if any) carrying the
 // taker's session pubkey, and bind the maker so it receives couriered frames.
@@ -392,6 +509,11 @@ func (s *Server) attach(c *wsConn, sess *session.Session, role session.Role) {
 		for {
 			select {
 			case <-sess.Done():
+				return
+			case <-c.closed:
+				// This connection dropped: stop pumping so a reconnected+re-attached
+				// connection (P3.8) receives the session's frames instead of this dead pump
+				// silently consuming them.
 				return
 			case msg, ok := <-inbox:
 				if !ok {
@@ -463,7 +585,8 @@ func (s *Server) wsSettleAck(c *wsConn, sa *seqobv1.SettleAck) {
 		if fill > 0 {
 			// Record BEFORE ApplyPartialFill: the latter may remove the entry at full fill, after
 			// which e.Offer (needed for the trade's pair + execution price) is no longer fetchable.
-			s.store.RecordTrade(e.Offer, fill)
+			// Record WITH the settle txid so a reorg can retract this exact print (P3.9).
+			s.store.RecordTradeTx(e.Offer, fill, sa.GetSettleTxid())
 			// anchor_confs the maker declares for the settling tx (0 keeps the 0-conf-tolerant
 			// default). A fill with anchor_confs >= min_anchor_depth reaches FILLED; previously
 			// this was hard-coded 0, so a min_anchor_depth>0 offer could never finalize.
@@ -471,6 +594,13 @@ func (s *Server) wsSettleAck(c *wsConn, sa *seqobv1.SettleAck) {
 				c.sendErr(409, "apply fill: "+err.Error())
 				return
 			}
+			// Arm reorg re-open with the settled offer + fill: if this tx's Bitcoin anchor is
+			// later orphaned, onReopen re-inserts the exact order (restoring `fill` atoms) and
+			// retracts the phantom trade (Principle 1 / P3.9). Cache the offer here because a full
+			// fill REMOVED it from the store.
+			_ = s.sessions.ArmReorgReopen(sid, sa.GetSettleTxid(), e.Offer, fill)
+			s.sessions.Close(sid)
+			return
 		}
 	}
 	_ = s.sessions.SetSettleTxid(sid, sa.GetSettleTxid()) // arms reorg re-open (Principle 1)

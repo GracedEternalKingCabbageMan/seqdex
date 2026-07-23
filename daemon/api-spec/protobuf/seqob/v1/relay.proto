@@ -41,6 +41,12 @@ message StartLift {
   uint64 take_amount         = 3; // base atoms; <= base_amount (partial if allow_partial)
   string taker_fee_asset     = 4; // open fee market (Principle 4)
   bytes  taker_session_pubkey = 5;
+  // Taker-side execution option (additive; default 0 = GTC). The take field for the
+  // continuous-matcher order options: a taker walking the book across several lifts can
+  // ask for IOC (take what is available now, do not wait) or FOK (take the full
+  // requested size in one shot or nothing). POST_ONLY is meaningless for a lift (a lift
+  // is by definition a take), so it is rejected on a StartLift.
+  TimeInForce time_in_force = 6;
 }
 
 // Relay confirms a lift session is open and binds the two peers. Carries the
@@ -133,6 +139,36 @@ message SettledTrade {
   bytes  sig          = 7; // by maker_pubkey over {offer_id, maker_pubkey, fill_base, settle_txid, anchor_confs, nonce}
 }
 
+// Client -> relay: re-attach a RECONNECTED websocket to a still-live lift session
+// after a WS drop (P3.8). The session's role was bound to the OLD socket, so a fresh
+// WS otherwise 403s on the first swap_msg. The original participant re-proves control
+// of the session key it already holds: sig is a secp256k1 signature over
+// sha256("seqob-reattach|" || session_id || "|" || role) by that key — the maker's
+// OFFER key (== maker_pubkey) for role "maker", the ephemeral taker_session_pubkey for
+// role "taker". The relay verifies the session exists and the signature matches the
+// bound key, then re-binds this connection to the session (delivering couriered frames).
+message SessionReattach {
+  string session_id = 1;
+  string role       = 2; // "taker" or "maker"
+  bytes  sig        = 3;
+}
+
+// relay -> client: a SessionReattach succeeded; this connection is re-bound to the
+// session and will again receive couriered swap_msg frames for it.
+message SessionReattached {
+  string session_id = 1;
+  string role       = 2;
+}
+
+// relay -> a book subscriber: the relay DROPPED at least one delta for this
+// subscriber (its delivery buffer overflowed on a burst), so its view may be stale
+// (P3.8). The client MUST re-fetch the pair snapshot (REST orderbook or a fresh
+// market_subscribe). next_seq is the sequence the subscriber's stream resumes at.
+message Resync {
+  AssetPair pair     = 1;
+  uint64    next_seq = 2;
+}
+
 enum OfferStatus {
   OFFER_STATUS_UNSPECIFIED      = 0;
   OFFER_STATUS_OPEN             = 1;
@@ -150,6 +186,13 @@ message OrderStatus {
   uint64 active_amount = 4; // remaining base atoms after partials
   string settle_txid   = 5; // set when settling; FILLED only after anchor depth
   uint32 anchor_confs  = 6; // Bitcoin-anchor confirmations of settle_txid so far
+  // Soft oversell flag (P3.10): true when this INTERACTIVE offer's offer_amount pushed
+  // the maker's cumulative committed capital in this offer_asset past the relay's soft
+  // per-maker cap — i.e. it is likely phantom depth backed by coins already committed
+  // to the maker's earlier live offers. Advisory only (the relay cannot see confidential
+  // balances): the offer still rests and can still be lifted, but a book/UI should
+  // down-weight demoted depth. Covenant offers are funded on-chain and never demoted.
+  bool demoted = 7;
 }
 
 message GenericError {
@@ -168,6 +211,7 @@ message To {
     StartLift   start_lift         = 113;
     SettleAck   settle_ack         = 114; // maker: interactive lift settled (record + decrement + close)
     SettledTrade settled_trade     = 115; // maker: durable cross/LN lift settled (session-independent, maker-signed record + decrement)
+    SessionReattach session_reattach = 116; // re-bind a reconnected WS to a live session (P3.8)
     SwapMsg     swap_msg           = 130; // opaque courier passthrough
     Empty       list_markets       = 150;
   }
@@ -180,6 +224,8 @@ message From {
     PublicBook   public_book          = 105; // snapshot
     Offer        public_order_created = 106; // delta
     OfferRef     public_order_removed = 107; // delta
+    Resync       resync               = 108; // book subscriber: deltas were dropped, re-snapshot (P3.8)
+    SessionReattached session_reattached = 109; // WS re-bound to a live session (P3.8)
     LiftAccepted lift_accepted        = 142;
     LiftRequested lift_requested      = 143; // relay -> maker: a taker lifted your offer
     Matched      matched              = 144; // relay -> peer: the matcher crossed two orders
@@ -187,4 +233,10 @@ message From {
     OrderStatus  order_status         = 160;
     GenericError error                = 200;
   }
+  // Monotonic per-subscription sequence number of a book DELTA
+  // (public_order_created / public_order_removed / order_status forwarded to a
+  // subscriber). 0 on snapshots, direct replies, and courier/session messages. A
+  // subscriber that sees seq skip a value missed a delta (the relay dropped it on a
+  // buffer overflow) and MUST re-snapshot; the relay also proactively sends Resync.
+  uint64 seq = 210;
 }

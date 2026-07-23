@@ -242,6 +242,42 @@ func VerifySettledTrade(st *seqobv1.SettledTrade) error {
 	return nil
 }
 
+// ReattachHash is the sha256 challenge a participant signs to re-bind a
+// reconnected WebSocket to a live lift session (P3.8). Binding the session_id AND
+// the role prevents replaying a maker's signature as a taker (or across sessions).
+func ReattachHash(sessionID, role string) [32]byte {
+	return sha256.Sum256([]byte("seqob-reattach|" + sessionID + "|" + role))
+}
+
+// SignReattach returns a DER secp256k1 signature over ReattachHash(sessionID, role)
+// with priv — the session participant's key (the maker's offer key, or the taker's
+// ephemeral session key).
+func SignReattach(sessionID, role string, priv *btcec.PrivateKey) []byte {
+	h := ReattachHash(sessionID, role)
+	return ecdsa.Sign(priv, h[:]).Serialize()
+}
+
+// VerifyReattach checks a DER secp256k1 signature over ReattachHash(sessionID, role)
+// against the compressed session-key bytes that the relay already holds for that role.
+func VerifyReattach(sessionID, role string, pubkey, sig []byte) error {
+	if len(sig) == 0 {
+		return errors.New("missing reattach sig")
+	}
+	pub, err := btcec.ParsePubKey(pubkey)
+	if err != nil {
+		return fmt.Errorf("bad session pubkey: %w", err)
+	}
+	s, err := ecdsa.ParseDERSignature(sig)
+	if err != nil {
+		return fmt.Errorf("bad reattach sig encoding: %w", err)
+	}
+	h := ReattachHash(sessionID, role)
+	if !s.Verify(h[:], pub) {
+		return errors.New("reattach sig verification failed")
+	}
+	return nil
+}
+
 func parsePubkeyHex(s string) (*btcec.PublicKey, error) {
 	b, err := hex.DecodeString(s)
 	if err != nil {
