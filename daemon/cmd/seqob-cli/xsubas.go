@@ -198,7 +198,12 @@ func cmdXSubAs(args []string) {
 	}
 	fmt.Printf("taking sub-asset offer %s by %s: pay %d BTC sats ON-CHAIN, receive %d %s OVER LIGHTNING%s\n",
 		target.GetOfferId(), short(target.GetMakerPubkey()), btcSats, assetAtoms, *asset,
-		func() string { if assetAtoms < wholeAsset { return fmt.Sprintf(" (PARTIAL of %d)", wholeAsset) }; return "" }())
+		func() string {
+			if assetAtoms < wholeAsset {
+				return fmt.Sprintf(" (PARTIAL of %d)", wholeAsset)
+			}
+			return ""
+		}())
 
 	// 2. Wire bitcoind (BTC leg) + the asset LN node (asset leg). Validate both.
 	btcRPC, err := xliftRPCFromURL(*btcRPCURL)

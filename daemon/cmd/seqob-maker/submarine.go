@@ -77,7 +77,7 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 			MakerClaimPub:          cfg.makerPubKey,
 			MakerRefundPub:         cfg.makerPubKey,
 			OnchainCltv:            cfg.onchainCltv,
-			MakerIssuesHoldInvoice: false, // both v1 modes are plugin-free
+			MakerIssuesHoldInvoice: false,        // both v1 modes are plugin-free
 			Max_0ConfAmount:        cfg.max0conf, // advertise the 0-conf cap so takers can front small amounts
 		}},
 	}

@@ -43,9 +43,17 @@ type TakerReverseParams struct {
 	SeqRefundKey *xchain.Key // refunds our SEQ leg after T_seq if the maker never claims
 
 	ExpectAsset     string // SEQ asset hex we sell (required)
-	ExpectSeqAmount uint64 // atoms we deliver (required; whole-HTLC lift)
-	ExpectBtcAmount uint64 // sats the offer pays (required)
+	ExpectSeqAmount uint64 // atoms the WHOLE signed offer buys (required)
+	ExpectBtcAmount uint64 // sats the WHOLE signed offer pays (required)
 	MaxFeeBtc       uint64 // refuse terms whose fee_btc exceeds this
+
+	// TakeSeqAmount is the slice of the offer to sell (asset atoms). 0 (or >= the
+	// whole) sells into the WHOLE offer, reducing to the classic whole-HTLC lift.
+	// For a partial (0 < TakeSeqAmount < ExpectSeqAmount) the maker pays
+	// ProportionalBtcFloor(ExpectBtcAmount, TakeSeqAmount, ExpectSeqAmount) — floor,
+	// in the maker's favour since the MAKER GIVES the BTC here, bound to the SIGNED
+	// offer's ratio — and we deliver exactly TakeSeqAmount of the asset.
+	TakeSeqAmount uint64
 
 	// Locktime sanity. T_btc is when the MAKER can take its BTC back, so it
 	// must leave us real runway to claim after the secret appears; T_seq is
@@ -78,6 +86,11 @@ type TakerReverseResult struct {
 	Secret       []byte
 	BtcClaimTxid string
 	SeqRefundTx  string
+	// FilledSeq / FilledBtc are the asset atoms sold and BTC sats received for this
+	// lift (== the whole offer for a whole-HTLC lift; a smaller slice + its
+	// proportional BTC for a partial). The caller persists/reports these.
+	FilledSeq uint64
+	FilledBtc uint64
 }
 
 func (p *TakerReverseParams) logf(format string, args ...interface{}) {
@@ -116,11 +129,37 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	}
 	res := &TakerReverseResult{}
 
-	// 1. Request terms, shipping the keys the maker's BTC HTLC must pay.
+	// Partial fills: decide the slice up front — the maker funds its BTC leg FIRST,
+	// so it must learn the slice BEFORE funding (via this request). takeSeq==0 (or
+	// >= the whole) is the classic whole-HTLC lift. The maker pays the PROPORTIONAL
+	// BTC for the slice (floor, in the maker's favour since the maker GIVES the BTC),
+	// which we recompute from OUR verified offer values and require exactly.
+	takeSeq := p.TakeSeqAmount
+	if takeSeq == 0 {
+		takeSeq = p.ExpectSeqAmount
+	}
+	if takeSeq > p.ExpectSeqAmount {
+		return res, fmt.Errorf("%w: take %d exceeds the offer's %d", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
+	}
+	wantBtc := ProportionalBtcFloor(p.ExpectBtcAmount, takeSeq, p.ExpectSeqAmount)
+	if wantBtc == 0 {
+		return res, fmt.Errorf("%w: take %d of %d prices to 0 sats (dust)", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
+	}
+	// Minimum-slice guard (BTC side): the BTC leg we will CLAIM must clear the safe
+	// minimum, else it is sub-dust-after-fee and stranded. Fail CLOSED here, BEFORE
+	// we even request terms or fund the asset leg; a whole take is exempt. (The asset
+	// leg we FUND is guarded once the engine exists, below.)
+	if err := minSafeBtcErr(takeSeq, p.ExpectSeqAmount, wantBtc, p.SpendFeeSats); err != nil {
+		return res, err
+	}
+	res.FilledSeq, res.FilledBtc = takeSeq, wantBtc
+
+	// 1. Request terms, shipping the keys the maker's BTC HTLC must pay + the slice.
 	req := &XcMsg{
 		Type:              XcTermsRequest,
 		TakerSeqRefundPub: hex.EncodeToString(p.SeqRefundKey.PubKey()),
 		TakerBtcClaimPub:  hex.EncodeToString(p.BtcClaimKey.PubKey()),
+		SeqAmount:         takeSeq, // the slice we sell (maker sizes its BTC leg to it)
 	}
 	if err := sendXc(req, p.Crypter, send); err != nil {
 		return res, err
@@ -136,13 +175,17 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if locked.Leg == nil {
 		return res, errors.New("btc_leg_locked without a leg")
 	}
-	if locked.BtcAmount != p.ExpectBtcAmount || locked.Leg.Amount != p.ExpectBtcAmount {
-		sendXcFail(p.Crypter, send, "terms_mismatch", "btc amount differs from the signed offer")
-		return res, fmt.Errorf("%w: btc %d/%d != offer %d", ErrXcBadTerms, locked.BtcAmount, locked.Leg.Amount, p.ExpectBtcAmount)
+	// The maker must pay exactly the proportional BTC (floor) for our slice, in both
+	// the terms field and the funded leg, and size the trade to takeSeq. Binding to
+	// wantBtc/takeSeq (not the whole offer) is what makes the partial fund-safe: we
+	// deliver takeSeq asset only against a BTC leg of exactly the proportional value.
+	if locked.BtcAmount != wantBtc || locked.Leg.Amount != wantBtc {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "btc amount != proportional for the slice")
+		return res, fmt.Errorf("%w: btc %d/%d != proportional %d (take %d of %d)", ErrXcBadTerms, locked.BtcAmount, locked.Leg.Amount, wantBtc, takeSeq, p.ExpectSeqAmount)
 	}
-	if locked.SeqAmount != p.ExpectSeqAmount {
-		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_amount differs from the signed offer")
-		return res, fmt.Errorf("%w: seq_amount %d != offer %d", ErrXcBadTerms, locked.SeqAmount, p.ExpectSeqAmount)
+	if locked.SeqAmount != takeSeq {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_amount differs from the taken slice")
+		return res, fmt.Errorf("%w: seq_amount %d != taken %d", ErrXcBadTerms, locked.SeqAmount, takeSeq)
 	}
 	if locked.FeeBtc > p.MaxFeeBtc {
 		sendXcFail(p.Crypter, send, "terms_mismatch", "fee_btc exceeds the taker bound")
@@ -164,6 +207,14 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	// and BTC claim both embed it).
 	ops, err := p.NewOps(hashH)
 	if err != nil {
+		return res, err
+	}
+	// Minimum-slice guard (asset side): the asset leg we are about to FUND (and would
+	// refund after T_seq) must clear the safe minimum in the asset's own atoms, else
+	// it is sub-dust-after-fee and stranded. Fail CLOSED before LockSEQLeg; a whole
+	// take is exempt.
+	if err := minSafeAssetErr(ops, p.ExpectAsset, takeSeq, p.ExpectSeqAmount, takeSeq, p.SpendFeeSats); err != nil {
+		sendXcFail(p.Crypter, send, "amount_too_small", err.Error())
 		return res, err
 	}
 	btcTip, err := ops.BtcTip()
@@ -219,7 +270,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	// T_seq), persisting the moment it is funded; poll out a slow confirmation
 	// instead of orphaning the leg.
 	seqLeg, seqBlockHash, err := ops.LockSEQLeg(makerSeqClaimPub, p.SeqRefundKey.PubKey(),
-		atomsToCoins(p.ExpectSeqAmount), p.ExpectAsset, tSeq)
+		atomsToCoins(takeSeq), p.ExpectAsset, tSeq)
 	if seqLeg != nil {
 		res.SeqLeg = seqLeg
 		if p.OnSeqLegFunded != nil {
@@ -284,7 +335,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 		}
 		tip, terr := ops.SeqTip()
 		if terr == nil && uint32(tip) >= tSeq {
-			raw, rerr := ops.RefundSEQLeg(seqLeg, p.SeqRefundKey, tSeq, xcSeqLegFee(ops, p.ExpectAsset, p.SpendFeeSats, p.ExpectSeqAmount))
+			raw, rerr := ops.RefundSEQLeg(seqLeg, p.SeqRefundKey, tSeq, xcSeqLegFee(ops, p.ExpectAsset, p.SpendFeeSats, takeSeq))
 			if rerr == nil {
 				if txid, berr := ops.SeqBroadcast(raw); berr == nil {
 					res.SeqRefundTx = txid
@@ -308,7 +359,7 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 			return res, fmt.Errorf("btc claim window closed (tip %d within %d of T_btc %d; secret %x persisted)",
 				tip, p.BtcClaimMargin, tBtc, res.Secret)
 		}
-		txid, cerr := ops.ClaimBTCLeg(verifiedBtc.Leg, p.BtcClaimKey, xcSafeFee(p.SpendFeeSats, p.ExpectBtcAmount))
+		txid, cerr := ops.ClaimBTCLeg(verifiedBtc.Leg, p.BtcClaimKey, xcSafeFee(p.SpendFeeSats, wantBtc))
 		if cerr == nil {
 			res.BtcClaimTxid = txid
 			p.logf("settled: maker claimed our asset, we claimed BTC (%s)", txid)
@@ -397,6 +448,11 @@ type MakerReverseResult struct {
 	SeqClaimTxid string
 	BtcRefundTx  string
 	Settled      bool
+	// FilledSeq / FilledBtc are the asset atoms the maker BUYS and the BTC sats it
+	// PAYS for this lift (== the offer for a whole lift; a smaller slice + its
+	// proportional BTC for a partial). The serve loop re-rests the remainder.
+	FilledSeq uint64
+	FilledBtc uint64
 }
 
 func (p *MakerReverseParams) logf(format string, args ...interface{}) {
@@ -463,6 +519,35 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		return res, errors.New("bad taker_btc_claim_pub")
 	}
 
+	// Partial fills: req.SeqAmount is the slice the taker sells (0 = the whole offer,
+	// back-compat). We PAY the proportional BTC for it (floor, in the maker's favour
+	// since we give the BTC) and BUY exactly that slice. Reject an over-ask, or a
+	// slice that prices to 0 sats, before any coins move — every value-move fails
+	// closed. The serve loop re-rests offer-minus-filled by subtracting the paid sats.
+	takeSeq := req.SeqAmount
+	if takeSeq == 0 {
+		takeSeq = p.SeqAmount
+	}
+	if takeSeq > p.SeqAmount {
+		sendXcFail(p.Crypter, send, "amount_too_large", "requested to sell more asset than the offer buys")
+		return res, fmt.Errorf("maker reverse: take %d > offer %d", takeSeq, p.SeqAmount)
+	}
+	payBtc := ProportionalBtcFloor(p.BtcAmount, takeSeq, p.SeqAmount)
+	if payBtc == 0 {
+		sendXcFail(p.Crypter, send, "amount_too_small", "slice prices to 0 sats (dust)")
+		return res, fmt.Errorf("maker reverse: take %d of %d prices to 0 sats", takeSeq, p.SeqAmount)
+	}
+	// Minimum-slice guard (BTC side): the BTC leg we are about to FUND (and would
+	// refund after T_btc) must clear the safe minimum, else it is sub-dust-after-fee
+	// and stranded. Fail CLOSED here, BEFORE the secret is minted or any coin moves;
+	// a whole take is exempt. (The asset leg we CLAIM is guarded once the engine
+	// exists, below.)
+	if err := minSafeBtcErr(takeSeq, p.SeqAmount, payBtc, p.SpendFeeSats); err != nil {
+		sendXcFail(p.Crypter, send, "amount_too_small", err.Error())
+		return res, err
+	}
+	res.FilledSeq, res.FilledBtc = takeSeq, payBtc
+
 	// 2. Mint the secret + per-lift keys and PERSIST before any coins move.
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -496,10 +581,18 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	if err != nil {
 		return res, err
 	}
+	// Minimum-slice guard (asset side): the taker's asset leg we will CLAIM (delivered
+	// as takeSeq atoms) must clear the safe minimum in the asset's own atoms, else our
+	// claim output is sub-dust and stranded. Fail CLOSED before we fund the BTC leg
+	// below; a whole take is exempt. (The BTC leg was guarded before the secret mint.)
+	if err := minSafeAssetErr(ops, p.AssetHex, takeSeq, p.SeqAmount, takeSeq, p.SpendFeeSats); err != nil {
+		sendXcFail(p.Crypter, send, "amount_too_small", err.Error())
+		return res, err
+	}
 
 	// 3. Fund the BTC leg FIRST (the reverse design: the taker will only fund
 	// the asset against our confirmed leg). Broadcast-only on a live parent.
-	btcLeg, _, err := ops.LockBTCLeg(takerBtcClaimPub, btcRefund.PubKey(), atomsToCoins(p.BtcAmount), res.BtcLocktime)
+	btcLeg, _, err := ops.LockBTCLeg(takerBtcClaimPub, btcRefund.PubKey(), atomsToCoins(payBtc), res.BtcLocktime)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "btc_lock_failed", err.Error())
 		return res, err
@@ -514,8 +607,8 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		MakerSeqClaimPub: hex.EncodeToString(seqClaim.PubKey()),
 		MakerRefundPub:   hex.EncodeToString(btcRefund.PubKey()),
 		SeqLocktime:      res.SeqLocktime,
-		BtcAmount:        p.BtcAmount,
-		SeqAmount:        p.SeqAmount,
+		BtcAmount:        payBtc,
+		SeqAmount:        takeSeq,
 		FeeBtc:           p.FeeBtc,
 		Leg: &XcLeg{
 			Txid:         btcLeg.Funded.TxID,
@@ -530,8 +623,8 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		// asset is coming. The leg is persisted; refund after T_btc.
 		return res, fmt.Errorf("btc_leg_locked announce failed (BTC refundable after T_btc %d): %w", res.BtcLocktime, err)
 	}
-	p.logf("BTC leg funded + announced: %s (%d sats, T_btc=%d T_seq=%d)",
-		btcLeg.Funded.TxID, p.BtcAmount, res.BtcLocktime, res.SeqLocktime)
+	p.logf("BTC leg funded + announced: %s (%d sats, buy %d of %d %s, T_btc=%d T_seq=%d)",
+		btcLeg.Funded.TxID, payBtc, takeSeq, p.SeqAmount, p.AssetHex, res.BtcLocktime, res.SeqLocktime)
 
 	// 4. The taker's asset leg (it waits for OUR confirmation first, so give it
 	// the long budget). A no-show leaves our BTC leg persisted for the T_btc
@@ -543,9 +636,10 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	if funded.Leg == nil {
 		return res, errors.New("seq_leg_funded without a leg")
 	}
-	if funded.Leg.Amount != p.SeqAmount || funded.Leg.Asset != p.AssetHex {
-		sendXcFail(p.Crypter, send, "seq_leg_mismatch", "amount/asset differ from the signed offer")
-		return res, fmt.Errorf("seq leg %d %s != offer %d %s", funded.Leg.Amount, funded.Leg.Asset, p.SeqAmount, p.AssetHex)
+	// The taker must deliver exactly the slice it asked for (takeSeq), of our asset.
+	if funded.Leg.Amount != takeSeq || funded.Leg.Asset != p.AssetHex {
+		sendXcFail(p.Crypter, send, "seq_leg_mismatch", "amount/asset differ from the taken slice")
+		return res, fmt.Errorf("seq leg %d %s != taken %d %s", funded.Leg.Amount, funded.Leg.Asset, takeSeq, p.AssetHex)
 	}
 	if funded.Leg.Locktime != res.SeqLocktime {
 		sendXcFail(p.Crypter, send, "seq_leg_mismatch", "locktime differs from terms")
@@ -619,7 +713,7 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	if uint32(tip)+p.SeqClaimMargin >= res.SeqLocktime {
 		return res, fmt.Errorf("seq tip %d within %d of T_seq %d; not revealing the secret", tip, p.SeqClaimMargin, res.SeqLocktime)
 	}
-	claimTxid, err := ops.ClaimSEQLeg(verifiedSeq.Leg, seqClaim, xcSeqLegFee(ops, p.AssetHex, p.SpendFeeSats, p.SeqAmount))
+	claimTxid, err := ops.ClaimSEQLeg(verifiedSeq.Leg, seqClaim, xcSeqLegFee(ops, p.AssetHex, p.SpendFeeSats, takeSeq))
 	if err != nil {
 		return res, fmt.Errorf("seq claim failed: %w", err)
 	}
@@ -645,19 +739,19 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 // funded it and it is still claimable before T_seq) or refunds the maker's own
 // BTC leg after T_btc. All material comes from the on-disk record.
 type MakerReverseResumeParams struct {
-	Ops          XcOps
-	BtcLeg       *xchain.LegLock // ours; refunded after T_btc if we cannot settle
-	SeqLeg       *xchain.LegLock // the taker's asset leg (nil if never funded/verified)
-	SeqBlockHash string          // the taker leg's confirming block (for the anchor gate)
-	Secret       []byte
-	HashH        []byte
-	SeqClaimKey  *xchain.Key // claims the taker's asset leg (reveals the secret)
-	BtcRefundKey *xchain.Key // refunds our BTC leg after T_btc
-	BtcLocktime  uint32
-	SeqLocktime  uint32
-	AssetHex     string
-	BtcAmount    uint64
-	SeqAmount    uint64
+	Ops            XcOps
+	BtcLeg         *xchain.LegLock // ours; refunded after T_btc if we cannot settle
+	SeqLeg         *xchain.LegLock // the taker's asset leg (nil if never funded/verified)
+	SeqBlockHash   string          // the taker leg's confirming block (for the anchor gate)
+	Secret         []byte
+	HashH          []byte
+	SeqClaimKey    *xchain.Key // claims the taker's asset leg (reveals the secret)
+	BtcRefundKey   *xchain.Key // refunds our BTC leg after T_btc
+	BtcLocktime    uint32
+	SeqLocktime    uint32
+	AssetHex       string
+	BtcAmount      uint64
+	SeqAmount      uint64
 	SeqClaimMargin uint32
 	MinBTCConf     int
 	SpendFeeSats   uint64

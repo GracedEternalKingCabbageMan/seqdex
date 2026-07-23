@@ -277,6 +277,24 @@ func ProportionalBtc(wholeBtc, takeAsset, wholeAsset uint64) uint64 {
 	return q
 }
 
+// ProportionalBtcFloor is the BTC (sats) owed for taking `takeAsset` atoms out of an offer
+// of `wholeAsset` atoms priced at `wholeBtc` sats, rounded DOWN. It is the maker's-favour
+// direction when the MAKER GIVES the BTC (a REVERSE cross BUY: the maker pays BTC to acquire
+// the asset), so a partial fill never makes the maker pay MORE than its offer's exact ratio.
+// The reverse serve loop then re-rests the remainder by SUBTRACTING the exact filled sats
+// (remaining_btc = offer_btc - filled_btc), so a full sweep of partials commits at most the
+// offer's original BTC and never over-commits the maker's capital (the ceil variant, summed
+// over partials, would exceed it). Rounding down can leave the counterparty a sub-atom short,
+// so the caller MUST reject a floor of 0 (dust / free-drain) — every value-move fails closed.
+// Uses the same 128-bit mulDiv64 as ProportionalBtc, so realistic sizes never wrap uint64.
+func ProportionalBtcFloor(wholeBtc, takeAsset, wholeAsset uint64) uint64 {
+	if wholeAsset == 0 || takeAsset >= wholeAsset {
+		return wholeBtc
+	}
+	q, _ := mulDiv64(wholeBtc, takeAsset, wholeAsset)
+	return q
+}
+
 func (p *MakerSubAssetParams) logf(f string, a ...interface{}) {
 	if p.Log != nil {
 		p.Log(f, a...)
