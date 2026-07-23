@@ -208,7 +208,16 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 			go func(sid string, in chan []byte) {
 				settled := false
 				var filledAsset, filledBtc uint64
+				var settleTxid string
 				defer func() {
+					// Record the executed fill FIRST, before the partial-remainder re-rest or the
+					// requote/cancel mutate/remove the still-resting original offer: the relay records
+					// the trade (last_price + chart for the asset/BTC pair) at the original price and
+					// decrements by exactly filledAsset (the base atoms actually taken; a sub-asset lift
+					// may be partial). Maker-signed + offer-keyed, so it lands with the session gone.
+					if settled {
+						reportSettledTrade(ws, o, cfg.makerKey, filledAsset, settleTxid)
+					}
 					// Only the asset-LN leg has channel peers to reconnect (the BTC leg is
 					// on-chain), so reconnect the asset LN node before re-quoting.
 					reconnect := func() {
@@ -294,6 +303,7 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 				}
 				settled = res.Settled
 				filledAsset, filledBtc = res.FilledAsset, res.FilledBtc
+				settleTxid = res.BtcClaimTxid
 				fmt.Printf("session %s: SUB-ASSET SWAP SETTLED: paid %d asset over LN, claimed %d sats BTC on-chain in %s\n",
 					sid, res.FilledAsset, res.FilledBtc, res.BtcClaimTxid)
 			}(sid, in)

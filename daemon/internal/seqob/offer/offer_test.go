@@ -131,6 +131,54 @@ func TestCancelSignVerifyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSettledTradeSignVerifyRoundTrip(t *testing.T) {
+	k := newKey(t)
+	st := &seqobv1.SettledTrade{
+		OfferId:     "00112233445566778899aabbccddeeff",
+		FillBase:    100,
+		SettleTxid:  "deadbeef",
+		AnchorConfs: 1,
+		Nonce:       7,
+	}
+	if err := SignSettledTrade(st, k); err != nil {
+		t.Fatalf("SignSettledTrade: %v", err)
+	}
+	if st.MakerPubkey != hex.EncodeToString(k.PubKey().SerializeCompressed()) {
+		t.Fatalf("maker_pubkey not set from key")
+	}
+	if err := VerifySettledTrade(st); err != nil {
+		t.Fatalf("VerifySettledTrade on freshly-signed record: %v", err)
+	}
+	// Every signed field is authenticated: mutating any one invalidates the signature.
+	for name, mut := range map[string]func(*seqobv1.SettledTrade){
+		"fill_base":    func(s *seqobv1.SettledTrade) { s.FillBase = 99 },
+		"settle_txid":  func(s *seqobv1.SettledTrade) { s.SettleTxid = "cafe" },
+		"anchor_confs": func(s *seqobv1.SettledTrade) { s.AnchorConfs = 2 },
+		"nonce":        func(s *seqobv1.SettledTrade) { s.Nonce = 8 },
+		"offer_id":     func(s *seqobv1.SettledTrade) { s.OfferId = "ffff" },
+	} {
+		c := proto.Clone(st).(*seqobv1.SettledTrade)
+		mut(c)
+		if err := VerifySettledTrade(c); err == nil {
+			t.Fatalf("expected verification failure after mutating %s", name)
+		}
+	}
+}
+
+func TestSettledTradeWrongKeyRejected(t *testing.T) {
+	k := newKey(t)
+	other := newKey(t)
+	st := &seqobv1.SettledTrade{OfferId: "aaaa", FillBase: 10, Nonce: 1}
+	if err := SignSettledTrade(st, k); err != nil {
+		t.Fatalf("SignSettledTrade: %v", err)
+	}
+	// A record claiming a different maker_pubkey than the signer must not verify.
+	st.MakerPubkey = hex.EncodeToString(other.PubKey().SerializeCompressed())
+	if err := VerifySettledTrade(st); err == nil {
+		t.Fatalf("expected verification failure for a mismatched maker_pubkey")
+	}
+}
+
 func TestCanonicalBytesStable(t *testing.T) {
 	o := sampleOffer()
 	b1, err := CanonicalOfferBytes(o)

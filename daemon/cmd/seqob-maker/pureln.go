@@ -270,6 +270,13 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 			go func(sid string, in chan []byte) {
 				settled := false
 				defer func() {
+					// Record the executed fill FIRST, before requote/cancel touch the still-resting
+					// offer: the relay records the trade (so the asset/BTC pure-LN pair gets a
+					// last_price + chart) and decrements/finalizes the order. Both legs are Lightning,
+					// so there is no settling txid; min_anchor_depth is 0, so the fill finalizes at once.
+					if settled {
+						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), "")
+					}
 					// -requote: re-post a fresh quote while still holding the in-flight slot
 					// (racing lifts are refused as "busy" until it is live -> no double-post).
 					// Both legs are Lightning, so reconnect BOTH LN nodes' dropped channel

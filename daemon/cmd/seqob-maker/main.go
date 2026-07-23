@@ -363,8 +363,11 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				// opaque courier, so without this ack the order lingers as a ghost and the trades feed
 				// stays empty (B-1). Best-effort txid from the completed tx; fill_base is the lift's take.
 				txid, _ := maker.HandleComplete(sm.GetCiphertext(), crypters[sid])
+				// anchor_confs = the offer's own min_anchor_depth: the maker declares its finality
+				// bar met at settlement, so a min_anchor_depth>0 offer reaches FILLED (default 0 keeps
+				// the 0-conf-tolerant behavior). Previously the relay hard-coded 0, so >0 never finalized.
 				if we := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SettleAck{SettleAck: &seqobv1.SettleAck{
-					SessionId: sid, SettleTxid: txid, FillBase: takes[sid],
+					SessionId: sid, SettleTxid: txid, FillBase: takes[sid], AnchorConfs: o.GetMinAnchorDepth(),
 				}}}); we != nil {
 					fmt.Printf("session %s: settle-ack write failed: %v; reconnecting\n", sid, we)
 					conn = redial(conn)
@@ -1070,7 +1073,15 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 
 			go func(sid string, in chan []byte, reverse bool) {
 				settled := false
+				var settleTxid string
 				defer func() {
+					// Record the executed fill FIRST, before requote/cancel mutate or remove the
+					// still-resting offer: the relay records the trade (price/size for the BTC/LN
+					// pair's last_price + chart) and decrements/finalizes the order. Maker-signed +
+					// offer-keyed, so it works even though the courier session is gone by now.
+					if settled {
+						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), settleTxid)
+					}
 					// -requote: re-post a fresh quote WHILE still holding the in-flight
 					// slot, so the serve loop refuses any racing lift as "busy" until the
 					// new offer is live (no double-post / oversell). Cross legs are on-chain
@@ -1120,6 +1131,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 						return
 					}
 					settled = true
+					settleTxid = res.SeqClaimTxid
 					fmt.Printf("session %s: REVERSE CROSS SWAP SETTLED: claimed the asset in %s\n", sid, res.SeqClaimTxid)
 					return
 				}
@@ -1141,6 +1153,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 					return
 				}
 				settled = true
+				settleTxid = res.BtcClaimTxid
 				fmt.Printf("session %s: CROSS SWAP SETTLED: taker claimed the asset, BTC claimed in %s\n",
 					sid, res.BtcClaimTxid)
 			}(sid, in, reverse)
@@ -1291,6 +1304,41 @@ func persistXSessionReverse(dir, sid, offerID string, r *client.MakerReverseResu
 	}
 	if err := ioutil.WriteFile(filepath.Join(dir, sid+".json"), b, 0o600); err != nil {
 		fmt.Printf("session %s: persist write: %v\n", sid, err)
+	}
+}
+
+// reportSettledTrade tells the relay a CROSS-CHAIN / LIGHTNING lift SETTLED, so the relay
+// records the trade (feeding last_price / candles / the trades feed for BTC/LN pairs, which
+// otherwise report last_price 0 with an empty chart) and decrements/finalizes the resting
+// order. It is the durable-settlement analogue of the same-chain maker's SettleAck, but it is
+// MAKER-SIGNED and keyed to the offer instead of a live session: a cross/LN swap can finish
+// after the short co-sign session was swept (its on-chain / Lightning leg outlives the courier
+// deadline) or after the maker reconnected (dropping the relay-side session role), so a
+// session-scoped ack is unreachable at settlement time.
+//
+// anchorConfs is the Bitcoin-anchor depth the maker declares final for this fill: reporting the
+// offer's own min_anchor_depth marks the maker's chosen finality bar met (the maker only reaches
+// this settled state after its swap-level confirmation gates hold), so a min_anchor_depth>0 offer
+// reaches FILLED; a later anchor orphan re-opens it (handled separately). Pure-LN offers carry
+// min_anchor_depth 0, so their fills finalize immediately. Best-effort: a send failure is logged.
+func reportSettledTrade(ws *crossWS, o *seqobv1.Offer, key *btcec.PrivateKey, fillBase uint64, settleTxid string) {
+	if fillBase == 0 {
+		return
+	}
+	st := &seqobv1.SettledTrade{
+		OfferId:     o.GetOfferId(),
+		MakerPubkey: o.GetMakerPubkey(),
+		FillBase:    fillBase,
+		SettleTxid:  settleTxid,
+		AnchorConfs: o.GetMinAnchorDepth(),
+		Nonce:       uint64(time.Now().UnixNano()),
+	}
+	if err := offer.SignSettledTrade(st, key); err != nil {
+		fmt.Printf("settled-trade: sign failed: %v (trade NOT recorded)\n", err)
+		return
+	}
+	if err := ws.write(&seqobv1.To{Msg: &seqobv1.To_SettledTrade{SettledTrade: st}}); err != nil {
+		fmt.Printf("settled-trade: relay write failed: %v (trade NOT recorded)\n", err)
 	}
 }
 
