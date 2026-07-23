@@ -79,6 +79,24 @@ func covSell(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, p
 	return o
 }
 
+// covBuy is a BUY like buy(), but settled by an on-chain covenant (its covenant
+// locks the quote asset B and buys base A). Used to build BOTH-covenant crosses so
+// the owner-guard (decision 3) lets them auto-cross (a covenant<->covenant cross is
+// settled by the always-online settler). min_lot 1 so any fill clears the floor.
+func covBuy(t *testing.T, k *btcec.PrivateKey, id string, base, quote uint64, partial bool) *seqobv1.Offer {
+	t.Helper()
+	o := buy(t, k, id, base, quote, partial)
+	o.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid: "covbuy" + id, CovenantVout: 0,
+		AssetA: assetB, AssetB: assetA, RateNum: base, RateDen: quote,
+		MinLot: 1, MakerProgVer: 1, ExpiryLocktime: 400,
+	}}
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
 func mustSubmit(t *testing.T, s *offerstore.Store, o *seqobv1.Offer) {
 	t.Helper()
 	if _, err := s.Submit(o); err != nil {
@@ -86,38 +104,78 @@ func mustSubmit(t *testing.T, s *offerstore.Store, o *seqobv1.Offer) {
 	}
 }
 
-// An INTERACTIVE cross is PLANNED (the Match carries the fill size + price) but commits NO
-// trade-truth: interactive orders settle only via an explicit StartLift + the maker's SettleAck
-// (B-1), never from an auto-cross (whose session id is never registered, so any co-sign fails). So
-// the book stays untouched and no trade is recorded here — recording it was a phantom (B-2).
-func TestCrossInteractivePlansNoSettle(t *testing.T) {
+// An INTERACTIVE <-> INTERACTIVE cross has NO auto-settle owner (it settles only via
+// a TAKER-INITIATED StartLift + the maker's SettleAck), so the owner-guard (decision
+// 3: every match settles) must NOT emit it — an auto-cross would advertise a
+// From.matched whose session is never registered and then drop it, leaving the book
+// crossed bid>=ask. No match, no mutation, no trade.
+func TestInteractiveCrossIsGuardedNoOwner(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
 	// Resting SELL: 100 A for 45 B (ask 0.45).
 	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true))
-	// Incoming BUY: 100 A for 50 B (bid 0.50 >= 0.45) -> crosses (planned).
+	// Incoming BUY: 100 A for 50 B (bid 0.50 >= 0.45) -> would cross, but neither side
+	// is a covenant, so there is no auto-settle owner: guarded (never auto-crossed).
 	in := buy(t, tk, "b1", 100, 50, true)
 	mustSubmit(t, s, in)
 
 	got := m.Cross(in)
-	if len(got) != 1 || got[0].FillBase != 100 {
-		t.Fatalf("want 1 planned match of 100, got %+v", got)
+	if len(got) != 0 {
+		t.Fatalf("interactive<->interactive has no auto-settle owner; want 0 matches, got %+v", got)
 	}
-	// Quote owed = ceil(100 * 45/100) = 45 (maker's ask, not the taker's bid).
-	if got[0].FillQuote != 45 {
-		t.Fatalf("fill quote = %d, want 45", got[0].FillQuote)
-	}
-	// NO optimistic mutation for an interactive cross: both orders remain at full size...
+	// Both orders remain untouched (they rest until a taker explicitly lifts).
 	if activeOf(s, "s1") != 100 {
-		t.Fatalf("interactive resting must NOT be decremented by a cross, got %d", activeOf(s, "s1"))
+		t.Fatalf("resting must NOT be decremented, got %d", activeOf(s, "s1"))
 	}
 	if e, ok := s.Get(offerstore.Key{MakerPubkey: in.GetMakerPubkey(), OfferID: "b1"}); !ok || e.ActiveAmount != 100 {
-		t.Fatalf("interactive incoming must NOT be decremented by a cross")
+		t.Fatalf("incoming must NOT be decremented")
 	}
-	// ...and NO trade is recorded (it never settled).
 	if tr := s.TradesFor(&seqobv1.AssetPair{BaseAsset: assetA, QuoteAsset: assetB}, 0); len(tr) != 0 {
-		t.Fatalf("interactive cross must record no trade, got %d", len(tr))
+		t.Fatalf("guarded cross must record no trade, got %d", len(tr))
+	}
+	_ = mk
+}
+
+// A COVENANT resting order crossed by an INTERACTIVE incoming DOES have an owner:
+// the incoming counterparty settles the permissionless covenant FILL itself from
+// the terms carried on the Match. So the owner-guard emits it (planned, no mutation).
+func TestCovenantVsInteractiveHasOwner(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true)) // resting covenant ask 0.45
+	in := buy(t, tk, "b1", 100, 50, true)                 // interactive incoming
+	mustSubmit(t, s, in)
+
+	got := m.Cross(in)
+	if len(got) != 1 || got[0].FillBase != 100 {
+		t.Fatalf("covenant<->interactive has an owner; want 1 planned match of 100, got %+v", got)
+	}
+	if got[0].RestingCovenant == nil {
+		t.Fatal("covenant terms must be carried so the taker can settle the FILL")
+	}
+	_ = mk
+}
+
+// A COVENANT that is the INCOMING order crossing a resting INTERACTIVE order has NO owner
+// as wired: the Match would set IncomingCovenant, but matchedProto only delivers
+// RestingCovenant, so the covenant terms reach no one and the resting interactive maker
+// would get a phantom From.matched. Only a RESTING covenant is an owner — guard this off.
+func TestIncomingCovenantVsInteractiveRestingNoOwner(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true)) // resting INTERACTIVE ask 0.45
+	in := covBuy(t, tk, "b1", 100, 50, true)           // incoming COVENANT bid 0.50 -> would cross
+	mustSubmit(t, s, in)
+
+	got := m.Cross(in)
+	if len(got) != 0 {
+		t.Fatalf("incoming covenant vs resting interactive has no owner as wired; want 0 matches, got %+v", got)
+	}
+	if activeOf(s, "s1") != 100 {
+		t.Fatalf("resting interactive must NOT be decremented, got %d", activeOf(s, "s1"))
 	}
 	_ = mk
 }
@@ -201,10 +259,12 @@ func TestPriceTimePriority(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	a, b, c, tk := newKey(t), newKey(t), newKey(t), newKey(t)
-	// Three resting SELLs at asks 0.50, 0.45, 0.45 (b older than c).
-	s5 := sell(t, a, "ask50", 100, 50, true)
-	s45old := sell(t, b, "ask45old", 100, 45, true)
-	s45new := sell(t, c, "ask45new", 100, 45, true)
+	// Three resting COVENANT SELLs at asks 0.50, 0.45, 0.45 (b older than c). Covenant
+	// so the owner-guard (decision 3) lets the cross auto-emit — the settler settles a
+	// covenant<->covenant cross; the price-time-priority walk is rail-agnostic.
+	s5 := covSell(t, a, "ask50", 100, 50, true)
+	s45old := covSell(t, b, "ask45old", 100, 45, true)
+	s45new := covSell(t, c, "ask45new", 100, 45, true)
 	s45old.CreatedAtUnix = 1750000000
 	s45new.CreatedAtUnix = 1750000500
 	// Re-sign after touching created_at (it is inside the signed bytes).
@@ -215,9 +275,9 @@ func TestPriceTimePriority(t *testing.T) {
 	mustSubmit(t, s, s45old)
 	mustSubmit(t, s, s45new)
 
-	// Incoming BUY of 150 A bidding 0.50: fills best price first (both 0.45s),
+	// Incoming covenant BUY of 150 A bidding 0.50: fills best price first (both 0.45s),
 	// oldest 0.45 before newer, then the 0.50.
-	in := buy(t, tk, "big", 150, 75, true)
+	in := covBuy(t, tk, "big", 150, 75, true)
 	mustSubmit(t, s, in)
 	got := m.Cross(in)
 	if len(got) != 2 {
@@ -238,9 +298,10 @@ func TestAllOrNothingIncomingNoPartial(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
-	// Only 40 A resting; incoming wants 100 all-or-nothing.
-	mustSubmit(t, s, sell(t, mk, "s1", 40, 18, true))
-	in := buy(t, tk, "b1", 100, 50, false) // allow_partial = false
+	// Only 40 A resting (covenant, so the cross has an owner); incoming covenant BUY
+	// wants 100 all-or-nothing and the book cannot fill it -> execute nothing.
+	mustSubmit(t, s, covSell(t, mk, "s1", 40, 18, true))
+	in := covBuy(t, tk, "b1", 100, 50, false) // allow_partial = false
 	mustSubmit(t, s, in)
 	if got := m.Cross(in); len(got) != 0 {
 		t.Fatalf("all-or-nothing incoming must not partially fill, got %d", len(got))
@@ -391,19 +452,21 @@ func TestSameRailNotCrossRail(t *testing.T) {
 	s := offerstore.New(nil)
 	m := New(s)
 	mk, tk := newKey(t), newKey(t)
-	// Two plain same-chain orders: a same-rail cross, never a bridge job.
-	mustSubmit(t, s, sell(t, mk, "s1", 100, 45, true))
-	in := buy(t, tk, "b1", 100, 50, true)
+	// Two covenant orders (both-covenant): a same-rail cross the settler owns, never a
+	// bridge job. (An interactive<->interactive cross would now be owner-guarded, so we
+	// exercise the CrossRail-negative on a combination that still auto-crosses.)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true))
+	in := covBuy(t, tk, "b1", 100, 50, true)
 	mustSubmit(t, s, in)
 	got := m.Cross(in)
 	if len(got) != 1 {
 		t.Fatalf("want 1 match, got %d", len(got))
 	}
 	if got[0].CrossRail() {
-		t.Fatal("a same-chain/same-chain cross must not be CrossRail")
+		t.Fatal("a covenant/covenant cross must not be CrossRail")
 	}
-	if terms, _ := got[0].BridgeCovenant(); terms != nil || got[0].BridgeLightning() != nil {
-		t.Fatal("same-rail match must expose no bridge sides")
+	if !got[0].BothCovenant() {
+		t.Fatal("a covenant/covenant cross must be BothCovenant")
 	}
 }
 
@@ -453,7 +516,12 @@ func TestConfidentialNeverCrossesTransparent(t *testing.T) {
 		}
 	}
 
-	// Case 3 (sanity): a confidential incoming DOES cross a confidential resting order.
+	// Case 3: a confidential incoming does NOT AUTO-cross a confidential resting order.
+	// A confidential offer must settle on the interactive same-chain co-sign rail (the
+	// covenant rail introspects explicit amounts and is CT-incompatible), so a
+	// confidential<->confidential cross has no auto-settle owner and is owner-guarded
+	// like every interactive<->interactive cross. Confidential orders settle via a
+	// TAKER-INITIATED lift, not the continuous auto-cross.
 	{
 		s := offerstore.New(nil)
 		m := New(s)
@@ -461,9 +529,127 @@ func TestConfidentialNeverCrossesTransparent(t *testing.T) {
 		mustSubmit(t, s, confidential(t, mk, sell(t, mk, "s3", 100, 45, true)))
 		in := confidential(t, tk, buy(t, tk, "b3", 100, 50, true))
 		mustSubmit(t, s, in)
-		if got := m.Cross(in); len(got) != 1 {
-			t.Fatalf("confidential-vs-confidential must cross, got %d matches", len(got))
+		if got := m.Cross(in); len(got) != 0 {
+			t.Fatalf("confidential (interactive) auto-cross is owner-guarded; want 0 matches, got %d", len(got))
 		}
+	}
+}
+
+// tif sets an incoming order's time-in-force and re-signs it (the option is part of
+// the signed canonical bytes).
+func tif(t *testing.T, k *btcec.PrivateKey, o *seqobv1.Offer, v seqobv1.TimeInForce) *seqobv1.Offer {
+	t.Helper()
+	o.TimeInForce = v
+	o.MakerSig = nil
+	if err := offer.SignOffer(o, k); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
+// P2.9: IOC fills what it can now and cancels the remainder (never rests). A covenant
+// BUY of 100 against 40 resting covenant liquidity fills 40, remainder 60 -> the
+// matches route and the disposition tells the caller to retire the remainder.
+func TestCrossOrderIOCFillsThenCancelsRemainder(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 40, 18, true))
+	in := tif(t, tk, covBuy(t, tk, "b1", 100, 50, true), seqobv1.TimeInForce_TIME_IN_FORCE_IOC)
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 1 || res.Matches[0].FillBase != 40 {
+		t.Fatalf("IOC want 1 match of 40, got %+v", res.Matches)
+	}
+	if res.Disposition != DispCancelRemainder {
+		t.Fatalf("IOC disposition = %v, want DispCancelRemainder", res.Disposition)
+	}
+	if res.Filled != 40 || res.Remainder != 60 {
+		t.Fatalf("IOC filled=%d remainder=%d, want 40/60", res.Filled, res.Remainder)
+	}
+}
+
+// P2.9: FOK is all-or-nothing. If the book cannot fill the WHOLE incoming at once,
+// execute NOTHING and reject (unlike a non-partial GTC, which rests). 40 resting vs a
+// 100 FOK -> no matches, DispReject.
+func TestCrossOrderFOKUnfillableRejects(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 40, 18, true))
+	in := tif(t, tk, covBuy(t, tk, "b1", 100, 50, true), seqobv1.TimeInForce_TIME_IN_FORCE_FOK)
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 0 {
+		t.Fatalf("FOK unfillable must emit no match, got %+v", res.Matches)
+	}
+	if res.Disposition != DispReject {
+		t.Fatalf("FOK unfillable disposition = %v, want DispReject", res.Disposition)
+	}
+}
+
+// P2.9: a FOK that CAN fill in full executes fully and rests nothing (remainder 0).
+func TestCrossOrderFOKFillableExecutes(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true))
+	in := tif(t, tk, covBuy(t, tk, "b1", 100, 50, true), seqobv1.TimeInForce_TIME_IN_FORCE_FOK)
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 1 || res.Matches[0].FillBase != 100 {
+		t.Fatalf("FOK fillable want 1 match of 100, got %+v", res.Matches)
+	}
+	if res.Disposition != DispRest || res.Remainder != 0 {
+		t.Fatalf("FOK fillable disposition=%v remainder=%d, want DispRest/0", res.Disposition, res.Remainder)
+	}
+}
+
+// P2.9: POST_ONLY rejects if it would take (cross) anything (rest-only).
+func TestCrossOrderPostOnlyRejectsIfWouldTake(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 45, true)) // ask 0.45
+	// A post-only BUY bidding 0.50 crosses the 0.45 ask -> would take -> reject.
+	in := tif(t, tk, covBuy(t, tk, "b1", 100, 50, true), seqobv1.TimeInForce_TIME_IN_FORCE_POST_ONLY)
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 0 || res.Disposition != DispReject {
+		t.Fatalf("post-only that would take must reject with no matches, got %+v disp=%v", res.Matches, res.Disposition)
+	}
+}
+
+// P2.9: POST_ONLY that would NOT take rests (adds liquidity).
+func TestCrossOrderPostOnlyRestsIfNoTake(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 100, 60, true)) // ask 0.60
+	// A post-only BUY bidding only 0.50 does NOT cross the 0.60 ask -> rests.
+	in := tif(t, tk, covBuy(t, tk, "b1", 100, 50, true), seqobv1.TimeInForce_TIME_IN_FORCE_POST_ONLY)
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 0 || res.Disposition != DispRest {
+		t.Fatalf("post-only with no cross must rest, got %+v disp=%v", res.Matches, res.Disposition)
+	}
+}
+
+// P2.9: GTC (default) is unchanged — cross what you can, rest the remainder. A
+// non-allow_partial GTC that cannot fully fill executes nothing and rests.
+func TestCrossOrderGTCRestsRemainder(t *testing.T) {
+	s := offerstore.New(nil)
+	m := New(s)
+	mk, tk := newKey(t), newKey(t)
+	mustSubmit(t, s, covSell(t, mk, "s1", 40, 18, true))
+	in := covBuy(t, tk, "b1", 100, 50, true) // GTC (unspecified), allow_partial
+	mustSubmit(t, s, in)
+	res := m.CrossOrder(in)
+	if len(res.Matches) != 1 || res.Matches[0].FillBase != 40 || res.Disposition != DispRest {
+		t.Fatalf("GTC want 1 match of 40 then rest, got %+v disp=%v", res.Matches, res.Disposition)
+	}
+	if res.Remainder != 60 {
+		t.Fatalf("GTC remainder=%d, want 60 (rests)", res.Remainder)
 	}
 }
 

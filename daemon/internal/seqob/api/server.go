@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -54,6 +55,12 @@ type Server struct {
 	// makerConns tracks WS connections by registered maker_pubkey so a lift can be
 	// routed to an online maker. Best-effort (Phase-1).
 	makerConns *connRegistry
+
+	// liftMu guards liftActive, the per-offer active-lift-session map (P3.10): one live
+	// lift session per NON-covenant offer, so two takers cannot open concurrent sessions
+	// on the same order (the 2nd would waste a session and race the maker's single coins).
+	liftMu     sync.Mutex
+	liftActive map[offerstore.Key]string // offer key -> live session id
 }
 
 // New builds a Server.
@@ -73,6 +80,7 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 			CheckOrigin:     func(*http.Request) bool { return true },
 		},
 		makerConns: newConnRegistry(),
+		liftActive: make(map[offerstore.Key]string),
 	}
 	// The relay notifies an online maker (via From.lift_requested) whenever a taker
 	// lifts one of its offers, so the maker can derive the E2E key and co-sign.
@@ -135,10 +143,16 @@ func (s *Server) handleOfferSubmit(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusConflict, "submit: "+err.Error())
 		return
 	}
-	// Cross against the resting opposite side to keep the book consistent. The
-	// REST path has no persistent connection to push From.matched to (WS clients
-	// receive it); the returned status reflects the post-cross active amount.
-	s.routeMatches(nil, s.matcher.Cross(&o))
+	// Cross against the resting opposite side under the order's time-in-force to keep
+	// the book consistent. The REST path has no persistent connection to push
+	// From.matched to (WS clients receive it); the returned status reflects the
+	// post-cross disposition (CANCELLED if the order was retired per IOC/FOK/POST_ONLY).
+	res := s.matcher.CrossOrder(&o)
+	s.routeMatches(nil, res.Matches)
+	if s.applyDisposition(&o, res) {
+		writeProto(w, cancelledStatus(&o))
+		return
+	}
 	st, ok := s.store.OrderStatusOf(k)
 	if !ok {
 		st = &seqobv1.OrderStatus{
@@ -329,6 +343,12 @@ func makerPubkeyBytes(hexPub string) []byte {
 
 // openLift validates the referenced offer is live and opens a session.
 func (s *Server) openLift(sl *seqobv1.StartLift) (*session.Session, error) {
+	// POST_ONLY is a rest-only maker option: it is meaningless on a lift (a lift is by
+	// definition a take), so reject it rather than silently ignoring it. IOC/FOK on a
+	// lift are additive/reserved (a single lift already takes a fixed amount).
+	if sl.GetTimeInForce() == seqobv1.TimeInForce_TIME_IN_FORCE_POST_ONLY {
+		return nil, errString("post_only is invalid on a lift (a lift takes liquidity)")
+	}
 	k := offerstore.Key{MakerPubkey: sl.GetMakerPubkey(), OfferID: sl.GetOfferId()}
 	e, ok := s.store.Get(k)
 	if !ok {
@@ -337,12 +357,47 @@ func (s *Server) openLift(sl *seqobv1.StartLift) (*session.Session, error) {
 	if sl.GetTakeAmount() > e.ActiveAmount {
 		return nil, errString("take_amount exceeds active_amount")
 	}
+	// Serialize lifts per offer (P3.10): a NON-covenant offer settles against the
+	// maker's single set of coins, so two concurrent takers racing one order means the
+	// second wastes a session (and could double-request the maker's coins). Allow only
+	// ONE live session per such offer; a second lift is refused until the first ends
+	// (settle/abort/deadline), at which point the taker retries. A dropped participant
+	// re-attaches to the live session instead (P3.8). Covenant offers are EXEMPT: they
+	// are funded on-chain and first-spend-wins enforces a single fill, so concurrent
+	// permissionless takers are safe.
+	isCovenant := e.Offer.GetCovenant() != nil
+	if !isCovenant {
+		// Atomically RESERVE the offer's single lift slot with an in-progress sentinel,
+		// so a concurrent openLift sees it taken even before StartLift returns. The lock
+		// is NOT held across StartLift (which does a WS notify that could block on a slow
+		// maker). A slot whose recorded session is no longer live (settled/aborted) is
+		// treated as free.
+		s.liftMu.Lock()
+		if prev, ok := s.liftActive[k]; ok && prev != "" {
+			_, live := s.sessions.Get(prev)
+			if prev == liftReserving || live {
+				s.liftMu.Unlock()
+				return nil, errString("offer has a lift in progress; retry when it frees")
+			}
+		}
+		s.liftActive[k] = liftReserving
+		s.liftMu.Unlock()
+	}
 	sess, err := s.sessions.StartLift(session.OpenReq{
 		OfferID:            sl.GetOfferId(),
 		MakerPubkey:        sl.GetMakerPubkey(),
 		TakeAmount:         sl.GetTakeAmount(),
 		TakerSessionPubkey: sl.GetTakerSessionPubkey(),
 	})
+	if !isCovenant {
+		s.liftMu.Lock()
+		if err != nil {
+			delete(s.liftActive, k) // release the reservation on failure
+		} else {
+			s.liftActive[k] = sess.ID
+		}
+		s.liftMu.Unlock()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -360,6 +415,10 @@ func (s *Server) openLift(sl *seqobv1.StartLift) (*session.Session, error) {
 func (s *Server) SetCrossSessionDeadline(d time.Duration) { s.crossDeadline = d }
 
 // --- helpers ---
+
+// liftReserving is the in-progress sentinel held in liftActive between reserving an
+// offer's lift slot and StartLift returning its real session id (P3.10).
+const liftReserving = "\x00reserving"
 
 type errString string
 

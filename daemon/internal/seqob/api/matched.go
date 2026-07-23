@@ -6,6 +6,7 @@ import (
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/matcher"
+	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offerstore"
 )
 
 // matchedProto builds the From.matched payload for one recipient role.
@@ -50,4 +51,43 @@ func newSessionID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// applyDisposition retires the just-accepted incoming order per its time-in-force
+// disposition (P2.9). It returns true iff it retired the order (removed it from the
+// book), so the caller reports CANCELLED instead of a resting status.
+//
+//   - DispReject (FOK could not fill in full, or POST_ONLY would have taken): execute
+//     nothing, do not rest — retire the order. A covenant's on-chain coin stays
+//     refundable via its REFUND leaf, so delisting it from the relay is safe.
+//   - DispCancelRemainder (IOC): the routed matches settle; the UNFILLED remainder
+//     must not rest — retire it. EXCEPTION: a COVENANT that PARTIALLY filled is left
+//     in place, because the settler needs its book entry to settle the filled slice
+//     on-chain and the watcher re-rests the on-chain remainder; a funded covenant's
+//     time-in-force is governed by its own on-chain expiry, not a relay retire.
+//   - DispRest: keep resting (returns false).
+func (s *Server) applyDisposition(o *seqobv1.Offer, res matcher.CrossResult) bool {
+	k := offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()}
+	switch res.Disposition {
+	case matcher.DispReject:
+		_ = s.store.RetireIncoming(k, seqobv1.OfferStatus_OFFER_STATUS_CANCELLED)
+		return true
+	case matcher.DispCancelRemainder:
+		if res.Remainder > 0 && (o.GetCovenant() == nil || res.Filled == 0) {
+			_ = s.store.RetireIncoming(k, seqobv1.OfferStatus_OFFER_STATUS_CANCELLED)
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// cancelledStatus is the terminal OrderStatus reported to the submitter when the
+// relay retired its order per its time-in-force (IOC remainder / FOK / POST_ONLY).
+func cancelledStatus(o *seqobv1.Offer) *seqobv1.OrderStatus {
+	return &seqobv1.OrderStatus{
+		OfferId: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey(),
+		Status: seqobv1.OfferStatus_OFFER_STATUS_CANCELLED,
+	}
 }

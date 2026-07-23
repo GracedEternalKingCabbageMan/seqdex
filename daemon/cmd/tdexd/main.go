@@ -53,13 +53,13 @@ var (
 	pricesSlippagePercentage, satsPerByte decimal.Decimal
 
 	// Cross-chain (XchainService) maker; nil unless XCHAIN_PARENT_RPC is set.
-	xchainSvc                                                   *xchainmaker.Service
+	xchainSvc                                                                  *xchainmaker.Service
 	xchainParentRPC, xchainSeqRPC, xchainWallet, xchainSeqAsset, xchainMarkets string
-	xchainParentKind, xchainParentChain                         string
-	xchainPriceSeqPerBtc                                        float64
-	xchainFeeBps, xchainSpendFee                                uint64
-	xchainBtcLocktimeDelta, xchainSeqLocktimeDelta              uint32
-	xchainMinBtcConf                                            int
+	xchainParentKind, xchainParentChain                                        string
+	xchainPriceSeqPerBtc                                                       float64
+	xchainFeeBps, xchainSpendFee                                               uint64
+	xchainBtcLocktimeDelta, xchainSeqLocktimeDelta                             uint32
+	xchainMinBtcConf                                                           int
 
 	version = "dev"
 	commit  = "none"

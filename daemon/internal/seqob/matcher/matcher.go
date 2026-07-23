@@ -41,6 +41,53 @@ func isSubAssetOffer(o *seqobv1.Offer) bool {
 	return ln != nil && offer.IsSubAsset(ln.GetLnDirection())
 }
 
+// hasSettlementOwner reports whether an auto-cross between incoming and resting
+// has a live settlement OWNER — the precondition (decision 3: EVERY MATCH SETTLES)
+// for the continuous matcher to emit the cross. The auto-cross path (offer_submit
+// -> Cross) is fire-and-forget: nothing online co-signs it, so it may emit a Match
+// only for combinations an out-of-band owner settles WITHOUT the two makers being
+// live on the socket:
+//
+//   - at least one side is a COVENANT (the funded, self-enforcing CLOB order).
+//     A covenant fill is permissionless, so the cross is settleable by an owner
+//     that needs neither maker online:
+//   - covenant <-> covenant: the always-online seqob-settler polls the book,
+//     pairs the two funded covenants, and broadcasts the joint FILL. LIVE.
+//   - covenant <-> Lightning (CrossRail): the silent seqob-bridge fills the
+//     covenant and settles the LN leg under one preimage. The bridge is the
+//     DESIGNATED owner; its standalone run-loop is not built in this pass
+//     (cmd/seqob-bridge 'run' is documented-only), so a CrossRail emit is a
+//     match FOR the bridge to pick up, not a self-settling one.
+//   - covenant <-> interactive: the counterparty settles the permissionless
+//     covenant FILL itself from the terms carried on the Match.
+//
+// Every combination with NO covenant side has NO auto-settle owner and must NOT
+// auto-cross (it would advertise a From.matched that is then dropped, leaving the
+// book crossed bid>=ask):
+//   - interactive <-> interactive: settles only via a TAKER-INITIATED lift
+//     (StartLift + the maker's SettleAck). An auto-cross mints an unregistered
+//     session that never settles (phantom). The engine-initiated lift owner
+//     (orderbook-design §4 v2) is not built in this pass.
+//   - pure-LN, submarine, cross-chain, and any interactive/Lightning or
+//     interactive/cross-chain mix: no poller settles them from an auto-cross;
+//     they too are taker-initiated only.
+//
+// This extends the sub-asset never-auto-cross guard to every ownerless
+// combination, so no advisory match ever ships.
+func hasSettlementOwner(incoming, resting *seqobv1.Offer) bool {
+	// The owner must key on the RESTING side being a covenant, because that is the
+	// only covenant the Match delivers: matchedProto carries RestingCovenant, so an
+	// out-of-band owner (the settler for a resting covenant vs another covenant; the
+	// bridge for a resting covenant vs Lightning; the taker's own permissionless FILL
+	// for a resting covenant vs interactive) only ever sees the RESTING covenant's
+	// terms. A covenant that is the INCOMING order crossing a non-covenant resting
+	// order has NO owner as wired (its terms reach no one) — guard it off rather than
+	// ship a phantom From.matched to the resting maker. (Both-covenant is covered here
+	// too, since the resting side is a covenant; the settler polls both regardless.)
+	_ = incoming
+	return resting.GetCovenant() != nil
+}
+
 // Book is the subset of offerstore.Store the matcher needs (so it can be faked
 // in tests). The matcher only READS the book (it commits no trade-truth), so this
 // is read-only — ApplyPartialFill/RecordTrade were removed when the matcher became
@@ -143,24 +190,100 @@ type Matcher struct{ book Book }
 // New returns a Matcher over book.
 func New(book Book) *Matcher { return &Matcher{book: book} }
 
-// Cross matches a freshly-rested incoming order against the resting opposite
-// side and applies the fills to the book. It returns the matches (best-price,
-// oldest-first order) for the caller to route. If nothing crosses, the incoming
-// order simply stays resting and Cross returns nil.
+// Disposition tells the caller what to do with the incoming order's UNFILLED
+// remainder after crossing, per its time-in-force.
+type Disposition int
+
+const (
+	// DispRest keeps the incoming's unfilled remainder RESTING as a maker order
+	// (GTC / Limit; the default). A non-allow_partial GTC order that could not fully
+	// fill also rests (execute-nothing-then-rest, the pre-existing behavior).
+	DispRest Disposition = iota
+	// DispCancelRemainder routes the matches but the unfilled remainder must NOT rest
+	// — the caller removes the incoming from the book (IOC: immediate-or-cancel).
+	DispCancelRemainder
+	// DispReject emits NO matches and removes the incoming entirely: either FOK could
+	// not fill the WHOLE order at once (all-or-nothing failed) or a POST_ONLY order
+	// would have taken (crossed). Nothing executes and nothing rests.
+	DispReject
+)
+
+// CrossResult is the outcome of crossing an incoming order under its time-in-force:
+// the matches to route plus the incoming's disposition.
+type CrossResult struct {
+	Matches     []Match
+	Disposition Disposition
+	Filled      uint64 // incoming base atoms crossed by Matches
+	Remainder   uint64 // incoming base atoms left unfilled by Matches
+}
+
+// Cross matches a freshly-rested incoming order against the resting opposite side
+// under GTC (good-till-cancel) semantics: it returns the matches (best-price,
+// oldest-first) for the caller to route and leaves the unfilled remainder resting.
+// It honors a non-allow_partial incoming as all-or-nothing-then-REST. It is the
+// pure planning primitive; CrossOrder wraps it with the IOC/FOK/POST_ONLY options.
 func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
+	matches, remainder := m.walk(incoming)
+	// All-or-nothing GTC incoming: if it disallows partials and the crossing liquidity
+	// cannot fill it completely, execute nothing (leave it resting).
+	if !incoming.GetAllowPartial() && remainder != 0 {
+		return nil
+	}
+	return matches
+}
+
+// CrossOrder crosses the incoming order under its TimeInForce, returning the
+// matches to route and the incoming's disposition (rest / cancel-remainder /
+// reject). GTC (the default) preserves Cross's behavior. IOC fills-then-cancels the
+// remainder; FOK is all-or-nothing-then-cancel; POST_ONLY rejects if it would take.
+func (m *Matcher) CrossOrder(incoming *seqobv1.Offer) CrossResult {
+	matches, remainder := m.walk(incoming)
+	var filled uint64
+	for _, mt := range matches {
+		filled += mt.FillBase
+	}
+	switch incoming.GetTimeInForce() {
+	case seqobv1.TimeInForce_TIME_IN_FORCE_POST_ONLY:
+		// Rest-only: any cross means it would take -> reject (execute nothing, don't rest).
+		if len(matches) > 0 {
+			return CrossResult{Disposition: DispReject, Remainder: filled + remainder}
+		}
+		return CrossResult{Disposition: DispRest, Remainder: remainder}
+	case seqobv1.TimeInForce_TIME_IN_FORCE_FOK:
+		// All-or-nothing-then-cancel: if the whole incoming can't fill at once, reject.
+		if remainder != 0 {
+			return CrossResult{Disposition: DispReject, Remainder: filled + remainder}
+		}
+		return CrossResult{Matches: matches, Disposition: DispRest, Filled: filled} // fully filled: nothing to rest
+	case seqobv1.TimeInForce_TIME_IN_FORCE_IOC:
+		// Fill now, cancel the remainder (never rest it).
+		return CrossResult{Matches: matches, Disposition: DispCancelRemainder, Filled: filled, Remainder: remainder}
+	default: // GTC / unspecified
+		if !incoming.GetAllowPartial() && remainder != 0 {
+			return CrossResult{Disposition: DispRest, Remainder: filled + remainder} // execute nothing, leave resting
+		}
+		return CrossResult{Matches: matches, Disposition: DispRest, Filled: filled, Remainder: remainder}
+	}
+}
+
+// walk is the pure price-time-priority book walk: it plans the crossing of the
+// incoming order against the resting opposite side and returns the matches (best-
+// price, oldest-first) and the incoming's UNFILLED remainder. It applies no
+// time-in-force policy (Cross / CrossOrder do) and commits no trade-truth.
+func (m *Matcher) walk(incoming *seqobv1.Offer) ([]Match, uint64) {
 	inKey := offerstore.Key{MakerPubkey: incoming.GetMakerPubkey(), OfferID: incoming.GetOfferId()}
 	inEntry, ok := m.book.Get(inKey)
 	if !ok {
-		return nil
+		return nil, 0
 	}
 	incomingRemaining := inEntry.ActiveAmount
 	if incomingRemaining == 0 {
-		return nil
+		return nil, 0
 	}
 
 	rest := m.candidates(incoming)
 	if len(rest) == 0 {
-		return nil
+		return nil, incomingRemaining
 	}
 
 	// Plan (pure) so we can honor an all-or-nothing incoming before mutating.
@@ -229,13 +352,8 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 		rem -= fillBase
 	}
 
-	// All-or-nothing incoming: if it disallows partials and the crossing
-	// liquidity cannot fill it completely, execute nothing (leave it resting).
-	if !incoming.GetAllowPartial() && rem != 0 {
-		return nil
-	}
 	if len(plan) == 0 {
-		return nil
+		return nil, rem
 	}
 
 	out := make([]Match, 0, len(plan))
@@ -283,7 +401,7 @@ func (m *Matcher) Cross(incoming *seqobv1.Offer) []Match {
 		}
 		out = append(out, mt)
 	}
-	return out
+	return out, rem
 }
 
 // candidates returns the resting opposite-side orders of incoming's pair that
@@ -325,6 +443,15 @@ func (m *Matcher) candidates(incoming *seqobv1.Offer) []offerstore.Entry {
 		// path for them, so they must never auto-cross. This keeps a sub-asset BUY
 		// (ln 4) and SELL (ln 5) coexisting on the asset/BTC pair without crossing.
 		if isSubAssetOffer(incoming) || isSubAssetOffer(e.Offer) {
+			continue
+		}
+		// Settlement-owner precondition (decision 3: every match settles). Auto-cross
+		// ONLY a combination a live out-of-band owner can settle (>= 1 covenant side:
+		// the settler for covenant<->covenant, the bridge for covenant<->Lightning,
+		// the taker's own permissionless FILL for covenant<->interactive). Guard every
+		// ownerless combination (interactive/pure-LN/submarine/cross-chain with no
+		// covenant side) so no advisory match ever ships — those settle taker-initiated.
+		if !hasSettlementOwner(incoming, e.Offer) {
 			continue
 		}
 		if !crosses(incoming, e.Offer) {

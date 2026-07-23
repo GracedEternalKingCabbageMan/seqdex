@@ -78,8 +78,8 @@ type Settlement struct {
 	// On-chain FILL leg (the covenant the bridge fills). Fill.RequiredB == PayY and
 	// Fill.Filled == RecvX; the witness [FillLeaf, ControlBlock] is introspection-
 	// only (no bridge signature authorises the maker payout — consensus does).
-	Fill *covenant.FillPlan
-	PayY uint64 // asset-Y atoms paid to the on-chain maker (its own ceil price)
+	Fill  *covenant.FillPlan
+	PayY  uint64 // asset-Y atoms paid to the on-chain maker (its own ceil price)
 	RecvX uint64 // asset-X atoms the bridge receives on-chain from the FILL
 
 	// Lightning leg (settled via the submarine/pure-LN orchestrator, one preimage).
