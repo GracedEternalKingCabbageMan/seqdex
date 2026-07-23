@@ -167,8 +167,8 @@ func main() {
 			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet, lnSocket: *lnSocket,
 			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
 			spendFee: *spendFee, max0conf: *max0conf,
-			reverse:  strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
-			requote:  *requote,
+			reverse: strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
+			requote: *requote,
 		})
 		return
 	}
@@ -457,7 +457,7 @@ func buildOffer(base, quote, side string, baseAmt, quoteAmt uint64, feeAsset str
 // load-bearing HTLC keys and CLTVs are minted per-lift over the E2E courier (Phase 2).
 // A SELL gives the asset for BTC (taker pays BTC; direction BTC_TO_ASSET); a BUY gives
 // BTC for the asset (taker sells the asset; direction ASSET_TO_BTC).
-func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset string,
+func buildCrossOffer(asset, side string, assetAmt, btcAmt, spendFee uint64, feeAsset string,
 	expiry time.Duration, minAnchor uint32, recvAddr, makerPubHex, id string) *seqobv1.Offer {
 	isSell := strings.ToLower(side) == "sell"
 	direction := offer.DirAssetToBTC
@@ -465,11 +465,16 @@ func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset strin
 		direction = offer.DirBTCToAsset
 	}
 	o := &seqobv1.Offer{
-		OfferId:        orDefault(id, randstr.Hex(16)),
-		SchemaVersion:  1,
-		Pair:           &seqobv1.AssetPair{BaseAsset: asset, QuoteAsset: offer.BTCSentinel},
-		BaseAmount:     assetAmt,
-		AllowPartial:   false, // cross-chain lifts are whole-HTLC; no partial fills (Phase 1)
+		OfferId:       orDefault(id, randstr.Hex(16)),
+		SchemaVersion: 1,
+		Pair:          &seqobv1.AssetPair{BaseAsset: asset, QuoteAsset: offer.BTCSentinel},
+		BaseAmount:    assetAmt,
+		AllowPartial:  true, // a taker may take a slice; the serve loop re-rests the remainder
+		// min_fill = the smallest base slice whose BTC leg still clears the dust+fee
+		// floor, so the book never advertises a partial that would strand a sub-dust
+		// HTLC leg. Clamped to <= base_amount (validator requires it); when even the
+		// whole offer barely clears the floor it equals base_amount (whole take only).
+		MinFill:        client.MinFillBase(btcAmt, assetAmt, spendFee),
 		CreatedAtUnix:  uint64(time.Now().Unix()),
 		ExpiresAtUnix:  uint64(time.Now().Add(expiry).Unix()),
 		FeeAssetHint:   feeAsset,
@@ -493,6 +498,26 @@ func buildCrossOffer(asset, side string, assetAmt, btcAmt uint64, feeAsset strin
 		o.WantAsset, o.WantAmount = asset, assetAmt
 	}
 	return o
+}
+
+// crossReRestRemainder decides how a settled cross fill re-rests, enforcing the
+// minimum-slice floor on the REMAINDER (the covenant CLOB's 'remainder == 0 OR
+// remainder >= min_fill'). Given the offer's base_amount, the base atoms actually
+// filled, and the offer's min_fill, it returns the remainder to re-rest and
+// whether to re-rest at all. reRest is false for a whole fill (nothing left) OR a
+// fill that would leave a sub-min_fill dust remainder — in both cases the caller
+// drops to a full fill (retire / -requote) rather than re-resting an order whose
+// only fills would strand sub-dust HTLC legs. A min_fill of 0 (unset) imposes no
+// remainder floor: any non-empty remainder re-rests.
+func crossReRestRemainder(base, filledSeq, minFill uint64) (remainder uint64, reRest bool) {
+	if filledSeq == 0 || filledSeq >= base {
+		return 0, false // whole fill (or nonsensical over-fill): nothing to re-rest
+	}
+	remainder = base - filledSeq
+	if minFill > 0 && remainder < minFill {
+		return remainder, false // sub-min_fill dust remainder: drop to a full fill
+	}
+	return remainder, true
 }
 
 // resumeCrossSessions finishes every non-terminal cross session persisted in
@@ -887,7 +912,7 @@ func runCrossMaker(cfg crossMakerConfig) {
 		fatal("getnewaddress on the Sequentia wallet: %v", err)
 	}
 
-	o := buildCrossOffer(cfg.asset, cfg.side, cfg.assetAmt, cfg.btcAmt, cfg.feeAsset,
+	o := buildCrossOffer(cfg.asset, cfg.side, cfg.assetAmt, cfg.btcAmt, cfg.spendFee, cfg.feeAsset,
 		cfg.expiry, cfg.minAnchor, recvAddr, cfg.makerPubHex, cfg.offerID)
 	if err := offer.SignOffer(o, cfg.makerKey); err != nil {
 		fatal("sign offer: %v", err)
@@ -1055,11 +1080,12 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				refuse(sid, cr, "busy", "another lift is in flight (whole-HTLC, one at a time)")
 				continue
 			}
-			if lr.GetTakeAmount() != o.GetBaseAmount() {
-				fmt.Printf("lift %s: take %d != offer %d (whole-HTLC only); terms will quote the full size\n",
+			if lr.GetTakeAmount() > o.GetBaseAmount() {
+				fmt.Printf("lift %s: take %d > offer %d; the driver will reject the over-ask\n",
 					sid, lr.GetTakeAmount(), o.GetBaseAmount())
 			}
-			fmt.Printf("cross lift requested: session %s offer %s\n", sid, lr.GetOfferId())
+			fmt.Printf("cross lift requested: session %s offer %s (take %d of %d)\n",
+				sid, lr.GetOfferId(), lr.GetTakeAmount(), o.GetBaseAmount())
 
 			send := func(sealed []byte) error {
 				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
@@ -1074,37 +1100,89 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			go func(sid string, in chan []byte, reverse bool) {
 				settled := false
 				var settleTxid string
+				var filledSeq, filledBtc uint64
 				defer func() {
-					// Record the executed fill FIRST, before requote/cancel mutate or remove the
-					// still-resting offer: the relay records the trade (price/size for the BTC/LN
-					// pair's last_price + chart) and decrements/finalizes the order. Maker-signed +
-					// offer-keyed, so it works even though the courier session is gone by now.
+					// Record the executed fill FIRST, before the partial-remainder re-rest or the
+					// requote/cancel mutate/remove the still-resting offer: the relay records the
+					// trade (price/size for the BTC pair's last_price + chart) at the ORIGINAL price
+					// and decrements by exactly filledSeq (the base atoms actually taken; a cross lift
+					// may be partial). Maker-signed + offer-keyed, so it lands with the session gone.
 					if settled {
-						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), settleTxid)
+						reportSettledTrade(ws, o, cfg.makerKey, filledSeq, settleTxid)
 					}
-					// -requote: re-post a fresh quote WHILE still holding the in-flight
-					// slot, so the serve loop refuses any racing lift as "busy" until the
-					// new offer is live (no double-post / oversell). Cross legs are on-chain
-					// (no LN channel peers), so the pre-quote "reconnect" is a reachability
-					// ping of both backends.
-					if settled && cfg.requote {
-						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
-							if _, err := btcChain.BlockCount(); err != nil {
-								fmt.Printf("requote: bitcoind unreachable before re-quote: %v\n", err)
-							}
-							if _, err := seqChain.BlockCount(); err != nil {
-								fmt.Printf("requote: sequentia node unreachable before re-quote: %v\n", err)
-							}
-						})
+					// Cross legs are on-chain (no LN channel peers), so the pre-quote "reconnect" is a
+					// reachability ping of both backends.
+					reconnect := func() {
+						if _, err := btcChain.BlockCount(); err != nil {
+							fmt.Printf("requote: bitcoind unreachable before re-quote: %v\n", err)
+						}
+						if _, err := seqChain.BlockCount(); err != nil {
+							fmt.Printf("requote: sequentia node unreachable before re-quote: %v\n", err)
+						}
+					}
+					// Partial fill: the taker took only a slice, so reduce the offer to the remainder
+					// and re-quote (there is more to trade, regardless of -requote); requoteAfterFill
+					// re-signs + re-posts the shrunk offer. A whole fill keeps the old behaviour
+					// (-requote re-posts the whole; otherwise the offer is retired). The remainder is
+					// priced so the maker NEVER over-commits its offer's capital across a full sweep:
+					//   - forward (SELL, maker receives BTC): re-quote WantAmount at the offer's own
+					//     rate (ProportionalBtc, ceil) — the maker asks >= its rate on the remainder,
+					//     total received >= the offer, capped by the asset it actually gives.
+					//   - reverse (BUY, maker gives BTC): SUBTRACT the exact filled sats, so the sum of
+					//     partials commits at most the offer's original BTC (a proportional re-quote
+					//     would round each partial up and over-commit).
+					// Minimum-slice floor on the REMAINDER: mirror the covenant CLOB's
+					// 'remainder == 0 OR remainder >= min_fill'. crossReRestRemainder returns
+					// reRest=false for a whole fill OR a fill that would leave a sub-min_fill dust
+					// remainder — re-resting such a remainder would advertise an order only sub-dust
+					// partials could fill, so drop to a full fill (retire / -requote) instead.
+					remainAsset, canReRest := crossReRestRemainder(o.GetBaseAmount(), filledSeq, o.GetMinFill())
+					partial := settled && canReRest
+					if partial && reverse && filledBtc >= o.GetOfferAmount() {
+						// Defensive: a partial that somehow consumed the whole BTC budget leaves no
+						// capital to re-rest; treat it as a full fill (retire/-requote) rather than
+						// re-posting a 0-BTC offer.
+						partial = false
+					}
+					if partial {
+						mu.Lock()
+						if reverse {
+							// BUY offer: OfferAmount=BTC (given), WantAmount=asset (wanted), Base=asset.
+							o.OfferAmount = o.GetOfferAmount() - filledBtc
+							o.BaseAmount = remainAsset
+							o.WantAmount = remainAsset
+							// Re-derive min_fill for the shrunk BUY offer (price is ~unchanged, so this
+							// stays consistent and never exceeds the new base_amount).
+							o.MinFill = client.MinFillBase(o.GetOfferAmount(), remainAsset, cfg.spendFee)
+						} else {
+							// SELL offer: OfferAmount=asset (given), WantAmount=BTC (wanted), Base=asset.
+							// Price the remainder at the offer's OWN rate (ceil), not by subtracting the
+							// rounded filledBtc — that subtraction drifts and can zero the want on a
+							// low-priced offer. ProportionalBtc rounds up, so remainAsset>0 => want>=1.
+							o.WantAmount = client.ProportionalBtc(o.GetWantAmount(), remainAsset, o.GetBaseAmount())
+							o.BaseAmount = remainAsset
+							o.OfferAmount = remainAsset
+							// Re-derive min_fill for the shrunk SELL offer against its new BTC want.
+							o.MinFill = client.MinFillBase(o.GetWantAmount(), remainAsset, cfg.spendFee)
+						}
+						mu.Unlock()
+						fmt.Printf("session %s: PARTIAL fill (%d %s, %d sats); re-resting the remainder %d %s (offer %d, want %d)\n",
+							sid, filledSeq, o.GetPair().GetBaseAsset(), filledBtc, remainAsset,
+							o.GetPair().GetBaseAsset(), o.GetOfferAmount(), o.GetWantAmount())
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
+					} else if settled && cfg.requote {
+						// -requote: re-post a fresh quote WHILE still holding the in-flight slot, so the
+						// serve loop refuses any racing lift as "busy" until the new offer is live.
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
 					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						filled = true
 					}
 					mu.Unlock()
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 					requoteExitIfPending(idle)
@@ -1132,7 +1210,9 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 					}
 					settled = true
 					settleTxid = res.SeqClaimTxid
-					fmt.Printf("session %s: REVERSE CROSS SWAP SETTLED: claimed the asset in %s\n", sid, res.SeqClaimTxid)
+					filledSeq, filledBtc = res.FilledSeq, res.FilledBtc
+					fmt.Printf("session %s: REVERSE CROSS SWAP SETTLED: bought %d %s for %d sats, claimed the asset in %s\n",
+						sid, res.FilledSeq, o.GetPair().GetBaseAsset(), res.FilledBtc, res.SeqClaimTxid)
 					return
 				}
 				// SELL (forward): the taker pays BTC and holds the secret.
@@ -1154,8 +1234,9 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				}
 				settled = true
 				settleTxid = res.BtcClaimTxid
-				fmt.Printf("session %s: CROSS SWAP SETTLED: taker claimed the asset, BTC claimed in %s\n",
-					sid, res.BtcClaimTxid)
+				filledSeq, filledBtc = res.FilledSeq, res.FilledBtc
+				fmt.Printf("session %s: CROSS SWAP SETTLED: sold %d %s for %d sats, taker claimed the asset, BTC claimed in %s\n",
+					sid, res.FilledSeq, o.GetPair().GetBaseAsset(), res.FilledBtc, res.BtcClaimTxid)
 			}(sid, in, reverse)
 
 		case from.GetSwapMsg() != nil:

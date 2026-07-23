@@ -82,6 +82,7 @@ func cmdXLift(args []string) {
 	seqRPCURL := fs.String("seq-rpc", "", "Sequentia node RPC URL http://user:pass@host:port (required)")
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations on our BTC leg before announcing it")
+	takeAmount := fs.Uint64("amount", 0, "PARTIAL FILL: asset atoms to buy (<= the offer). 0 = the whole offer. The BTC you lock is the proportional price (ceil, in the maker's favour); the maker re-rests the remainder.")
 	spendFee := fs.Uint64("spend-fee", 1000, "HTLC spend fee target in native sats (converted per-asset)")
 	btcFeeRate := fs.Float64("btc-fee-rate", 2, "sat/vB fee rate for funding the BTC HTLC leg (explicit; 0 = node default)")
 	maxFeeBtc := fs.Uint64("max-fee-btc", 0, "max maker fee_btc (sats) we accept")
@@ -122,10 +123,29 @@ func cmdXLift(args []string) {
 		fatal("no verified forward cross offer found for %s/BTC (use `seqob-cli book -base %s -quote BTC`)", *asset, *asset)
 	}
 	expectAsset := target.GetPair().GetBaseAsset()
-	expectSeq := target.GetOfferAmount()
-	expectBtc := target.GetWantAmount()
-	fmt.Printf("lifting cross offer %s by %s: %d %s for %d sats\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectBtc)
+	wholeSeq := target.GetOfferAmount() // the whole offer (asset atoms it sells)
+	wholeBtc := target.GetWantAmount()  // the whole offer (BTC sats it wants)
+	// Partial fill: buy a slice and lock the PROPORTIONAL BTC (ceil, so we never
+	// underpay the maker; the maker requires the same and re-rests the remainder).
+	takeSeq := wholeSeq
+	if *takeAmount > 0 && *takeAmount < wholeSeq {
+		takeSeq = *takeAmount
+	} else if *takeAmount > wholeSeq {
+		fatal("-amount %d exceeds the offer's %d %s", *takeAmount, wholeSeq, expectAsset)
+	}
+	fundBtc := client.ProportionalBtc(wholeBtc, takeSeq, wholeSeq)
+	// Minimum-slice guard: a partial that prices to a sub-dust BTC leg (or is below
+	// the offer's advertised min_fill) would strand an unclaimable HTLC leg. Reject
+	// it here, before any coins move; the driver re-checks defensively.
+	if err := guardPartialBtcLeg(takeSeq, wholeSeq, fundBtc, target.GetMinFill(), *spendFee); err != nil {
+		fatal("%v", err)
+	}
+	// The amounts THIS lift settles: the slice of asset, and its proportional BTC.
+	expectSeq := takeSeq
+	expectBtc := fundBtc
+	fmt.Printf("lifting cross offer %s by %s: %d %s for %d sats%s\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectBtc,
+		partialNote(takeSeq, wholeSeq))
 
 	// 2. Settlement chains.
 	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
@@ -191,7 +211,7 @@ func cmdXLift(args []string) {
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId:            target.GetOfferId(),
 		MakerPubkey:        target.GetMakerPubkey(),
-		TakeAmount:         target.GetBaseAmount(), // whole-HTLC lift
+		TakeAmount:         takeSeq, // the slice we're buying (== base_amount for a whole lift)
 		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
 	}}})
 	la := readWS(conn)
@@ -249,8 +269,9 @@ func cmdXLift(args []string) {
 		BtcRefundKey:    btcRefundKey,
 		SeqClaimKey:     seqClaimKey,
 		ExpectAsset:     expectAsset,
-		ExpectSeqAmount: expectSeq,
-		ExpectBtcAmount: expectBtc,
+		ExpectSeqAmount: wholeSeq, // the WHOLE signed offer; the driver checks terms against it
+		ExpectBtcAmount: wholeBtc,
+		TakeSeqAmount:   takeSeq, // the slice; the driver sizes the BTC leg to its proportional price
 		MaxFeeBtc:       *maxFeeBtc,
 		MinBTCConf:      *minBTCConf,
 		SpendFeeSats:    *spendFee,

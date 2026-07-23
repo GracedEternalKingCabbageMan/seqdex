@@ -305,8 +305,8 @@ func TestSubAssetPartialFill(t *testing.T) {
 
 	const offerAsset = uint64(100_000) // the WHOLE offer
 	const offerBtc = uint64(200_000)
-	const takeAsset = uint64(50_000)  // take half
-	const takeBtc = uint64(100_000)   // proportionalBtc(200_000, 50_000, 100_000)
+	const takeAsset = uint64(50_000) // take half
+	const takeBtc = uint64(100_000)  // proportionalBtc(200_000, 50_000, 100_000)
 	const tBtc = uint32(200)
 
 	if got := ProportionalBtc(offerBtc, takeAsset, offerAsset); got != takeBtc {
@@ -323,7 +323,7 @@ func TestSubAssetPartialFill(t *testing.T) {
 			NewMakerOps:   func(hashH []byte) SubAssetMakerOps { return &fakeSubAsMakerOps{st: st} },
 			AssetLNNodeID: "02fakenode",
 			Crypter:       mc,
-			BtcAmount:     offerBtc,   // the maker advertises the WHOLE offer
+			BtcAmount:     offerBtc, // the maker advertises the WHOLE offer
 			AssetAmount:   offerAsset,
 			BtcLocktime:   tBtc,
 			MinBTCConf:    1,
@@ -335,7 +335,7 @@ func TestSubAssetPartialFill(t *testing.T) {
 	takerRes, takerErr := RunTakerSubAsset(TakerSubAssetParams{
 		Ops:         &fakeSubAsTakerOps{st: st},
 		Crypter:     tc,
-		BtcAmount:   takeBtc,   // the taker locks the PROPORTIONAL BTC for its slice
+		BtcAmount:   takeBtc, // the taker locks the PROPORTIONAL BTC for its slice
 		AssetAmount: takeAsset,
 		MinBTCConf:  1,
 		Timing:      XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
@@ -394,7 +394,7 @@ func TestSubAssetPartialRejectsWrongBtc(t *testing.T) {
 	// the proportional price it must pay). We assert the taker aborts before any BTC lock.
 	_, takerErr := RunTakerSubAsset(TakerSubAssetParams{
 		Ops: &fakeSubAsTakerOps{st: st}, Crypter: tc,
-		BtcAmount: uint64(50_000), // WRONG: proportional would be 100_000
+		BtcAmount:   uint64(50_000), // WRONG: proportional would be 100_000
 		AssetAmount: takeAsset, MinBTCConf: 1,
 		Timing: XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
 	}, net.takerSend, net.takerRecv)
@@ -419,8 +419,8 @@ func TestProportionalBtcNoOverflow(t *testing.T) {
 		{1_000_000, 1_500_000_000_000_000, 2_100_000_000_000_000, 714286},        // ceil(1e6*1.5e15/2.1e15); bare multiply overflows
 		{100_000_000, 2_100_000_000_000_000, 2_100_000_000_000_000, 100_000_000}, // whole take -> early return
 		{100_000_000, 1_050_000_000_000_000, 2_100_000_000_000_000, 50_000_000},  // exactly half
-		{1, 1, 100, 1},                                                           // ceil(1/100)=1, never 0 for a positive take
-		{200_000, 50_000, 100_000, 100_000},                                      // the handshake test's partial
+		{1, 1, 100, 1},                      // ceil(1/100)=1, never 0 for a positive take
+		{200_000, 50_000, 100_000, 100_000}, // the handshake test's partial
 	} {
 		if got := ProportionalBtc(c.wholeBtc, c.take, c.whole); got != c.want {
 			t.Errorf("ProportionalBtc(%d,%d,%d) = %d, want %d (overflow?)", c.wholeBtc, c.take, c.whole, got, c.want)

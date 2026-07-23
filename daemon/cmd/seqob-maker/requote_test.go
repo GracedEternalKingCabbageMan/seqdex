@@ -26,7 +26,7 @@ func TestRefreshOfferForRequote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := buildCrossOffer("gold", "sell", 100, 45, "", time.Hour, 0, "seqaddr", pubHex(key), "stable-offer-id")
+	o := buildCrossOffer("gold", "sell", 100, 45, 1000, "", time.Hour, 0, "seqaddr", pubHex(key), "stable-offer-id")
 	if err := offer.SignOffer(o, key); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestPostCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := buildCrossOffer("gold", "sell", 100, 45, "", time.Hour, 0, "seqaddr", pubHex(key), "oid")
+	o := buildCrossOffer("gold", "sell", 100, 45, 1000, "", time.Hour, 0, "seqaddr", pubHex(key), "oid")
 	if err := offer.SignOffer(o, key); err != nil {
 		t.Fatal(err)
 	}

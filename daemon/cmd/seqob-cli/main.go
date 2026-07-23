@@ -464,6 +464,15 @@ func short(s string) string {
 	return s[:6] + ".." + s[len(s)-6:]
 }
 
+// partialNote annotates a cross lift log line when the taker takes a slice of a
+// larger resting offer (a partial fill), and is empty for a whole-offer lift.
+func partialNote(take, whole uint64) string {
+	if take < whole {
+		return fmt.Sprintf(" (PARTIAL of %d)", whole)
+	}
+	return ""
+}
+
 func shortDir(d seqobv1.TradeDir) string {
 	switch d {
 	case seqobv1.TradeDir_TRADE_DIR_SELL:
