@@ -131,9 +131,16 @@ func runSubmarineMaker(cfg submarineMakerConfig) {
 		fatal("dial ws %s: %v", wsURL, err)
 	}
 	if cfg.reverse {
+		// The reverse-submarine T_seq is COUPLED to the invoice min_final_cltv (not cfg.seqDelta,
+		// which sizes the cross W1/W2 leg); RunMakerReverseSubmarine raises a short delta to the
+		// coupled minimum. Print the effective coupled values so the operator sees what takers gate on.
+		effDelta := cfg.seqDelta
+		if effDelta < client.SubReverseSeqLocktimeDelta {
+			effDelta = client.SubReverseSeqLocktimeDelta
+		}
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
-			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.seqDelta, cfg.subAnchor, cfg.max0conf, lnID)
+		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-final-cltv=%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, effDelta, client.SubReverseInvoiceCLTV, cfg.subAnchor, cfg.max0conf, lnID)
 		fmt.Printf("  taker lifts with: seqob-cli xsubbuy -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
 	} else {
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
@@ -264,12 +271,17 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 							sub := xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(cfg.lnSocket), xchain.NewHashLock(secret))
 							return &client.LiveSubReverseMakerOps{Sub: sub}
 						},
-						Crypter:          cr,
-						SeqTip:           seqChain.BlockCount,
-						AssetHex:         o.GetPair().GetBaseAsset(),
-						SeqAmount:        o.GetOfferAmount(),       // the asset the maker sells
-						InvoiceMsat:      o.GetWantAmount() * 1000, // BTC sats wanted -> msat
+						Crypter:     cr,
+						SeqTip:      seqChain.BlockCount,
+						AssetHex:    o.GetPair().GetBaseAsset(),
+						SeqAmount:   o.GetOfferAmount(),       // the asset the maker sells
+						InvoiceMsat: o.GetWantAmount() * 1000, // BTC sats wanted -> msat
+						// T_seq and the invoice min_final_cltv are COUPLED from ONE invariant so an honest
+						// offer clears the taker's hold-CLTV masquerade gate. This is the single-chain
+						// submarine gate, NOT the cross W1/W2 delta (cfg.seqDelta) — coupleSubReverse inside
+						// RunMakerReverseSubmarine raises T_seq to the coupled minimum if cfg.seqDelta is short.
 						SeqLocktimeDelta: cfg.seqDelta,
+						InvoiceCLTV:      client.SubReverseInvoiceCLTV,
 						Log:              logf,
 					}
 					res, err := client.RunMakerReverseSubmarine(p, in, send)
