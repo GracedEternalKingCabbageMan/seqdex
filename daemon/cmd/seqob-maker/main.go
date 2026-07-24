@@ -72,7 +72,7 @@ func main() {
 	btcChainName := flag.String("btc-chain", "testnet4", "cross: parent chain params: testnet4 | regtest")
 	xseqRPCURL := flag.String("xseq-rpc", "", "cross: Sequentia node RPC URL http://user:pass@host:port (required for -mode cross)")
 	xseqWallet := flag.String("xseq-wallet", "", "cross: Sequentia node wallet funding the asset leg")
-	btcDelta := flag.Uint("btc-locktime-delta", 100, "cross: T_btc = parent tip + this (longer leg in time; ~16h)")
+	btcDelta := flag.Uint("btc-locktime-delta", 180, "cross: T_btc = parent tip + this (longer leg in time; ~30h). 180 clears the LSP payer-bridge fund gate for T_seq=240 (B1 floor ~150, B3 ceiling ~192); see RunMakerForward's BtcLocktimeDelta comment")
 	seqDelta := flag.Uint("seq-locktime-delta", 240, "cross: T_seq = SEQ tip + this (shorter leg in time; ~2h — must cover the taker's real parent confirmation, or takers refuse the terms)")
 	minBTCConf := flag.Int("min-btc-conf", 1, "cross: confirmations required on the taker's BTC leg (1 = testnet-grade; confirmation depth, not anchoring, protects the maker's BTC side — raise for real value)")
 	spendFee := flag.Uint64("spend-fee", 1000, "cross: HTLC spend fee target in native sats (converted per-asset via the fee market)")

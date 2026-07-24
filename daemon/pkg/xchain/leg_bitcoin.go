@@ -2,6 +2,7 @@ package xchain
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 
@@ -131,10 +132,15 @@ func (l *BitcoinLeg) BuildRefundTx(redeemScript []byte, in BitcoinSpendInput, lo
 }
 
 // buildSpendTx builds the unsigned Bitcoin spend skeleton shared by claim and
-// refund. Refund sets nLockTime + a non-final sequence (0xfffffffe) so CLTV
-// passes; claim uses a final sequence (0xffffffff) and nLockTime 0. There is a
-// single recipient output of (Amount-Fee) sats; the fee is implicit (no fee
-// output, unlike Elements).
+// refund. Refund sets nLockTime + an RBF-signalling non-final sequence
+// (0xfffffffd) so CLTV passes AND the refund is fee-BUMPABLE (BIP125): the LSP
+// payer leg-bridge must be able to RBF-replace a stalled 0-conf refund with a
+// higher fee so it confirms inside the taker hold's remaining life (else the
+// hold fails back to the taker and a maker claim takes the LSP's BTC HTLC). Any
+// sequence <= 0xfffffffe is non-final (CLTV takes effect); <= 0xfffffffd ALSO
+// opts into RBF, a strict superset that never weakens the timelock. Claim uses a
+// final sequence (0xffffffff) and nLockTime 0. There is a single recipient output
+// of (Amount-Fee) sats; the fee is implicit (no fee output, unlike Elements).
 func (l *BitcoinLeg) buildSpendTx(in BitcoinSpendInput, locktime uint32, refund bool) (*wire.MsgTx, error) {
 	if in.Fee >= in.Amount {
 		return nil, fmt.Errorf("xchain/btc: fee %d >= amount %d", in.Fee, in.Amount)
@@ -146,7 +152,7 @@ func (l *BitcoinLeg) buildSpendTx(in BitcoinSpendInput, locktime uint32, refund 
 	tx := wire.NewMsgTx(2)
 	txin := wire.NewTxIn(wire.NewOutPoint(h, in.Vout), nil, nil)
 	if refund {
-		txin.Sequence = 0xfffffffe // non-final: lets nLockTime/CLTV take effect
+		txin.Sequence = 0xfffffffd // non-final (lets nLockTime/CLTV take effect) AND RBF-signalling (BIP125) so the refund is fee-bumpable
 		tx.LockTime = locktime
 	} else {
 		txin.Sequence = 0xffffffff
@@ -306,6 +312,27 @@ func findOutputBySPK(rawTxHex string, wantSPK []byte) (uint32, uint64, error) {
 	return 0, 0, fmt.Errorf("no output matches the target scriptPubKey")
 }
 
+// LocateHTLCOutputByScript parses a raw Bitcoin funding tx (Bitcoin-serialized
+// hex, e.g. from getrawtransaction) and returns the (vout, value sats) of the
+// output paying the P2SH of redeemScript under params. It is the
+// redeem-script-only analog of VerifyFundedHTLC (which reconstructs the script
+// from H + the claim/refund pubkeys): the REFUND path already holds the EXACT
+// redeemScript it funded, so it locates its own HTLC output on-chain by that
+// script alone — without needing H or the counterparty pubkey. Used to
+// verify-not-trust a refund's outpoint + amount before spending the CLTV/ELSE
+// (refund) branch back to the funder.
+func LocateHTLCOutputByScript(params *chaincfg.Params, rawTxHex string, redeemScript []byte) (uint32, uint64, error) {
+	addr, err := btcutil.NewAddressScriptHash(redeemScript, params)
+	if err != nil {
+		return 0, 0, fmt.Errorf("derive HTLC P2SH: %w", err)
+	}
+	spk, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("HTLC scriptPubKey: %w", err)
+	}
+	return findOutputBySPK(rawTxHex, spk)
+}
+
 // scriptEmbedsHash reports whether redeemScript contains an exact 32-byte push
 // of wantHash (the OP_SHA256 <H> in a Design-A HTLC). It is a cheap sanity check
 // layered on top of the full byte-for-byte script comparison the caller does.
@@ -335,6 +362,229 @@ func testNet4Params() *chaincfg.Params {
 	p.Name = "testnet4"
 	p.Net = 0x283f161c // testnet4 message-start magic (0x1c161f28 little-endian)
 	return &p
+}
+
+// --- HTLC-spend classification (authoritative on-chain fate) --------------
+
+// BTCHTLCSpendStatus is the AUTHORITATIVE on-chain fate of a funded Design-A HTLC
+// output, learned by inspecting the transaction that spent it. It is the signal
+// the LSP payer leg-bridge keys its recoup-vs-refund decision on — REPLACING any
+// persisted intent flag, which is racy across the persist/broadcast window
+// (crash-before-broadcast => stale "refunded=true"; RPC-error-after-broadcast =>
+// stale "refunded=false"). The chain's single spend is idempotent and cannot lie.
+type BTCHTLCSpendStatus int
+
+const (
+	// BTCHTLCSpendUnknown is the FAIL-CLOSED sentinel: the fate could not be
+	// DEFINITIVELY determined (a lookup errored, or a spend was seen but could not
+	// be classified). It is ONLY ever paired with definitive=false; the caller must
+	// treat it as neither unspent/claim/refund and re-drive later, never guess.
+	BTCHTLCSpendUnknown BTCHTLCSpendStatus = iota
+	// BTCHTLCSpendUnspent: the funded output is still in the UTXO set (no spend,
+	// including the mempool). The HTLC is live; the higher-level P-public / T_btc
+	// decision applies (P public => recoup; T_btc passed with no P => refund).
+	BTCHTLCSpendUnspent
+	// BTCHTLCSpendClaim: the output was spent via the CLAIM / IF (hashlock) branch —
+	// the spending input revealed a preimage P with sha256(P)==H. The maker got
+	// paid; the LSP MUST recoup the taker's hold. P is returned so the LSP can
+	// settle the held LN.
+	BTCHTLCSpendClaim
+	// BTCHTLCSpendRefund: the output was spent via the REFUND / ELSE (CLTV) branch —
+	// no preimage; the funder (the LSP) reclaimed its BTC. The maker is UNPAID, so
+	// the taker's hold MUST be released, never captured.
+	BTCHTLCSpendRefund
+)
+
+// String renders the status as the stable label the seqob-cli / LSP contract uses.
+func (s BTCHTLCSpendStatus) String() string {
+	switch s {
+	case BTCHTLCSpendUnspent:
+		return "UNSPENT"
+	case BTCHTLCSpendClaim:
+		return "SPENT_VIA_CLAIM"
+	case BTCHTLCSpendRefund:
+		return "SPENT_VIA_REFUND"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// HashFromHTLCRedeemScript extracts the 32-byte hashlock image H from a Design-A
+// HTLC redeemScript — the push immediately following OP_SHA256 (see primitive.go's
+// LockScript: OP_IF OP_SHA256 <H> OP_EQUALVERIFY ...). It is the SINGLE source of
+// truth the spend classifier keys claim-detection on, so H never has to be threaded
+// separately alongside the redeemScript the caller already holds. A script that is
+// not a Design-A HTLC (no OP_SHA256 <32-byte push>) is rejected rather than guessed.
+func HashFromHTLCRedeemScript(redeemScript []byte) ([]byte, error) {
+	tok := txscript.MakeScriptTokenizer(0, redeemScript)
+	afterSha256 := false
+	for tok.Next() {
+		if afterSha256 {
+			d := tok.Data()
+			if len(d) != 32 {
+				return nil, fmt.Errorf("expected a 32-byte hash after OP_SHA256, got a %d-byte item", len(d))
+			}
+			return append([]byte(nil), d...), nil
+		}
+		if tok.Opcode() == txscript.OP_SHA256 {
+			afterSha256 = true
+		}
+	}
+	if err := tok.Err(); err != nil {
+		return nil, fmt.Errorf("parse redeem script: %w", err)
+	}
+	return nil, fmt.Errorf("redeem script has no OP_SHA256 <32-byte H> (not a Design-A HTLC)")
+}
+
+// ClassifyBTCHTLCSpendScriptSig classifies a Design-A HTLC spend PURELY from the
+// spending input's legacy-P2SH scriptSig, with NO chain access — the pure primitive
+// under BitcoinChain.ClassifyBTCHTLCSpend. The two branches serialize as:
+//
+//	CLAIM:  <sig> <preimage> OP_TRUE  <redeemScript>   (IF / hashlock)
+//	REFUND: <sig>            OP_FALSE <redeemScript>   (ELSE / CLTV)
+//
+// (the redeemScript is always the FINAL push in a P2SH spend). It returns:
+//
+//   - (BTCHTLCSpendClaim, P, nil)   — a pushed item's sha256 == H, so the hashlock/IF
+//     branch was taken; P is that preimage (sha256(P)==H holds by construction).
+//   - (BTCHTLCSpendRefund, nil, nil)— no preimage present AND the branch selector is
+//     script-FALSE, so the CLTV/ELSE branch was taken.
+//   - (BTCHTLCSpendUnknown, nil, err)— unclassifiable: the final push is not our exact
+//     redeemScript (P2SH binding failed), or no preimage AND a non-false selector
+//     (a claim whose preimage we failed to recognize) — FAIL CLOSED, never guess.
+//
+// Preimage-presence is the AUTHORITATIVE claim signal: only the IF branch's
+// OP_SHA256 <H> OP_EQUALVERIFY can put a valid preimage on-chain, so any accepted
+// (mempool or confirmed) spend carrying one took the claim branch. The P2SH binding
+// (final push == our exact redeemScript) proves the spend is of OUR HTLC, so a
+// no-preimage spend is OUR refund branch — cross-checked against a false selector so
+// a preimage we somehow missed is reported UNCERTAIN, not mislabeled REFUND.
+func ClassifyBTCHTLCSpendScriptSig(sigScript, redeemScript []byte) (BTCHTLCSpendStatus, []byte, error) {
+	hashH, err := HashFromHTLCRedeemScript(redeemScript)
+	if err != nil {
+		return BTCHTLCSpendUnknown, nil, fmt.Errorf("classify: %w", err)
+	}
+
+	type sigItem struct {
+		op     byte
+		data   []byte
+		isData bool
+	}
+	var items []sigItem
+	tok := txscript.MakeScriptTokenizer(0, sigScript)
+	for tok.Next() {
+		d := tok.Data()
+		items = append(items, sigItem{op: tok.Opcode(), data: append([]byte(nil), d...), isData: d != nil})
+	}
+	if err := tok.Err(); err != nil {
+		return BTCHTLCSpendUnknown, nil, fmt.Errorf("classify: parse scriptSig: %w", err)
+	}
+	// The minimal Design-A spend is <selector> <redeemScript> (refund) — two items;
+	// anything shorter cannot be a P2SH HTLC spend.
+	if len(items) < 2 {
+		return BTCHTLCSpendUnknown, nil, fmt.Errorf("classify: scriptSig has %d item(s), too few for a Design-A P2SH spend", len(items))
+	}
+	// P2SH BINDING: the final push must reveal EXACTLY our redeemScript. That proves
+	// this input spends OUR HTLC via its P2SH, so the branch read below is a branch of
+	// OUR script and the H we extracted governs it.
+	last := items[len(items)-1]
+	if !last.isData || !bytes.Equal(last.data, redeemScript) {
+		return BTCHTLCSpendUnknown, nil, fmt.Errorf("classify: spender's final push is not our redeem script (P2SH binding failed)")
+	}
+	// CLAIM (authoritative): any pushed item whose sha256 == H is the revealed
+	// preimage; return it so the LSP can settle the taker's hold (recoup).
+	for _, it := range items {
+		if !it.isData || len(it.data) == 0 {
+			continue
+		}
+		h := sha256.Sum256(it.data)
+		if bytes.Equal(h[:], hashH) {
+			return BTCHTLCSpendClaim, append([]byte(nil), it.data...), nil
+		}
+	}
+	// No preimage. In a valid spend that reveals our redeemScript this can ONLY be
+	// the ELSE/refund branch. Confirm the selector (the item before the redeemScript
+	// push) is script-FALSE, so a claim whose preimage we failed to recognize is
+	// reported UNCERTAIN rather than mislabeled REFUND (fail closed).
+	sel := items[len(items)-2]
+	if isScriptSelectorFalse(sel.op, sel.data, sel.isData) {
+		return BTCHTLCSpendRefund, nil, nil
+	}
+	return BTCHTLCSpendUnknown, nil, fmt.Errorf("classify: spend reveals our redeem script but shows neither a valid preimage (H) nor a false refund-selector (unclassifiable, fail closed)")
+}
+
+// isScriptSelectorFalse reports whether an HTLC branch-selector stack item is
+// script-FALSE (selects the ELSE / CLTV refund branch). OP_0 and an empty or
+// all-zero data push (incl. a trailing 0x80 negative-zero sign byte) are false;
+// OP_1..OP_16 / OP_1NEGATE and any non-zero data push are true.
+func isScriptSelectorFalse(op byte, data []byte, isData bool) bool {
+	if !isData {
+		// A bare opcode: only OP_0 (== OP_FALSE) pushes an empty (false) value.
+		return op == txscript.OP_0
+	}
+	if len(data) == 0 {
+		return true
+	}
+	for i, b := range data {
+		if b == 0x00 {
+			continue
+		}
+		if b == 0x80 && i == len(data)-1 {
+			continue // trailing sign byte of negative zero
+		}
+		return false
+	}
+	return true
+}
+
+// spenderSpendsOutpoint parses a raw Bitcoin tx hex and reports whether ANY of its
+// inputs spends (fundingTxid, vout). Used to confirm a candidate tx is the spender
+// of a funded HTLC output. A fetch/parse failure returns false (the candidate is
+// skipped) — the classifier's fail-closed accounting lives in ClassifyBTCHTLCSpend.
+func spenderSpendsOutpoint(rawTxHex, fundingTxid string, vout uint32) bool {
+	fundHash, err := chainhash.NewHashFromStr(fundingTxid)
+	if err != nil {
+		return false
+	}
+	rawB, err := hex.DecodeString(rawTxHex)
+	if err != nil {
+		return false
+	}
+	var msg wire.MsgTx
+	if err := msg.Deserialize(bytes.NewReader(rawB)); err != nil {
+		return false
+	}
+	for _, in := range msg.TxIn {
+		if in.PreviousOutPoint.Hash.IsEqual(fundHash) && in.PreviousOutPoint.Index == vout {
+			return true
+		}
+	}
+	return false
+}
+
+// htlcSpendSigScript parses a raw Bitcoin spender tx and returns the scriptSig of
+// the input that spends (fundingTxid, vout) — the witness the branch classifier
+// reads. Errors if the tx does not actually spend that outpoint (so the caller
+// fails closed rather than classifying an unrelated input).
+func htlcSpendSigScript(rawTxHex, fundingTxid string, vout uint32) ([]byte, error) {
+	fundHash, err := chainhash.NewHashFromStr(fundingTxid)
+	if err != nil {
+		return nil, fmt.Errorf("bad funding txid %q: %w", fundingTxid, err)
+	}
+	rawB, err := hex.DecodeString(rawTxHex)
+	if err != nil {
+		return nil, fmt.Errorf("bad spender raw hex: %w", err)
+	}
+	var msg wire.MsgTx
+	if err := msg.Deserialize(bytes.NewReader(rawB)); err != nil {
+		return nil, fmt.Errorf("parse spender tx: %w", err)
+	}
+	for _, in := range msg.TxIn {
+		if in.PreviousOutPoint.Hash.IsEqual(fundHash) && in.PreviousOutPoint.Index == vout {
+			return in.SignatureScript, nil
+		}
+	}
+	return nil, fmt.Errorf("spender tx does not spend %s:%d", fundingTxid, vout)
 }
 
 // BitcoinChainParams selects btcd chain params for the BTC parent leg.

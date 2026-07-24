@@ -68,6 +68,12 @@ func main() {
 		cmdXSubAsSell(os.Args[2:])
 	case "xsubas-claim-btc":
 		cmdXSubAsClaimBTC(os.Args[2:])
+	case "xsubas-refund-btc":
+		cmdXSubAsRefundBTC(os.Args[2:])
+	case "xsubas-htlc-spend-status":
+		cmdXSubAsHtlcSpendStatus(os.Args[2:])
+	case "xsubas-node-caps":
+		cmdXSubAsNodeCaps(os.Args[2:])
 	case "xhtlc-observe":
 		cmdXHtlcObserve(os.Args[2:])
 	case "xfund-seq":
@@ -100,7 +106,13 @@ commands:
           (flags: -relay -side buy|sell -asset -offer-id -maker-pubkey -asset-ln-socket -ln-socket -final-cltv -terms-wait -hold-wait)
   xsubas  buy the asset by paying BTC ON-CHAIN and receiving the asset OVER LIGHTNING (submarine's mirror) [-taker-ln-node-id <hosted node id> for a non-custodial HODL buy: relay H + node id, maker pays the bare hash, the device settles]
           (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -asset-ln-socket -min-btc-conf -state-file -refund-wait)
-  xsubas-refund  recover the BTC HTLC of an aborted xsubas after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)`)
+  xsubas-refund  recover the BTC HTLC of an aborted xsubas after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)
+  xsubas-refund-btc  LSP recoup: spend the REFUND/ELSE (CLTV) branch of the payer-bridge BTC HTLC back to the LSP wallet after T_btc (mirror of xsubas-claim-btc)
+          (flags: -btc-rpc -btc-wallet -btc-chain -txid -vout -amount -redeem-script -t-btc -refund-priv -spend-fee)
+  xsubas-htlc-spend-status  LSP recoup-vs-refund ORACLE: read the AUTHORITATIVE on-chain fate of the payer-bridge BTC HTLC — UNSPENT | SPENT_VIA_CLAIM (returns P) | SPENT_VIA_REFUND — fail-closed on uncertainty (replaces the racy persisted intent flag; needs txindex + unpruned to read a non-wallet maker claim)
+          (flags: -btc-rpc -btc-wallet -btc-chain -txid -vout -redeem-script -require-node-caps)
+  xsubas-node-caps  LSP payer-bridge BRING-UP gate: assert the BTC node is UNPRUNED + has a SYNCED txindex (so the HTLC-spend classifier can read a non-wallet maker claim). Exit 0 = capable, 1 = refuse payer bridges
+          (flags: -btc-rpc -btc-wallet -btc-chain)`)
 	os.Exit(2)
 }
 
