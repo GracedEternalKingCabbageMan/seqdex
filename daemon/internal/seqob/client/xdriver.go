@@ -611,10 +611,23 @@ type MakerForwardParams struct {
 
 	// Locktime deltas above the respective tips. T_btc must be LONGER IN TIME
 	// than T_seq, and T_seq must leave the taker room for a REAL parent
-	// confirmation before its claim: 100 parent blocks ~16 h vs 240 SEQ slots
+	// confirmation before its claim: 180 parent blocks ~30 h vs 240 SEQ slots
 	// ~2 h. (The RFQ's 50-slot delta was tuned for regtest; on a live parent a
 	// taker with the default 120-slot minimum window rightly refuses it.)
-	BtcLocktimeDelta uint32 // default 100
+	//
+	// BtcLocktimeDelta is ALSO consumed by the LSP PAYER leg-bridge: it becomes
+	// T_btc on the on-chain BTC HTLC the LSP funds, which checkPayerFundGate
+	// (sequentia-web-wallet leg-bridge.mjs) gates against the taker's BTC-LN hold
+	// under CONSERVATIVE divisors (slow-SEQ 90 s/blk, fast-BTC 150 s/blk):
+	//   B1  T_btc >= tip + ceil(T_seq_blocks*90/150) + makerClaimRunway(6)
+	//       => for T_seq=240 the floor is ~150 blocks (the old 100 was a wall-clock
+	//       inversion under fast BTC and FAILED B1);
+	//   B3  T_btc <= holdCLTV - holdBuffer, holdBuffer=18 (finality 6 + confirm 12);
+	//       the taker's hold is ~requiredTakerHold(T_seq) ~210 blocks => ceiling ~192.
+	// 180 sits comfortably in the [~150,~192] window (B1 margin ~30, B3 ~12),
+	// clearing the payer fund gate for the honest fleet. Keep it in that window if
+	// you change SeqLocktimeDelta or the LSP's holdBuffer.
+	BtcLocktimeDelta uint32 // default 180 (payer-bridge safe window [~150,~192] for T_seq=240)
 	SeqLocktimeDelta uint32 // default 240
 
 	MinBTCConf   int    // confirmations required on the taker's BTC leg (default 1; testnet-grade — depth, not anchoring, protects the maker's BTC side)
@@ -671,7 +684,7 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 		return nil, errors.New("maker forward: offer amounts required")
 	}
 	if p.BtcLocktimeDelta == 0 {
-		p.BtcLocktimeDelta = 100
+		p.BtcLocktimeDelta = 180 // payer-bridge safe window [~150,~192] for T_seq=240; see the field comment
 	}
 	if p.SeqLocktimeDelta == 0 {
 		p.SeqLocktimeDelta = 240

@@ -14,6 +14,15 @@ package main
 //   seqob-cli xsubas-fund-btc -maker-claim-pub <hex> -hash <H hex> -btc-amount <sats>
 //     -btc-locktime <T_btc> -btc-rpc <url> -btc-wallet <user wallet> -btc-chain testnet4
 //     [-refund-priv <hex>]   (a device refund key is generated + printed if omitted)
+//
+// LSP payer-bridge (fund-safety) mode: pass -refund-pub <hex compressed pubkey> to
+// embed the CALLER's OWN refund pubkey in the redeem script INSTEAD of minting an
+// ephemeral one here. The LSP mints its refund keypair and PERSISTS the private key
+// to durable storage BEFORE calling this CLI, so the funding broadcast can never run
+// ahead of a persisted refund key — closing the crash window (mint-here → broadcast →
+// crash-before-persist) that would otherwise strand a funded HTLC (fund-loss). No
+// private key is minted or returned in this mode; the caller already holds it and
+// refunds via xsubas-refund-btc using the returned on-chain facts.
 
 import (
 	"encoding/hex"
@@ -21,6 +30,7 @@ import (
 	"fmt"
 
 	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 func cmdXSubAsFundBtc(args []string) {
@@ -32,12 +42,20 @@ func cmdXSubAsFundBtc(args []string) {
 	btcRPCURL := fs.String("btc-rpc", "", "bitcoind RPC URL http://user:pass@host:port (required)")
 	btcWallet := fs.String("btc-wallet", "", "bitcoind wallet holding the USER's BTC that funds the HTLC")
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
-	refundPrivHex := fs.String("refund-priv", "", "device BTC refund privkey (32-byte hex); a fresh one is generated + printed if empty")
+	refundPubHex := fs.String("refund-pub", "", "LSP payer-bridge: the CALLER's OWN refund pubkey (33-byte compressed hex) to embed in the redeem script; when set, NO refund key is minted or returned here (the caller persisted its private key BEFORE broadcast). Mutually exclusive with -refund-priv.")
+	refundPrivHex := fs.String("refund-priv", "", "device BTC refund privkey (32-byte hex); a fresh one is generated + printed if empty (ignored when -refund-pub is set)")
 	feeRate := fs.Float64("btc-fee-rate", 2, "sat/vB fee rate for funding the HTLC (0 = node default)")
+	locateOnly := fs.Bool("locate-only", false, "DRY-LOCATE (broadcast NOTHING): compute the deterministic Design-A redeem script from -maker-claim-pub/-hash/-btc-locktime/-refund-pub and scan the chain+wallet for an output ALREADY paying its P2SH. Prints {funded:true,...outpoint} if found, {funded:false,...} otherwise. Makes the LSP payer-bridge funding crash-IDEMPOTENT: scan-before-broadcast + recover-on-resume so a crash between a prior broadcast and the caller persisting the funding facts never double-funds. Requires -refund-pub (or -refund-priv to derive it) so the P2SH is deterministic.")
 	_ = fs.Parse(args)
 
 	if *makerClaimPubHex == "" || *hashHex == "" || *btcAmount == 0 || *btcLocktime == 0 || *btcRPCURL == "" {
 		fatal("xsubas-fund-btc requires -maker-claim-pub, -hash, -btc-amount, -btc-locktime, -btc-rpc")
+	}
+	// Locate-only cannot mint a refund key: the P2SH it scans for must be the SAME
+	// deterministic script a real fund would produce, which requires the caller's
+	// OWN refund pubkey. Refuse rather than silently scan for a script nobody funded.
+	if *locateOnly && *refundPubHex == "" && *refundPrivHex == "" {
+		fatal("xsubas-fund-btc -locate-only requires -refund-pub (or -refund-priv) so the redeem script's P2SH is deterministic")
 	}
 	makerClaimPub, err := hex.DecodeString(*makerClaimPubHex)
 	if err != nil || len(makerClaimPub) == 0 {
@@ -59,39 +77,130 @@ func cmdXSubAsFundBtc(args []string) {
 	if *feeRate > 0 {
 		btcChain.SetFeeRate(*feeRate)
 	}
-	// The device refund key: generated + printed if not supplied. The wallet keeps
-	// the PRIVATE key (only it can reclaim the HTLC at CLTV) — the LSP never sees it.
-	var refundKey *xchain.Key
-	if *refundPrivHex != "" {
+	// The refund key that guards the HTLC's CLTV/ELSE branch. Two modes:
+	//
+	//   (a) -refund-pub supplied (LSP payer-bridge, fund-safe): the CALLER already
+	//       minted the refund keypair and PERSISTED its private key to durable storage
+	//       BEFORE invoking this CLI. We embed the supplied pubkey in the redeem script
+	//       and NEVER mint or return a private key — closing the crash window where an
+	//       ephemeral refund key minted here and broadcast before the caller could
+	//       persist it would strand the funded HTLC (fund-loss). The caller persists the
+	//       returned on-chain facts (txid/vout/amount/redeem_script/locktime) and
+	//       reclaims via xsubas-refund-btc with the key it already holds.
+	//
+	//   (b) -refund-pub absent (device self-custody, back-compat): mint (or load from
+	//       -refund-priv) the refund key here and RETURN the private key so the device
+	//       keeps it — only it can reclaim the HTLC at CLTV; the LSP never sees it.
+	var (
+		refundKey *xchain.Key // nil in mode (a): the caller holds the private key
+		refundPub []byte      // the compressed pubkey embedded in the redeem script
+	)
+	switch {
+	case *refundPubHex != "":
+		if *refundPrivHex != "" {
+			fatal("-refund-pub and -refund-priv are mutually exclusive: pass -refund-pub when the CALLER holds the refund private key, -refund-priv (or neither) for device self-custody")
+		}
+		pkb, derr := hex.DecodeString(*refundPubHex)
+		if derr != nil {
+			fatal("-refund-pub must be hex: %v", derr)
+		}
+		pk, derr := btcec.ParsePubKey(pkb)
+		if derr != nil {
+			fatal("-refund-pub is not a valid secp256k1 public key: %v", derr)
+		}
+		// Embed the exact 33-byte compressed encoding the redeemScript uses; a
+		// mismatched (e.g. uncompressed) encoding would fund an HTLC whose CLTV branch
+		// the caller's persisted key could not spend.
+		refundPub = pk.SerializeCompressed()
+	case *refundPrivHex != "":
 		kb, derr := hex.DecodeString(*refundPrivHex)
 		if derr != nil || len(kb) != 32 {
 			fatal("-refund-priv must be 32-byte hex")
 		}
 		refundKey = xchain.KeyFromBytes(kb)
-	} else {
+		refundPub = refundKey.PubKey()
+	default:
 		refundKey, err = xchain.NewKey()
 		if err != nil {
 			fatal("mint refund key: %v", err)
 		}
+		refundPub = refundKey.PubKey()
 	}
 
-	// Build the HTLC on H (claim=maker with P, refund=device after T_btc) and fund it
-	// from the USER's wallet (device-signed). This is the on-chain payment the user
-	// makes; the maker claims it later with the revealed preimage.
+	// LOCATE-ONLY (dry-locate, broadcast NOTHING): recompute the deterministic
+	// Design-A redeem script from the caller's own params + refund pubkey, then scan
+	// the chain + wallet for an output ALREADY paying its P2SH. This is the
+	// scan-before-broadcast + recover-on-resume primitive that makes the LSP payer
+	// bridge's BTC funding crash-IDEMPOTENT: a crash between a prior broadcast and the
+	// caller persisting the funding facts is recovered here (the already-funded output
+	// is found and adopted) instead of double-funding a second output to the SAME
+	// deterministic P2SH (which would strand the first). Prints funded:true + the
+	// outpoint if present, funded:false otherwise; exits 0 either way (a clean "not
+	// funded yet" is not an error — the caller then broadcasts).
+	if *locateOnly {
+		leg := xchain.NewBitcoinLeg(xchain.NewHashLockFromHash(hashH), params)
+		script, err := leg.HTLCScript(makerClaimPub, refundPub, uint32(*btcLocktime))
+		if err != nil {
+			fatal("locate-only: build redeem script: %v", err)
+		}
+		loc, definitive, err := btcChain.LocateFundedHTLC(script)
+		// Fail CLOSED on uncertainty: a locate is only actionable when it DEFINITIVELY
+		// answered. If any chain/wallet lookup errored (definitive=false), we cannot
+		// rule out a prior self-broadcast funding, so we must NOT report not-funded
+		// (which the caller would take as license to broadcast and could double-fund).
+		// Exit non-zero with a RETRYABLE signal; nothing was broadcast, re-drive later.
+		if !definitive {
+			fatal("locate-only: UNCERTAIN whether the HTLC is funded — a chain/wallet lookup failed, failing closed (RETRYABLE; nothing broadcast): %v", err)
+		}
+		out := map[string]interface{}{
+			"btc_htlc_script": hex.EncodeToString(script),
+			"btc_locktime":    uint32(*btcLocktime),
+			"btc_refund_pub":  hex.EncodeToString(refundPub),
+			"hash_h":          hex.EncodeToString(hashH),
+			"funded":          loc != nil,
+		}
+		if loc != nil {
+			// Verify-not-trust the value before reporting funded: refuse to let the
+			// caller adopt an output of the WRONG amount (fail closed on a mismatch;
+			// the caller then treats it as not-yet-funded and can re-fund cleanly).
+			if loc.Amount != *btcAmount {
+				fatal("locate-only: found HTLC output %s:%d pays %d sats, expected %d — refusing to report a mismatched-amount HTLC as funded", loc.TxID, loc.Vout, loc.Amount, *btcAmount)
+			}
+			out["btc_htlc_txid"] = loc.TxID
+			out["btc_htlc_vout"] = loc.Vout
+			out["btc_htlc_amount"] = loc.Amount
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+
+	// Build the HTLC on H (claim=maker with P, refund branch after T_btc) and fund it
+	// from the funder's wallet (device- or LSP-signed). This is the on-chain payment;
+	// the maker claims it later with the revealed preimage.
 	swap := xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLockFromHash(hashH))
-	leg, _, err := swap.LockBTCLeg(makerClaimPub, refundKey.PubKey(), atomsToCoinsCli(*btcAmount), uint32(*btcLocktime))
+	leg, _, err := swap.LockBTCLeg(makerClaimPub, refundPub, atomsToCoinsCli(*btcAmount), uint32(*btcLocktime))
 	if err != nil {
 		fatal("fund BTC HTLC from the user's wallet: %v", err)
 	}
+	// The funded on-chain facts + the EXACT redeem script are always returned so the
+	// caller can persist them and later locate/spend its own HTLC by script alone
+	// (xsubas-refund-btc verify-not-trust) without re-deriving it.
 	out := map[string]interface{}{
 		"btc_htlc_txid":   leg.Funded.TxID,
 		"btc_htlc_vout":   leg.Funded.Vout,
 		"btc_htlc_amount": leg.Funded.Amount,
 		"btc_htlc_script": hex.EncodeToString(leg.Script),
 		"btc_locktime":    leg.Locktime,
-		"btc_refund_pub":  hex.EncodeToString(refundKey.PubKey()),
-		"btc_refund_priv": hex.EncodeToString(refundKey.Bytes()), // DEVICE-HELD; never send to the LSP
+		"btc_refund_pub":  hex.EncodeToString(refundPub),
 		"hash_h":          hex.EncodeToString(hashH),
+	}
+	// Return the refund PRIVATE key ONLY in self-custody mode (b), where this CLI minted
+	// it and the device must keep it. In the LSP payer-bridge mode (a) the caller already
+	// persisted its own refund key before broadcast, so we never echo a secret it never
+	// asked us to hold.
+	if refundKey != nil {
+		out["btc_refund_priv"] = hex.EncodeToString(refundKey.Bytes()) // DEVICE-HELD; never send to the LSP
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	fmt.Println(string(b))
