@@ -30,6 +30,83 @@ import (
 //	  maker  : AwaitReversePayment (got the BTC-LN); refund the asset after
 //	           seq_locktime if the taker never pays.
 
+// Reverse-submarine HOLD-INVOICE coupling (fund-safety invariant).
+//
+// The reverse-submarine TAKER refuses a hold-invoice MASQUERADE (subswap.js
+// holdCltvSafeVsTseq): a bolt11 hold invoice is byte-identical to a plain one, so
+// the taker gates on the invoice's BTC-LN min_final_cltv (fc, in BTC blocks). It
+// converts fc into a Sequentia settle-deadline with the CONSERVATIVE INVERSE ratio
+// (SEQ slots per BTC block). The SEQ slot is DETERMINISTIC (30 s,
+// g_pos_slot_interval), so the ENTIRE margin belongs on the VARIABLE Bitcoin side:
+// Bitcoin's nominal block is ~600 s, but a sustained hashrate-drop lull can average
+// ~1500-1800 s/block over a short window, so we assume Bitcoin as SLOW as ~1800 s
+// and Sequentia at its exact 30 s slot => 1800/30 = 60 SEQ slots per BTC block.
+//
+// The gate is evaluated at the POST-anchor-bury tip. The wallet taker
+// (minAnchorDepth=3, max0conf=0) waits ~minAnchorDepth BTC confs to bury the fresh
+// asset HTLC before paying, and the SEQ tip advances ~minAnchorDepth*ratio blocks
+// during that wait, so:
+//
+//	settleDeadlineSeq = seqTip2 + ceil(fc * SubReverseConservativeRatio)
+//	gate PASSES iff    settleDeadlineSeq + SubReverseClaimMargin < T_seq
+//	  where seqTip2 = M + SubReverseMinAnchorDepth*ratio  (the tip AFTER the bury)
+//
+// For an HONEST maker's offer to CLEAR that gate, the maker must size its asset leg
+// T_seq (SeqLocktimeDelta) and the minted bolt11's min_final_cltv from ONE
+// invariant, so the two can never silently drift apart — and T_seq MUST also absorb
+// the anchor-bury tip advance (minAnchorDepth*ratio), since the gate only runs AFTER
+// the taker has waited out the bury:
+//
+//	SeqLocktimeDelta >= (fc + minAnchorDepth)*ratio + claimMargin + buffer
+//
+// The maker mints a BOUNDED-SMALL fc (viable over the short LSP-hub routes these
+// swaps take) and DERIVES T_seq from it. This coupling is SINGLE-CHAIN and unrelated
+// to the cross-path W1/W2 delta (cmd/seqob-maker -seq-locktime-delta, sized against
+// T_btc); the reverse-submarine maker uses THESE constants, not that flag.
+//
+// RESIDUAL (irreducible, documented — NOT a logic bug). This is a FIXED SEQ window
+// versus a VARIABLE, unbounded Bitcoin block time. The ratio is sized for a
+// sustained ~1800 s/block lull; if the REAL Bitcoin average over the fc-block window
+// exceeds ratio*30 s, a hold-masquerade maker could reveal P PAST the claim window
+// and capture the BTC-LN with no asset for the taker. It is BOUNDED, never a
+// permanent freeze: the taker caps its OWN outgoing max-cltv-delay at fc, so a HELD
+// payment refunds if unsettled — the loss materialises only if the maker actively
+// settles late, is borne by the taker/LSP, and never leaves the taker's BTC merely
+// HELD unrecoverable. Mitigated by the generous ratio + the bounded fc + the
+// max-cltv cap; NOT eliminated (Bitcoin block time is unbounded) — the SAME known
+// limitation every Lightning CLTV delta lives with.
+const (
+	SubReverseInvoiceCLTV       = 8   // fc: min_final_cltv (BTC blocks) on the reverse maker's bolt11. BOUNDED-SMALL: below the bolt11 default 18, viable over short LSP-hub routes; the maker is the final hop so it fully controls it. A smaller fc keeps the coupled T_seq sane.
+	SubReverseConservativeRatio = 60  // conservative SEQ slots per BTC block: SEQ slot deterministic 30 s (g_pos_slot_interval); assume Bitcoin as SLOW as ~1800 s/block (a sustained hashrate-lull average, ~3x nominal) => 1800/30 = 60x. ALL the margin sits on the VARIABLE Bitcoin side. MUST equal subswap.js SLOW_BTC_SECS/FAST_SEQ_SECS.
+	SubReverseClaimMargin       = 120 // SEQ blocks the taker keeps to claim after the latest possible reveal (matches subswap.js claimMargin)
+	SubReverseTseqBuffer        = 40  // slack absorbing ceil() + the SEQ-tip advance during the pre-bury handshake (kept < ratio, so the honest fc is exactly the largest CLTV the T_seq admits)
+	SubReverseMinAnchorDepth    = 3   // BTC confs the wallet taker buries the fresh asset HTLC before paying (matches the wallet minAnchorDepth default, max0conf=0). The SEQ tip advances ~this*ratio blocks during that wait, so T_seq MUST include it or the gate (run at the post-bury tip) refuses an honest offer.
+
+	// SubReverseSeqLocktimeDelta is the coupled T_seq for the default fc: it MUST
+	// clear the taker's gate for fc = SubReverseInvoiceCLTV, evaluated at the
+	// POST-anchor-bury tip (seqTip2 = M + SubReverseMinAnchorDepth*ratio).
+	//   (8+3)*60 + 120 + 40 = 820 SEQ blocks (~6.8 h at a 30 s slot).
+	SubReverseSeqLocktimeDelta = (SubReverseInvoiceCLTV+SubReverseMinAnchorDepth)*SubReverseConservativeRatio + SubReverseClaimMargin + SubReverseTseqBuffer
+)
+
+// coupleSubReverse returns the (fc, T_seq) the reverse maker MUST use so an honest
+// offer clears the taker's hold-CLTV gate evaluated at the POST-anchor-bury tip. It
+// defaults fc to the bounded value and RAISES T_seq to the coupled minimum
+// ((fc+minAnchorDepth)*ratio + claimMargin + buffer) whenever a caller-supplied
+// delta falls short — an honest maker may pick a LARGER T_seq, but never a smaller
+// one, or the taker would (correctly) refuse the offer. The minAnchorDepth*ratio
+// term is what absorbs the SEQ-tip advance while the taker waits out the bury.
+func coupleSubReverse(fc, seqDelta uint32) (uint32, uint32) {
+	if fc == 0 {
+		fc = SubReverseInvoiceCLTV
+	}
+	minDelta := (fc+SubReverseMinAnchorDepth)*SubReverseConservativeRatio + SubReverseClaimMargin + SubReverseTseqBuffer
+	if seqDelta < minDelta {
+		seqDelta = minDelta
+	}
+	return fc, seqDelta
+}
+
 // SubReverseMakerOps is the settlement seam for the reverse maker.
 type SubReverseMakerOps interface {
 	OfferReverseMakerSecret(p xchain.ReverseMakerSecretParams) (*xchain.ReverseMakerSecretOffer, error)
@@ -92,8 +169,12 @@ type MakerReverseSubmarineParams struct {
 	SeqAmount   uint64 // atoms the offer sells
 	InvoiceMsat uint64 // BTC-LN the offer wants
 
-	SeqLocktimeDelta uint32 // T_seq above the current SEQ tip (default 240)
-	InvoiceCLTV      uint32 // min_final_cltv on the maker's invoice
+	// SeqLocktimeDelta (T_seq above the current SEQ tip) and InvoiceCLTV
+	// (min_final_cltv on the maker's bolt11) are COUPLED by coupleSubReverse: a 0
+	// InvoiceCLTV defaults to SubReverseInvoiceCLTV, and SeqLocktimeDelta is raised
+	// to the coupled minimum so an honest offer clears the taker's hold-CLTV gate.
+	SeqLocktimeDelta uint32
+	InvoiceCLTV      uint32
 	Timing           XcTiming
 	Log              func(format string, args ...interface{})
 }
@@ -128,9 +209,13 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 	if p.AssetHex == "" || p.SeqAmount == 0 || p.InvoiceMsat == 0 {
 		return nil, errors.New("maker reverse submarine: offer amounts required")
 	}
-	if p.SeqLocktimeDelta == 0 {
-		p.SeqLocktimeDelta = 240
-	}
+	// Couple the invoice min_final_cltv and T_seq from ONE invariant so an honest
+	// offer clears the taker's hold-CLTV masquerade gate (see coupleSubReverse):
+	// default fc to the bounded value, then RAISE T_seq to
+	// (fc+minAnchorDepth)*ratio+claimMargin+buffer if the caller's delta is too small
+	// (e.g. the cross-sized default 240). The minAnchorDepth*ratio term covers the
+	// SEQ-tip advance while the taker buries the asset HTLC before paying.
+	p.InvoiceCLTV, p.SeqLocktimeDelta = coupleSubReverse(p.InvoiceCLTV, p.SeqLocktimeDelta)
 	recv := chanRecv(in)
 	res := &MakerReverseSubmarineResult{}
 
@@ -206,7 +291,10 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 	}, p.Crypter, send); err != nil {
 		return res, err
 	}
-	p.logf("reverse maker: locked asset (claim=taker), issued invoice on H=%x; awaiting payment", offer.HashH)
+	p.logf("reverse maker: locked asset (claim=taker) T_seq=%d (delta=%d), issued invoice min_final_cltv=%d BTC blocks on H=%x; awaiting payment (taker hold-CLTV gate at the post-bury tip: (%d+%d)*%d+%d=%d < delta)",
+		seqLocktime, p.SeqLocktimeDelta, p.InvoiceCLTV, offer.HashH,
+		p.InvoiceCLTV, SubReverseMinAnchorDepth, SubReverseConservativeRatio, SubReverseClaimMargin,
+		(p.InvoiceCLTV+SubReverseMinAnchorDepth)*SubReverseConservativeRatio+SubReverseClaimMargin)
 
 	// 4. Wait for the taker to pay our invoice. Once paid we have the BTC-LN and
 	// the taker will claim the asset with the P it learned by paying.
