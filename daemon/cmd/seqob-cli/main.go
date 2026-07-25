@@ -392,6 +392,66 @@ func readWSUntilSwap(c *websocket.Conn, timeout time.Duration) (*seqobv1.From, e
 	}
 }
 
+// startCourierReader spawns the SINGLE background reader for a courier WS session and
+// returns a recv closure (the shape the RunTaker* drivers expect: ciphertext bytes for
+// the next swap_msg, or an error). The on-demand readWSUntilSwap pattern only calls
+// ReadMessage when the driver is actively waiting; during a multi-minute on-chain
+// confirmation wait the driver is in its own poll loop and NEVER reads, so gorilla never
+// auto-pongs the relay's keepalive pings and the relay reaps the idle socket at pongWait
+// (60s) — the later announce write then hits a closed socket (broken pipe) and the lift
+// aborts AFTER funding. A dedicated goroutine that stays in ReadMessage keeps gorilla
+// auto-ponging for the whole wait, so the session survives to the announce. gorilla
+// permits one concurrent reader + one concurrent writer, and this is the only reader
+// (the send closure is the only writer), so it is race-free. Must be started AFTER the
+// one-shot readWS(lift_accepted) handshake, so nothing else touches ReadMessage.
+func startCourierReader(c *websocket.Conn) func(timeout time.Duration) ([]byte, error) {
+	frames := make(chan *seqobv1.From, 16)
+	errc := make(chan error, 1)
+	go func() {
+		c.SetReadDeadline(time.Time{}) // no idle deadline: block in ReadMessage (auto-ponging) until a frame or a real close
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				errc <- err
+				close(frames)
+				return
+			}
+			var from seqobv1.From
+			if jsonUnmarshal.Unmarshal(data, &from) != nil {
+				continue
+			}
+			frames <- &from
+		}
+	}()
+	return func(timeout time.Duration) ([]byte, error) {
+		deadline := time.After(timeout)
+		for {
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					select {
+					case e := <-errc:
+						return nil, e
+					default:
+						return nil, fmt.Errorf("courier connection closed")
+					}
+				}
+				if f.GetSwapMsg() != nil {
+					return f.GetSwapMsg().GetCiphertext(), nil
+				}
+				if e := f.GetError(); e != nil {
+					return nil, fmt.Errorf("relay error %d: %s", e.GetCode(), e.GetMessage())
+				}
+				// a non-swap, non-error frame (out-of-band notice): keep waiting for the swap_msg
+			case <-deadline:
+				return nil, fmt.Errorf("courier recv timeout")
+			case e := <-errc:
+				return nil, e
+			}
+		}
+	}
+}
+
 // --- helpers ---
 
 func newFlagSet(name string) *flag.FlagSet {
