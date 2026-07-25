@@ -250,13 +250,10 @@ func cmdXLift(args []string) {
 		}
 		return conn.WriteMessage(websocket.TextMessage, b)
 	}
-	recv := func(timeout time.Duration) ([]byte, error) {
-		from, err := readWSUntilSwap(conn, timeout)
-		if err != nil {
-			return nil, err
-		}
-		return from.GetSwapMsg().GetCiphertext(), nil
-	}
+	// One background reader keeps gorilla auto-ponging the relay's keepalive through the
+	// on-chain confirmation wait, so the session survives to the BtcLegFunded announce
+	// (else the relay reaps the idle socket at 60s and the announce hits a broken pipe).
+	recv := startCourierReader(conn)
 	ops := &client.LiveXcOps{
 		Swap: xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLock(secret)),
 		BTC:  btcChain,

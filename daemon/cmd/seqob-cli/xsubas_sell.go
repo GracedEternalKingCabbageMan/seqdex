@@ -204,13 +204,9 @@ func cmdXSubAsSell(args []string) {
 		}
 		return conn.WriteMessage(websocket.TextMessage, b)
 	}
-	recv := func(timeout time.Duration) ([]byte, error) {
-		from, err := readWSUntilSwap(conn, timeout)
-		if err != nil {
-			return nil, err
-		}
-		return from.GetSwapMsg().GetCiphertext(), nil
-	}
+	// One background reader keeps gorilla auto-ponging the relay's keepalive through any
+	// on-chain confirmation wait, so the session survives to the announce (see startCourierReader).
+	recv := startCourierReader(conn)
 
 	createdAt := time.Now().UTC().Format(time.RFC3339)
 	res, err := client.RunTakerSubAssetSell(client.TakerSubAssetSellParams{
