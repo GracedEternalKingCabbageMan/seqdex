@@ -17,6 +17,7 @@ package client
 // spoofed by the peer or relay.
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,6 +39,11 @@ type TakerReverseParams struct {
 	// the terms (mirrors the forward maker's NewOps(hashH)).
 	NewOps  func(hashH []byte) (XcOps, error)
 	Crypter *Crypter
+
+	// Ctx cancels the lift. It interrupts the anchor precondition below, where
+	// nothing of ours is committed yet, so cancelling never loses funds — this is
+	// the seam the wallet's "cancel this trade" button uses. nil == Background.
+	Ctx context.Context
 
 	BtcClaimKey  *xchain.Key // claims the maker's BTC leg once the secret is revealed
 	SeqRefundKey *xchain.Key // refunds our SEQ leg after T_seq if the maker never claims
@@ -126,6 +132,9 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
+	}
+	if p.Ctx == nil {
+		p.Ctx = context.Background()
 	}
 	res := &TakerReverseResult{}
 
@@ -266,6 +275,59 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	res.BtcLeg = verifiedBtc.Leg
 	p.logf("maker BTC leg verified + confirmed: %s (%d sats, T_btc=%d)", locked.Leg.Txid, locked.Leg.Amount, tBtc)
 
+	// 3b. ANCHOR PRECONDITION — the mirror of the forward maker's. Here WE are the
+	// asset giver, so the maker's gate is the one we must satisfy: the block that
+	// confirms our funding has to commit anchorheight >= the maker's BTC-leg
+	// height, and that value is immutable once the funding confirms. Wait for our
+	// own anchor to reach it FIRST; R2 monotonicity then makes every block
+	// extending this tip satisfy the gate by construction. Measured against our
+	// own node's verification of the maker's leg (verifiedBtc.Height), raised (never
+	// lowered) by anything the maker itself reported, plus one block of slack for
+	// the maker's non-atomic height derivation — waiting longer is never unsafe.
+	//
+	// How long: until the timelock says a leg funded now could no longer be claimed
+	// (T_seq for the maker's claim, T_btc for ours), or the user cancels. Never a
+	// flat number of minutes (owner ruling 2026-07-25). Aborting here is clean: no
+	// asset has moved and the maker refunds at T_btc.
+	btcLegH := claimantBtcLegHeight(verifiedBtc.Height, locked.Leg.Height)
+	window := fundWindow{
+		SeqLocktime:       tSeq,
+		MinSeqClaimWindow: p.MinSeqFundWindow,
+		BtcLocktime:       tBtc,
+		MinBtcClaimWindow: p.BtcClaimMargin,
+	}
+	if err := waitSeqAnchorReachesBTCLeg(p.Ctx, ops, btcLegH+1, window, p.Timing, p.logf); err != nil {
+		sendXcFail(p.Crypter, send, "anchor_not_caught_up", "our anchor has not reached your BTC leg; asset leg not funded")
+		return res, fmt.Errorf("%w (BTC-leg height %d; nothing of ours was spent)", err, btcLegH)
+	}
+
+	// 3c. RE-VERIFY THE MAKER'S BTC LEG. The wait above is bounded by the timelock,
+	// not by a clock, so it can be long — and a BTC HTLC that was confirmed when we
+	// checked can be GONE by the time it ends: a one-block parent reorg lets the
+	// maker double-spend the input it funded with. Funding our asset against a dead
+	// BTC leg is exactly the one-sided loss this gate exists to prevent, so the full
+	// verification runs again — same txid, vout, amount, script, locktime,
+	// confirmations — immediately before LockSEQLeg. A changed height also
+	// invalidates the anchor precondition we just satisfied, so that is a refusal
+	// too (fail closed; nothing of ours has moved).
+	recheckBtc, rerr := ops.VerifyBTCLeg(hashH, p.BtcClaimKey.PubKey(), makerBtcRefundPub, script,
+		tBtc, locked.Leg.Txid, locked.Leg.Vout, locked.Leg.Amount, p.MinBTCConf)
+	if rerr != nil {
+		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg no longer verifies; asset leg not funded")
+		return res, fmt.Errorf("%w: re-verifying %s after the anchor wait: %v (nothing of ours was spent)",
+			ErrBtcLegChanged, locked.Leg.Txid, rerr)
+	}
+	if recheckBtc.Height != verifiedBtc.Height {
+		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg moved to a different block; asset leg not funded")
+		return res, fmt.Errorf("%w: %s was at height %d, now %d (nothing of ours was spent)",
+			ErrBtcLegChanged, locked.Leg.Txid, verifiedBtc.Height, recheckBtc.Height)
+	}
+	// 3d. The timelock re-check at the last possible moment.
+	if werr := window.check(ops); werr != nil {
+		sendXcFail(p.Crypter, send, "seq_window_closed", "the asset leg's claim window has run down; asset leg not funded")
+		return res, fmt.Errorf("%w (nothing of ours was spent)", werr)
+	}
+
 	// 4. Fund our SEQ asset leg (claim = the maker's key, refund = ours after
 	// T_seq), persisting the moment it is funded; poll out a slow confirmation
 	// instead of orphaning the leg.
@@ -300,29 +362,67 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if p.OnSeqLegFunded != nil {
 		p.OnSeqLegFunded(res)
 	}
-	anchorH, aerr := ops.SeqAnchorHeightOf(seqBlockHash)
-	if aerr != nil {
-		anchorH = 0 // advisory only; the maker gates via its own node
+	// POST-FUNDING CHECK — the mirror of the forward maker's (xdriver.go). The
+	// precondition above makes it true by construction on the honest path, but a
+	// Sequentia reorg can still land our funding on a lower-anchored branch, and
+	// this side previously just shrugged (`anchorH = 0` and announce anyway). It
+	// must not: an asset leg whose block anchors BELOW the maker's BTC leg is
+	// precisely the leg that can outlive that BTC leg, and inviting the maker to
+	// claim it is inviting our own loss.
+	//
+	// Withholding the announcement is a COURTESY, not a guarantee — the maker minted
+	// the secret and holds our refund pubkey, so it can rebuild this redeem script
+	// and find the P2SH itself. The real defences are the precondition above (we do
+	// not fund early) and the maker's own claimant gate (it refuses on its own
+	// node's reading). What withholding does buy: an HONEST maker is told plainly
+	// not to claim, and we keep the T_seq refund path clean.
+	//
+	// The confirming block is re-derived and checked to be on the ACTIVE chain
+	// first: a cached hash can point at an orphan whose header commits nothing.
+	anchorH := int64(0)
+	var aerr error
+	for i := 0; i < 6; i++ {
+		if bh, berr := ops.SeqBlockHashOfTx(seqLeg.Funded.TxID); berr == nil && bh != "" {
+			seqBlockHash = bh
+		}
+		if onChain, cerr := ops.SeqBlockOnActiveChain(seqBlockHash); cerr != nil || !onChain {
+			aerr = fmt.Errorf("block %s is not on the active chain (cerr %v)", seqBlockHash, cerr)
+			time.Sleep(p.Timing.Poll)
+			continue
+		}
+		if anchorH, aerr = ops.SeqAnchorHeightOf(seqBlockHash); aerr == nil {
+			break
+		}
+		time.Sleep(p.Timing.Poll)
 	}
-	fundedMsg := &XcMsg{
-		Type: XcSeqLegFunded,
-		Leg: &XcLeg{
-			Txid:         seqLeg.Funded.TxID,
-			Vout:         seqLeg.Funded.Vout,
-			Amount:       seqLeg.Funded.Amount,
-			Asset:        seqLeg.Funded.AssetID,
-			RedeemScript: hex.EncodeToString(seqLeg.Script),
-			Locktime:     tSeq,
-			BlockHash:    seqBlockHash,
-			AnchorHeight: anchorH,
-		},
+	res.SeqBlockHash = seqBlockHash
+	if aerr != nil || anchorH < btcLegH {
+		p.logf("NOT announcing our SEQ leg: its block %s anchors at %d (read err %v), below the maker's BTC-leg height %d; "+
+			"an honest maker must not claim it. We refund it after T_seq %d.",
+			seqBlockHash, anchorH, aerr, btcLegH, tSeq)
+		sendXcFail(p.Crypter, send, "seq_leg_underanchored",
+			"our asset leg confirmed under-anchored; do NOT claim it (we refund it after T_seq); refund your BTC after T_btc")
+	} else {
+		fundedMsg := &XcMsg{
+			Type: XcSeqLegFunded,
+			Leg: &XcLeg{
+				Txid:         seqLeg.Funded.TxID,
+				Vout:         seqLeg.Funded.Vout,
+				Amount:       seqLeg.Funded.Amount,
+				Asset:        seqLeg.Funded.AssetID,
+				RedeemScript: hex.EncodeToString(seqLeg.Script),
+				Locktime:     tSeq,
+				BlockHash:    seqBlockHash,
+				AnchorHeight: anchorH,
+			},
+		}
+		if err := sendXc(fundedMsg, p.Crypter, send); err != nil {
+			// The leg is on-chain: proceed to the watch loop regardless; if the
+			// maker never learned of it, our T_seq refund recovers it.
+			p.logf("seq_leg_funded announce failed (%v); continuing to watch on-chain", err)
+		}
+		p.logf("SEQ leg funded: %s in block %s (anchor %d >= BTC-leg height %d)", seqLeg.Funded.TxID, seqBlockHash, anchorH, btcLegH)
 	}
-	if err := sendXc(fundedMsg, p.Crypter, send); err != nil {
-		// The leg is on-chain: proceed to the watch loop regardless; if the
-		// maker never learned of it, our T_seq refund recovers it.
-		p.logf("seq_leg_funded announce failed (%v); continuing to watch on-chain", err)
-	}
-	p.logf("SEQ leg funded: %s in block %s", seqLeg.Funded.TxID, seqBlockHash)
 
 	// 5. Watch OUR leg for the maker's claim: its scriptSig carries the secret
 	// (the courier's XcSecretRevealed is deliberately not relied upon). If
@@ -409,6 +509,12 @@ type MakerReverseParams struct {
 	NewOps  func(secret []byte) (XcOps, error)
 	Crypter *Crypter
 
+	// Ctx cancels the swap. Like the forward side's, it interrupts only waits
+	// where nothing of ours is committed yet (or is already recoverable), so
+	// cancelling is the user's call and never loses funds — the wallet's "cancel
+	// this trade" button wires straight to it. nil == context.Background().
+	Ctx context.Context
+
 	// Tip queries usable BEFORE the engine exists.
 	BtcTip func() (int64, error)
 	SeqTip func() (int64, error)
@@ -485,6 +591,9 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	}
 	if p.SeqClaimMargin == 0 {
 		p.SeqClaimMargin = 10
+	}
+	if p.Ctx == nil {
+		p.Ctx = context.Background()
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
@@ -672,16 +781,16 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	// 5. Measure our OWN BTC leg's confirmation height (broadcast-only earlier)
 	// for the anchor gate: the taker's asset block must anchor at/above it so
 	// a parent reorg reverts both legs together before we reveal anything.
+	// Derived ATOMICALLY (confirmations read either side of the tip read): a parent
+	// block landing between the two RPCs used to inflate this by one, and the gate
+	// then demanded an anchor the taker was never told to reach.
 	var btcLegHeight int64
 	hDeadline := time.Now().Add(p.Timing.BtcConfWait)
 	for {
-		confs, cerr := ops.BtcConfirmations(btcLeg.Funded.TxID)
-		if cerr == nil && confs >= p.MinBTCConf {
-			tip, terr := ops.BtcTip()
-			if terr == nil {
-				btcLegHeight = tip - int64(confs) + 1
-				break
-			}
+		h, _, herr := btcLegConfirmedHeight(ops, btcLeg.Funded.TxID, p.MinBTCConf)
+		if herr == nil {
+			btcLegHeight = h
+			break
 		}
 		if time.Now().After(hDeadline) {
 			return res, fmt.Errorf("own btc leg %s never reached %d conf (refund after T_btc %d)",
@@ -694,17 +803,16 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		p.OnUpdate(res)
 	}
 
-	// 6. Anchor gate on the SELF-derived confirming block, then the no-reveal
-	// margin, then claim the asset (revealing the secret on-chain).
-	anchorDeadline := time.Now().Add(p.Timing.AnchorWait)
-	for {
-		if _, err = ops.VerifySeqLegSafe(verifiedSeq.BlockHash, btcLegHeight); err == nil {
-			break
+	// 6. Anchor gate on the confirming block, RE-DERIVED from the leg's txid on
+	// every pass (gateSeqLeg) rather than cached at verification time, then the
+	// no-reveal margin, then claim the asset (revealing the secret on-chain).
+	if _, gerr := gateSeqLeg(p.Ctx, ops, verifiedSeq.Leg.Funded.TxID, btcLegHeight,
+		claimWindow{SeqLocktime: res.SeqLocktime, Margin: p.SeqClaimMargin}, p.Timing, nil); gerr != nil {
+		if errors.Is(gerr, xchain.ErrAnchorOrderingTerminal) {
+			return res, fmt.Errorf("anchor gate terminally failed (waiting cannot help): %w (not revealing; both legs refundable)", gerr)
 		}
-		if time.Now().After(anchorDeadline) {
-			return res, fmt.Errorf("anchor gate not passed in %s: %w (not revealing; both legs refundable)", p.Timing.AnchorWait, err)
-		}
-		time.Sleep(p.Timing.Poll)
+		return res, fmt.Errorf("anchor gate did not pass while T_seq %d left a claim window: %w (not revealing; both legs refundable)",
+			res.SeqLocktime, gerr)
 	}
 	tip, err := p.SeqTip()
 	if err != nil {
@@ -758,6 +866,11 @@ type MakerReverseResumeParams struct {
 	Timing         XcTiming
 	OnUpdate       func(*MakerReverseResult)
 	Log            func(string, ...interface{})
+
+	// Ctx cancels the resume. Same contract as MakerReverseParams.Ctx: it only
+	// interrupts waits where nothing of ours is committed or everything is still
+	// refundable. nil == context.Background().
+	Ctx context.Context
 }
 
 // ResumeMakerReverse finishes a reverse maker session after a restart. If the
@@ -772,6 +885,9 @@ func ResumeMakerReverse(p MakerReverseResumeParams) (*MakerReverseResult, error)
 	p.Timing.setDefaults()
 	if p.SeqClaimMargin == 0 {
 		p.SeqClaimMargin = 10
+	}
+	if p.Ctx == nil {
+		p.Ctx = context.Background()
 	}
 	if p.MinBTCConf <= 0 {
 		p.MinBTCConf = 1
@@ -834,16 +950,16 @@ func ResumeMakerReverse(p MakerReverseResumeParams) (*MakerReverseResult, error)
 // the T_seq margin, and claims the taker's asset leg. Returns (true, nil) on a
 // successful claim; (false, nil) means "cannot claim safely, refund BTC instead".
 func resumeReverseTryClaim(p MakerReverseResumeParams, res *MakerReverseResult, logf func(string, ...interface{})) (bool, error) {
-	// Our BTC leg's confirmation height for the anchor ordering check.
+	// Our BTC leg's confirmation height for the anchor ordering check, derived
+	// atomically (see btcLegConfirmedHeight) so a parent block landing mid-read
+	// cannot inflate it by one and fail the gate on a good leg.
 	var btcLegHeight int64
 	hDeadline := time.Now().Add(p.Timing.BtcConfWait)
 	for {
-		confs, cerr := p.Ops.BtcConfirmations(p.BtcLeg.Funded.TxID)
-		if cerr == nil && confs >= p.MinBTCConf {
-			if tip, terr := p.Ops.BtcTip(); terr == nil {
-				btcLegHeight = tip - int64(confs) + 1
-				break
-			}
+		h, _, herr := btcLegConfirmedHeight(p.Ops, p.BtcLeg.Funded.TxID, p.MinBTCConf)
+		if herr == nil {
+			btcLegHeight = h
+			break
 		}
 		if time.Now().After(hDeadline) {
 			logf("reverse resume: own BTC leg never reached %d conf; refunding", p.MinBTCConf)
@@ -851,17 +967,19 @@ func resumeReverseTryClaim(p MakerReverseResumeParams, res *MakerReverseResult, 
 		}
 		time.Sleep(p.Timing.Poll)
 	}
-	// Anchor gate on the taker leg's confirming block.
-	anchorDeadline := time.Now().Add(p.Timing.AnchorWait)
-	for {
-		if _, err := p.Ops.VerifySeqLegSafe(p.SeqBlockHash, btcLegHeight); err == nil {
-			break
-		}
-		if time.Now().After(anchorDeadline) {
-			logf("reverse resume: anchor gate did not pass; refunding BTC instead of revealing the secret")
+	// Anchor gate on the taker leg's confirming block, RE-DERIVED from the leg's
+	// txid every pass: the persisted SeqBlockHash was captured before the restart
+	// and a reorg since then would leave it pointing at an orphan, whose header
+	// commits nothing. The persisted hash is used only when the leg outpoint is
+	// missing (it never is here — the caller checks SeqLeg first).
+	if _, gerr := gateSeqLeg(p.Ctx, p.Ops, p.SeqLeg.Funded.TxID, btcLegHeight,
+		claimWindow{SeqLocktime: p.SeqLocktime, Margin: p.SeqClaimMargin}, p.Timing, nil); gerr != nil {
+		if errors.Is(gerr, xchain.ErrAnchorOrderingTerminal) {
+			logf("reverse resume: anchor gate TERMINALLY failed (%v); refunding BTC instead of revealing the secret", gerr)
 			return false, nil
 		}
-		time.Sleep(p.Timing.Poll)
+		logf("reverse resume: anchor gate did not pass (%v); refunding BTC instead of revealing the secret", gerr)
+		return false, nil
 	}
 	// Never reveal the secret inside the T_seq margin (the taker could be
 	// refunding its asset leg).
