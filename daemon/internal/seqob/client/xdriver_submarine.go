@@ -87,9 +87,16 @@ type MakerSubmarineParams struct {
 	Crypter     *Crypter
 	SeqTip      func() (int64, error)
 
-	AssetHex    string // SEQ asset the offer sells
-	SeqAmount   uint64 // atoms the offer sells (whole-HTLC lift)
-	InvoiceMsat uint64 // BTC-LN the offer wants (cross-checks the taker's bolt11)
+	AssetHex string // SEQ asset the offer sells
+	// SeqAmount is the WHOLE signed offer, in atoms. It is the maximum a taker may
+	// take, not the amount every lift settles: the taker names its slice in the
+	// terms request and this maker locks exactly that (see MakerSubmarineResult
+	// .FilledSeq / .RemainderSeq).
+	SeqAmount uint64
+	// InvoiceMsat is the BTC-LN the WHOLE offer wants. A partial is priced
+	// proportionally from it, so both sides derive the number from the same signed
+	// offer rather than trusting a quoted one.
+	InvoiceMsat uint64
 
 	SeqLocktimeDelta uint32 // T_seq above the current SEQ tip (default 240)
 	MinAnchorDepth   int64  // the funding anchor-depth gate before paying (default 3, >=2)
@@ -109,6 +116,16 @@ type MakerSubmarineResult struct {
 	Preimage     []byte
 	SeqClaimTxid string
 	Settled      bool
+
+	// FilledSeq / FilledMsat are what THIS lift settled: the asset atoms received
+	// and the invoice msat paid. For a whole-HTLC lift they equal the offer.
+	FilledSeq  uint64
+	FilledMsat uint64
+	// RemainderSeq is what is left of the offer after this lift. Non-zero means
+	// the caller should RE-REST that much rather than retire the offer — the
+	// supervisor does exactly this on the cross rail, which is where partial fills
+	// are already proven end to end.
+	RemainderSeq uint64
 }
 
 func (p *MakerSubmarineParams) logf(format string, args ...interface{}) {
@@ -148,9 +165,37 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 	res := &MakerSubmarineResult{}
 
 	// 1. Terms request -> mint per-lift terms with a FRESH SEQ-claim key.
-	if _, err := recvXcType(recv, p.Crypter, XcSubTermsRequest, p.Timing.TermsReqWait); err != nil {
+	//
+	// PARTIAL FILLS. The request now carries the slice the taker wants
+	// (XcMsg.SeqAmount, a field the cross rail already uses). It used to carry no
+	// fields at all, so the maker had nothing to size by and locked the WHOLE
+	// offer on every lift — a taker wanting a tenth of an offer either took all of
+	// it or nothing. Zero (or the whole) keeps the classic whole-HTLC lift, so an
+	// older taker that sends an empty request is unaffected.
+	req, err := recvXcType(recv, p.Crypter, XcSubTermsRequest, p.Timing.TermsReqWait)
+	if err != nil {
 		return res, err
 	}
+	takeSeq := req.SeqAmount
+	if takeSeq == 0 {
+		takeSeq = p.SeqAmount
+	}
+	if takeSeq > p.SeqAmount {
+		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "requested slice exceeds the offer")
+		return res, fmt.Errorf("submarine maker: take %d exceeds the offer's %d", takeSeq, p.SeqAmount)
+	}
+	// Price the slice from the SIGNED offer's ratio, rounding in the direction that
+	// favours us — we RECEIVE the asset and PAY the invoice, so the invoice floors.
+	// The taker recomputes this identically and requires it exactly, so neither
+	// side has to trust a quoted price.
+	invoiceMsat := ProportionalBtcFloor(p.InvoiceMsat, takeSeq, p.SeqAmount)
+	if invoiceMsat == 0 {
+		sendXcFail(p.Crypter, send, "DUST", "that slice prices to zero")
+		return res, fmt.Errorf("submarine maker: take %d of %d prices to 0 msat", takeSeq, p.SeqAmount)
+	}
+	res.FilledSeq = takeSeq
+	res.FilledMsat = invoiceMsat
+	res.RemainderSeq = p.SeqAmount - takeSeq
 	makerSeqClaim, err := xchain.NewKey()
 	if err != nil {
 		return res, err
@@ -167,12 +212,14 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		Type:             XcSubTerms,
 		MakerSeqClaimPub: hex.EncodeToString(makerSeqClaim.PubKey()),
 		SeqLocktime:      seqLocktime,
-		SeqAmount:        p.SeqAmount,
+		SeqAmount:        takeSeq,
+		BtcAmount:        invoiceMsat,
 		MinAnchorDepth:   uint32(p.MinAnchorDepth),
 	}, p.Crypter, send); err != nil {
 		return res, err
 	}
-	p.logf("submarine maker: sent terms (seq_amount=%d, seq_locktime=%d, min_anchor_depth=%d)", p.SeqAmount, seqLocktime, p.MinAnchorDepth)
+	p.logf("submarine maker: sent terms (seq_amount=%d of %d, invoice_msat=%d, seq_locktime=%d, min_anchor_depth=%d)",
+		takeSeq, p.SeqAmount, invoiceMsat, seqLocktime, p.MinAnchorDepth)
 
 	// 2. Receive the taker's funded asset HTLC + the BOLT11 to pay.
 	funded, err := recvXcType(recv, p.Crypter, XcSubAssetFunded, p.Timing.BtcFundWait)
@@ -198,9 +245,9 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 	// Bind the leg to the SIGNED offer: amount + asset must match our terms; the
 	// script/locktime/P2SH/value are re-derived and byte-checked inside RunNormal
 	// (VerifySEQLeg) against the terms we pass, so a lying taker cannot inflate.
-	if leg.Amount != p.SeqAmount {
-		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "asset leg amount != offer")
-		return res, fmt.Errorf("submarine maker: asset leg amount %d != offer %d", leg.Amount, p.SeqAmount)
+	if leg.Amount != takeSeq {
+		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "asset leg amount != agreed slice")
+		return res, fmt.Errorf("submarine maker: asset leg amount %d != agreed slice %d", leg.Amount, takeSeq)
 	}
 	if leg.Asset != "" && leg.Asset != p.AssetHex {
 		sendXcFail(p.Crypter, send, "BAD_ASSET", "asset leg asset != offer")
@@ -222,11 +269,11 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		SeqLocktime:       seqLocktime,
 		SeqTxID:           leg.Txid,
 		SeqVout:           leg.Vout,
-		SeqAmountAtoms:    p.SeqAmount,
+		SeqAmountAtoms:    takeSeq,
 		SeqAssetID:        p.AssetHex,
 		SeqMinConf:        1,
 		Bolt11:            funded.Bolt11,
-		InvoiceMsat:       p.InvoiceMsat,
+		InvoiceMsat:       invoiceMsat,
 		MinAnchorDepth:    p.MinAnchorDepth,
 		Max0ConfAmount:    p.Max0ConfAmount,
 		AnchorTimeout:     p.AnchorTimeout,
@@ -262,8 +309,17 @@ type TakerSubmarineParams struct {
 	SeqRefundKey *xchain.Key // refunds the asset HTLC after T_seq
 
 	ExpectAsset       string // SEQ asset hex the offer sells (required)
-	ExpectSeqAmount   uint64 // atoms the offer promises (required)
-	ExpectInvoiceMsat uint64 // BTC-LN we expect to receive (mint the invoice for this)
+	ExpectSeqAmount   uint64 // atoms the WHOLE signed offer promises (required)
+	ExpectInvoiceMsat uint64 // BTC-LN the WHOLE offer pays (a slice is priced from this)
+
+	// TakeSeqAmount is the slice of the offer to sell (asset atoms). 0 (or a value
+	// at/above the whole) sells into the WHOLE offer, reducing to the classic
+	// whole-HTLC lift. For a partial the maker pays
+	// ProportionalBtcFloor(ExpectInvoiceMsat, TakeSeqAmount, ExpectSeqAmount) —
+	// floor, in the maker's favour since the MAKER PAYS here — and we fund exactly
+	// TakeSeqAmount of the asset. We recompute that figure from OUR OWN verified
+	// offer values and require it exactly, so a maker cannot re-price the slice.
+	TakeSeqAmount uint64
 
 	MinSeqClaimWindow uint32 // refuse terms whose T_seq leaves less than this window (default 120)
 	InvoiceCLTV       uint32 // min_final_cltv on the minted invoice (0 = node default)
@@ -287,6 +343,12 @@ type TakerSubmarineResult struct {
 	InvoiceLabel string
 	PaidMsat     uint64
 	Settled      bool
+
+	// FilledSeq / FilledMsat are what THIS lift sold: the asset atoms funded and
+	// the invoice msat minted for them. Equal to the whole offer on a whole-HTLC
+	// lift; the caller reports these rather than the offer's headline size.
+	FilledSeq  uint64
+	FilledMsat uint64
 }
 
 func (p *TakerSubmarineParams) logf(format string, args ...interface{}) {
@@ -315,8 +377,28 @@ func RunTakerSubmarineNormal(p TakerSubmarineParams, send XcSend, recv XcRecv) (
 	}
 	res := &TakerSubmarineResult{}
 
-	// 1. Request terms.
-	if err := sendXc(&XcMsg{Type: XcSubTermsRequest}, p.Crypter, send); err != nil {
+	// PARTIAL FILLS. Decide the slice up front and TELL the maker: the request used
+	// to carry no fields at all, so the maker had nothing to size by and locked the
+	// whole offer every time. XcMsg already carries SeqAmount — the cross rail uses
+	// exactly this field — so nothing new goes on the wire.
+	takeSeq := p.TakeSeqAmount
+	if takeSeq == 0 || takeSeq > p.ExpectSeqAmount {
+		takeSeq = p.ExpectSeqAmount
+	}
+	// Price it OURSELVES from the signed offer. Whatever the maker quotes, this is
+	// the only number we will accept.
+	wantMsat := ProportionalBtcFloor(p.ExpectInvoiceMsat, takeSeq, p.ExpectSeqAmount)
+	if wantMsat == 0 {
+		return res, fmt.Errorf("%w: take %d of %d prices to 0 msat (dust)", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
+	}
+	res.FilledSeq, res.FilledMsat = takeSeq, wantMsat
+
+	// 1. Request terms, naming the slice.
+	//
+	// WIRE NOTE: seq_amount must ride as a JSON NUMBER. Go's json.Unmarshal
+	// rejects a quoted string into a uint64 field, leaving 0 — which here would
+	// silently read as "the whole offer" and lock far more than intended.
+	if err := sendXc(&XcMsg{Type: XcSubTermsRequest, SeqAmount: takeSeq}, p.Crypter, send); err != nil {
 		return res, err
 	}
 	terms, err := recvXcType(recv, p.Crypter, XcSubTerms, p.Timing.TermsWait)
@@ -331,9 +413,22 @@ func RunTakerSubmarineNormal(p TakerSubmarineParams, send XcSend, recv XcRecv) (
 		sendXcFail(p.Crypter, send, "BAD_PUBKEY", "maker_seq_claim_pub must be 33-byte hex")
 		return res, fmt.Errorf("%w: maker_seq_claim_pub", ErrXcBadTerms)
 	}
-	if terms.SeqAmount != p.ExpectSeqAmount {
-		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "seq_amount != offer")
-		return res, fmt.Errorf("%w: seq_amount %d != offer %d", ErrXcBadTerms, terms.SeqAmount, p.ExpectSeqAmount)
+	if terms.SeqAmount != takeSeq {
+		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "seq_amount != the slice we asked for")
+		return res, fmt.Errorf("%w: seq_amount %d != the %d we asked for", ErrXcBadTerms, terms.SeqAmount, takeSeq)
+	}
+	// The maker must pay the proportional invoice we derived from the SIGNED offer.
+	// A maker that quotes anything else is re-pricing the slice; refuse before a
+	// single atom is committed. (An older maker sends no BtcAmount at all, which is
+	// only acceptable for a whole-offer lift, where the price cannot have moved.)
+	if terms.BtcAmount != 0 && terms.BtcAmount != wantMsat {
+		sendXcFail(p.Crypter, send, "BAD_AMOUNT", "invoice_msat != the offer's proportional price")
+		return res, fmt.Errorf("%w: maker priced the slice at %d msat, the offer's ratio gives %d",
+			ErrXcBadTerms, terms.BtcAmount, wantMsat)
+	}
+	if terms.BtcAmount == 0 && takeSeq != p.ExpectSeqAmount {
+		sendXcFail(p.Crypter, send, "NO_PARTIAL", "this maker does not price partial fills")
+		return res, fmt.Errorf("%w: maker did not price the partial slice", ErrXcBadTerms)
 	}
 	seqTip, err := p.Ops.SeqTip()
 	if err != nil {
@@ -349,14 +444,14 @@ func RunTakerSubmarineNormal(p TakerSubmarineParams, send XcSend, recv XcRecv) (
 	h := sha256.Sum256(p.Secret)
 	label := "seqob-sub-normal-" + hex.EncodeToString(h[:8])
 	res.InvoiceLabel = label
-	bolt11, err := p.Ops.MintInvoice(p.Secret, p.ExpectInvoiceMsat, p.InvoiceCLTV, label, "SeqOB submarine (asset -> BTC-LN)")
+	bolt11, err := p.Ops.MintInvoice(p.Secret, wantMsat, p.InvoiceCLTV, label, "SeqOB submarine (asset -> BTC-LN)")
 	if err != nil {
 		return res, fmt.Errorf("taker submarine mint invoice: %w", err)
 	}
 	res.Bolt11 = bolt11
 
 	// 4. Fund the asset HTLC (claim=maker, refund=taker).
-	seqLeg, seqBlock, err := p.Ops.LockSEQLeg(makerSeqClaimPub, p.SeqRefundKey.PubKey(), atomsToCoins(p.ExpectSeqAmount), p.ExpectAsset, terms.SeqLocktime)
+	seqLeg, seqBlock, err := p.Ops.LockSEQLeg(makerSeqClaimPub, p.SeqRefundKey.PubKey(), atomsToCoins(takeSeq), p.ExpectAsset, terms.SeqLocktime)
 	if seqLeg != nil {
 		res.SeqLeg = seqLeg
 		res.SeqBlock = seqBlock
