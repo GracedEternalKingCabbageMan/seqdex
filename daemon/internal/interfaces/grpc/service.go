@@ -113,10 +113,6 @@ type ServiceOpts struct {
 	NoOperatorTls bool
 	ConnectAddr   string
 	ConnectProto  string
-
-	// XchainService, when non-nil, is the integrated cross-chain swap maker,
-	// registered on the Trade listener (gRPC + grpc-web + grpc-gateway REST).
-	XchainService seqdexv1.XchainServiceServer
 }
 
 func (o ServiceOpts) validate() error {
@@ -578,9 +574,6 @@ func (s *service) newTradeServer(tlsConfig *tls.Config) (*http.Server, error) {
 	seqdexv1.RegisterTradeServiceServer(grpcServer, tradeHandler)
 	transportHandler := grpchandler.NewTransportHandler()
 	seqdexv1.RegisterTransportServiceServer(grpcServer, transportHandler)
-	if s.opts.XchainService != nil {
-		seqdexv1.RegisterXchainServiceServer(grpcServer, s.opts.XchainService)
-	}
 	healthHandler := grpchandler.NewHealthHandler()
 	grpchealth.RegisterHealthServer(grpcServer, healthHandler)
 	reflection.Register(grpcServer)
@@ -621,14 +614,6 @@ func (s *service) newTradeServer(tlsConfig *tls.Config) (*http.Server, error) {
 		ctx, gwmux, conn,
 	); err != nil {
 		return nil, err
-	}
-	if s.opts.XchainService != nil {
-		if err := seqdexv1.RegisterXchainServiceHandler(
-			ctx, gwmux, conn,
-		); err != nil {
-			return nil, err
-		}
-		log.Info("cross-chain xchain interface registered on the trade listener")
 	}
 	if err := reflectionv1.RegisterReflectionServiceHandler(
 		ctx, gwmux, conn,
