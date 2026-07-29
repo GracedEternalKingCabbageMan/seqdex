@@ -118,7 +118,8 @@ func TestForwardMakerRejectsUnderpaidPartial(t *testing.T) {
 	makerClaim, _ := hex.DecodeString(terms.MakerBtcClaimPub)
 	hashH := sha256.Sum256(tp.Secret)
 	st.mu.Lock()
-	st.btcConfs["btc-htlc"] = 1
+	st.confirmBtcLegLocked("btc-htlc")
+	legH := st.btcLegHeightLocked()
 	st.mu.Unlock()
 	const takeSeq = uint64(2_500_000)
 	const underpaid = uint64(12_400) // proportional is 12_500; fund 100 sats short
@@ -131,7 +132,7 @@ func TestForwardMakerRejectsUnderpaidPartial(t *testing.T) {
 		Leg: &XcLeg{
 			Txid: "btc-htlc", Vout: 0, Amount: underpaid,
 			RedeemScript: hex.EncodeToString(fakeScript("btc", hashH[:], makerClaim, tp.BtcRefundKey.PubKey(), terms.BtcLocktime)),
-			Locktime:     terms.BtcLocktime, Height: 1000,
+			Locktime:     terms.BtcLocktime, Height: legH,
 		},
 	}, tp.Crypter, net.takerSend)
 	wg.Wait()
@@ -167,7 +168,8 @@ func TestForwardMakerRejectsOverAsk(t *testing.T) {
 	makerClaim, _ := hex.DecodeString(terms.MakerBtcClaimPub)
 	hashH := sha256.Sum256(tp.Secret)
 	st.mu.Lock()
-	st.btcConfs["btc-htlc"] = 1
+	st.confirmBtcLegLocked("btc-htlc")
+	legH := st.btcLegHeightLocked()
 	st.mu.Unlock()
 	_ = sendXc(&XcMsg{
 		Type: XcBtcLegFunded, HashH: hex.EncodeToString(hashH[:]),
@@ -178,7 +180,7 @@ func TestForwardMakerRejectsOverAsk(t *testing.T) {
 		Leg: &XcLeg{
 			Txid: "btc-htlc", Vout: 0, Amount: 26_000,
 			RedeemScript: hex.EncodeToString(fakeScript("btc", hashH[:], makerClaim, tp.BtcRefundKey.PubKey(), terms.BtcLocktime)),
-			Locktime:     terms.BtcLocktime, Height: 1000,
+			Locktime:     terms.BtcLocktime, Height: legH,
 		},
 	}, tp.Crypter, net.takerSend)
 	wg.Wait()

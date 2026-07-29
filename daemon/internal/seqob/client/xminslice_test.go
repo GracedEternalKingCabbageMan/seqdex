@@ -117,7 +117,8 @@ func TestForwardMakerRejectsSubDustPartial(t *testing.T) {
 	makerClaim, _ := hex.DecodeString(terms.MakerBtcClaimPub)
 	hashH := sha256.Sum256(tp.Secret)
 	st.mu.Lock()
-	st.btcConfs["btc-htlc"] = 1
+	st.confirmBtcLegLocked("btc-htlc")
+	legH := st.btcLegHeightLocked()
 	st.mu.Unlock()
 	const takeSeq = uint64(1)
 	const priced = uint64(1) // ProportionalBtc(25000,1,5M) = 1: correctly priced, still sub-dust
@@ -130,7 +131,7 @@ func TestForwardMakerRejectsSubDustPartial(t *testing.T) {
 		Leg: &XcLeg{
 			Txid: "btc-htlc", Vout: 0, Amount: priced,
 			RedeemScript: hex.EncodeToString(fakeScript("btc", hashH[:], makerClaim, tp.BtcRefundKey.PubKey(), terms.BtcLocktime)),
-			Locktime:     terms.BtcLocktime, Height: 1000,
+			Locktime:     terms.BtcLocktime, Height: legH,
 		},
 	}, tp.Crypter, net.takerSend)
 	wg.Wait()

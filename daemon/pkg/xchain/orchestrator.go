@@ -209,8 +209,18 @@ func (s *Swap) VerifySeqLegSafe(seqBlockHash string, btcLegHeight int64) (*Ancho
 		OK:               anchor >= btcLegHeight && status.AnchorStatus == "ok" && (!certPresent || certified),
 	}
 	if !ev.OK {
-		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, anchorstatus=%q, quorum-certified=%v)",
-			ErrAnchorOrdering, seqBlockHash, anchor, btcLegHeight, status.AnchorStatus, certified)
+		// Which conjunct failed decides whether waiting can ever help. The ordering
+		// term reads the leg block's COMMITTED anchorheight, so it is immutable for
+		// this block hash: report it as TERMINAL so the caller refunds now instead
+		// of re-reading the same number until its timelock window is gone. The
+		// status/certification terms genuinely flap, so they stay retryable.
+		// Same verdict either way — this only distinguishes futile from transient.
+		sentinel := ErrAnchorOrdering
+		if anchor < btcLegHeight {
+			sentinel = ErrAnchorOrderingTerminal
+		}
+		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, node anchorheight=%d, anchorstatus=%q, quorum-certified=%v)",
+			sentinel, seqBlockHash, anchor, btcLegHeight, status.AnchorHeight, status.AnchorStatus, certified)
 	}
 	return ev, nil
 }

@@ -25,6 +25,7 @@ package client
 //     taker result carries them all even on error for exactly that reason.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -56,6 +57,18 @@ type XcOps interface {
 	// SEQ side (always the anchored Sequentia/Elements node).
 	SeqTip() (int64, error)
 	SeqAnchorHeightOf(blockHash string) (int64, error)
+	// SeqAnchorTip reports the node's CURRENT anchor view (getanchorstatus): the
+	// active tip's Bitcoin-anchor height and the health of that anchor. Unlike
+	// SeqAnchorHeightOf — a FIXED per-block header commitment — this value
+	// ADVANCES as the committee anchors forward, which is what makes it usable as
+	// a precondition to wait on before funding an asset leg.
+	SeqAnchorTip() (int64, string, error)
+	// SeqBlockOnActiveChain reports whether a block is still connected to the
+	// node's ACTIVE chain. getblockheader answers for ORPHANED blocks too, so
+	// every anchor gate must establish this before trusting a block's committed
+	// anchorheight (see the gate loops: the confirming block is re-derived from
+	// the leg's txid every iteration, never cached).
+	SeqBlockOnActiveChain(blockHash string) (bool, error)
 	SeqBlockHashOfTx(txid string) (string, error)
 	SeqFeeRate(assetHex string) (uint64, bool)
 	LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*xchain.LegLock, string, error)
@@ -96,6 +109,16 @@ func (o *LiveXcOps) SeqTip() (int64, error) { return o.SEQ.BlockCount() }
 func (o *LiveXcOps) SeqAnchorHeightOf(blockHash string) (int64, error) {
 	return o.SEQ.BlockAnchorHeight(blockHash)
 }
+func (o *LiveXcOps) SeqAnchorTip() (int64, string, error) {
+	st, err := o.SEQ.GetAnchorStatus()
+	if err != nil {
+		return 0, "", err
+	}
+	return st.AnchorHeight, st.AnchorStatus, nil
+}
+func (o *LiveXcOps) SeqBlockOnActiveChain(blockHash string) (bool, error) {
+	return o.SEQ.BlockOnActiveChain(blockHash)
+}
 func (o *LiveXcOps) SeqBlockHashOfTx(txid string) (string, error) {
 	return o.SEQ.BlockHashOfTx(txid)
 }
@@ -125,12 +148,22 @@ func (o *LiveXcOps) RefundSEQLeg(leg *xchain.LegLock, key *xchain.Key, nLockTime
 func (o *LiveXcOps) SeqBroadcast(rawHex string) (string, error) { return o.SEQ.Broadcast(rawHex) }
 
 // XcTiming bundles the polling/wait knobs; zero values take the defaults.
+//
+// NOTE (owner ruling, Andreas 2026-07-25): none of these is allowed to cancel a
+// HEALTHY wait for a contested chain to clear — "we should let users decide if
+// the wait is intolerable and they want to cancel the trade, rather than cancel
+// it automatically. We cannot really predict how long contested blocks will take
+// to clear anyway." They are ordinary per-STEP courier/RPC budgets. The two waits
+// that gate real value — the asset funder's anchor precondition, and the taker's
+// wait for the funder to announce that leg — are bounded by PROTOCOL DEADLINES
+// (the timelock claim windows, fundWindow below) and by the caller's Ctx, never
+// by a flat number of minutes.
 type XcTiming struct {
 	Poll         time.Duration // chain/watch polling cadence (default 5s)
 	TermsWait    time.Duration // taker: wait for XcTerms (default 2m)
 	BtcConfWait  time.Duration // taker: wait for own BTC-leg confirmation (default 90m)
-	SeqLockWait  time.Duration // taker: wait for XcSeqLegLocked after announcing (default 15m; maker's LockSEQLeg alone can take ~3m)
-	AnchorWait   time.Duration // taker: wait for the anchor gate to pass (default 20m)
+	SeqLockWait  time.Duration // per-ATTEMPT courier/RPC step budget (default 15m). For the taker's XcSeqLegLocked wait it is only the size of one recv window: an idle window is re-armed while the claim window is open, so a maker legitimately waiting out its anchor precondition is not cut off.
+	AnchorWait   time.Duration // CLAIMANT ONLY: how long to wait out a transient anchorstatus/certification flap on an otherwise-good leg (default 20m). The asset FUNDER's precondition does NOT use this — it is bounded by the timelock (fundWindow).
 	TermsReqWait time.Duration // maker: wait for XcTermsRequest (default 2m)
 	BtcFundWait  time.Duration // maker: wait for XcBtcLegFunded (default 2h; covers the taker's conf wait)
 }
@@ -146,9 +179,16 @@ func (t *XcTiming) setDefaults() {
 		t.BtcConfWait = 90 * time.Minute
 	}
 	if t.SeqLockWait <= 0 {
+		// A per-ATTEMPT budget, not a swap deadline. The taker re-arms it for as
+		// long as its own claim window (T_seq) is still open, because the maker may
+		// legitimately be waiting out its anchor precondition — a wait nobody can
+		// put a number on, and which only the user may cancel.
 		t.SeqLockWait = 15 * time.Minute
 	}
 	if t.AnchorWait <= 0 {
+		// CLAIMANT-side flap budget only. The ordering conjunct is already terminal
+		// (ErrAnchorOrderingTerminal), so what remains here is a transient bad
+		// anchorstatus / not-yet-certified block on a leg that is otherwise good.
 		t.AnchorWait = 20 * time.Minute
 	}
 	if t.TermsReqWait <= 0 {
@@ -164,7 +204,272 @@ var (
 	ErrXcPeerFailed = errors.New("peer failed the cross-chain lift") // wraps an XcFail from the counterparty
 	ErrXcBadTerms   = errors.New("cross-chain terms rejected")
 	ErrXcRefunded   = errors.New("cross-chain leg refunded")
+
+	// ErrSeqAnchorBehindBTC means our OWN node's anchor view had not reached the
+	// BTC-leg height by the time the PROTOCOL made funding unsafe (or our node
+	// stopped answering), so we refused to fund the asset leg. Nothing of ours
+	// moved; the counterparty refunds its BTC after T_btc.
+	ErrSeqAnchorBehindBTC = errors.New("seq anchor behind the BTC leg; asset leg NOT funded")
+
+	// ErrFundWindowClosed means the timelock claim window ran down while we were
+	// waiting: funding now would leave the claimant (or us) too little room to
+	// claim before the refund path opens, which is the one thing that turns a
+	// stalled swap into a lost leg. This is the ONLY automatic stop the owner
+	// ruling permits for the funder's wait — everything else is the user's call.
+	ErrFundWindowClosed = errors.New("timelock claim window exhausted; asset leg NOT funded")
+
+	// ErrXcCanceled means the caller cancelled the lift (context). The user asked
+	// to stop waiting; nothing of ours has moved at that point.
+	ErrXcCanceled = errors.New("cross-chain lift cancelled")
+
+	// ErrBtcLegChanged means the counterparty's BTC leg no longer verifies the
+	// way it did before we waited — it vanished (double-spent / reorged out) or
+	// moved to a different height. Funding an asset leg against it would be the
+	// classic one-sided loss, so we refuse.
+	ErrBtcLegChanged = errors.New("btc leg changed during the anchor wait; asset leg NOT funded")
 )
+
+// maxFundWaitReadFailures bounds a wait against a DEAD node rather than against a
+// slow chain: if we cannot read our own anchor at all, we could not fund anyway.
+// At the 5s default poll that is ~5 minutes of an unreachable node.
+const maxFundWaitReadFailures = 60
+
+// maxCounterpartyHeightSlack caps how far a COUNTERPARTY-REPORTED BTC-leg height
+// may raise our wait target above the height our own node verified. The gap is
+// only ever the claimant's non-atomic tip/confirmations derivation plus a little
+// courier indexing lag — a couple of parent blocks — so six is generous. See
+// claimantBtcLegHeight: without a cap this field is a remote denial-of-service.
+const maxCounterpartyHeightSlack = 6
+
+// fundWindow is the PROTOCOL deadline an asset funder's wait is bounded by, in
+// place of a wall-clock constant (owner ruling, Andreas 2026-07-25: "we should
+// let users decide if the wait is intolerable and they want to cancel the trade
+// [...] We cannot really predict how long contested blocks will take to clear").
+//
+// Waiting is free right up until the point where funding would no longer leave a
+// real claim window — past that the swap can only end in a stranded leg, so the
+// wait stops THERE and nowhere else. Both bounds are read off the chains, not a
+// clock, so a slow chain moves the deadline with it.
+type fundWindow struct {
+	SeqLocktime       uint32 // T_seq: when the asset leg's refund path opens
+	MinSeqClaimWindow uint32 // SEQ blocks that must remain after funding for the claim to land
+	BtcLocktime       uint32 // T_btc: when the BTC leg's refund path opens (0 = not read here)
+	MinBtcClaimWindow uint32 // parent blocks that must remain for the BTC-side claim (0 = does not bind)
+}
+
+// check reports why funding is no longer safe, or nil while it still is. A chain
+// read that FAILS is not a verdict: it returns nil (keep waiting) and the caller's
+// consecutive-failure counter handles a genuinely dead node.
+func (w fundWindow) check(ops XcOps) error {
+	if w.SeqLocktime > 0 && w.MinSeqClaimWindow > 0 {
+		if seqTip, err := ops.SeqTip(); err == nil && uint32(seqTip)+w.MinSeqClaimWindow >= w.SeqLocktime {
+			return fmt.Errorf("%w: SEQ tip %d is within %d blocks of T_seq %d, so a leg funded now could not be claimed in time",
+				ErrFundWindowClosed, seqTip, w.MinSeqClaimWindow, w.SeqLocktime)
+		}
+	}
+	if w.BtcLocktime > 0 && w.MinBtcClaimWindow > 0 {
+		if btcTip, err := ops.BtcTip(); err == nil && uint32(btcTip)+w.MinBtcClaimWindow >= w.BtcLocktime {
+			return fmt.Errorf("%w: BTC tip %d is within %d blocks of T_btc %d, so the BTC side could no longer be claimed",
+				ErrFundWindowClosed, btcTip, w.MinBtcClaimWindow, w.BtcLocktime)
+		}
+	}
+	return nil
+}
+
+// claimWindow is fundWindow's counterpart for the CLAIMANT side: it bounds the
+// anchor gate by the protocol deadline instead of a wall clock.
+//
+// The same owner ruling applies here as to the funder's wait — no arbitrary
+// wall-clock timeout may abort a HEALTHY wait, because nobody can predict how
+// long a contested parent chain takes to clear. A flat budget is wrong in both
+// directions at once: it gives up on a gate that is merely slow while hours of
+// timelock remain, and it would happily keep waiting past the point where a
+// claim could still land if the timelock were short.
+//
+// The real deadline is the one the protocol already enforces immediately after
+// this gate: we must not still be here once the tip is within SeqClaimMargin of
+// T_seq, because claiming then races the counterparty's refund. Waiting past
+// that point cannot produce a usable result, so that is exactly where the gate
+// stops — and the wait costs nothing before it, since the claimant has not
+// revealed its secret and both legs remain refundable.
+type claimWindow struct {
+	SeqLocktime uint32 // T_seq: when the asset leg's refund path opens
+	Margin      uint32 // SEQ blocks that must remain for our claim to land ahead of it
+}
+
+// closed reports why the claim can no longer land, or nil while it still can. As
+// in fundWindow.check, a chain read that FAILS is not a verdict: it returns nil
+// (keep waiting) and leaves node health to the caller's failure counter.
+//
+// A zero SeqLocktime or Margin means the caller did not supply the timelock. That
+// is a programming error, not a licence to spin forever, so it is reported as
+// closed rather than silently restoring the unbounded behaviour this type exists
+// to remove.
+func (w claimWindow) closed(ops XcOps) error {
+	if w.SeqLocktime == 0 || w.Margin == 0 {
+		return fmt.Errorf("%w: the anchor gate was given no T_seq to bound it (SeqLocktime=%d margin=%d); refusing to wait unbounded",
+			ErrXcBadTerms, w.SeqLocktime, w.Margin)
+	}
+	seqTip, err := ops.SeqTip()
+	if err != nil {
+		return nil
+	}
+	if uint32(seqTip)+w.Margin >= w.SeqLocktime {
+		return fmt.Errorf("%w: SEQ tip %d is within %d blocks of T_seq %d, so a claim made now would race the refund path",
+			ErrFundWindowClosed, seqTip, w.Margin, w.SeqLocktime)
+	}
+	return nil
+}
+
+// waitSeqAnchorReachesBTCLeg is the ANCHOR PRECONDITION every asset FUNDER must
+// clear BEFORE it commits the asset (forward maker, reverse taker). It blocks
+// until our own node's live anchor view (getanchorstatus) has reached the height
+// at which the BTC leg confirmed, with a healthy anchor status.
+//
+// Why here, and not later. The claimant's gate (xchain.VerifySeqLegSafe) requires
+// the block that CONFIRMS this funding to commit anchorheight >= the BTC-leg
+// height. That value is a committed header field: once the funding confirms, its
+// fate is decided and no amount of waiting can change it. Anchors are monotone
+// non-decreasing along a chain (consensus rule R2, "bad-anchor-not-monotonic"),
+// so by waiting for the TIP's anchor to reach the BTC-leg height first, every
+// block extending that tip — including the one that will confirm our funding —
+// carries anchorheight >= the BTC-leg height, and the claimant's gate passes on
+// its FIRST read. That is Andreas's invariant ("BTC leg first implies the
+// Sequentia leg anchors at or above the BTC-leg height") turned from a hope into
+// a precondition we enforce.
+//
+// Waiting HERE is free: nothing is committed, so aborting costs nothing but the
+// swap. Waiting AFTER funding is futile AND expensive: the value is already at
+// risk and the only exit burns both timelock windows.
+//
+// This does NOT relax the claimant's gate by a single character, and it must
+// never be replaced by "consult a burying block / the tip at claim time": a
+// burying block's anchor says nothing about whether the funding OUTPUT survives a
+// Bitcoin reorg (invalidation propagates to descendants, never to ancestors).
+//
+// HOW LONG IT WAITS. Not a wall-clock constant — the owner ruled that out
+// (Andreas 2026-07-25): "we should let users decide if the wait is intolerable
+// and they want to cancel the trade (putting the makers order back to rest),
+// rather than cancel it automatically. We cannot really predict how long
+// contested blocks will take to clear anyway." So the only automatic stops are
+//  1. the PROTOCOL deadline (fundWindow): past it, funding could not be claimed;
+//  2. ctx cancellation — the user's own decision, wired here so the wallet's
+//     cancel button needs no further refactor;
+//  3. our own node being unreadable for maxFundWaitReadFailures polls, which is
+//     an RPC-health bound, not a judgement about the chain.
+//
+// `target` is the height our anchor must REACH, already carrying the +1 slack the
+// caller computes (see the call sites): waiting longer is never unsafe, so the
+// funder absorbs the claimant's height-derivation race rather than risking a
+// refusal that would strand the leg.
+func waitSeqAnchorReachesBTCLeg(ctx context.Context, ops XcOps, target int64, window fundWindow,
+	timing XcTiming, logf func(string, ...interface{})) error {
+	announced := false
+	readFails := 0
+	for {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w while waiting for our anchor to reach %d (asset leg NOT funded; nothing of ours was spent)", ErrXcCanceled, target)
+		}
+		anchorH, status, err := ops.SeqAnchorTip()
+		if err != nil {
+			readFails++
+			if readFails >= maxFundWaitReadFailures {
+				return fmt.Errorf("%w: our node's anchor view was unreadable for %d consecutive polls (target height %d): %v",
+					ErrSeqAnchorBehindBTC, readFails, target, err)
+			}
+		} else {
+			readFails = 0
+			if status == "ok" && anchorH >= target {
+				if announced && logf != nil {
+					logf("anchor precondition met: our anchor is %d >= %d; funding the asset leg", anchorH, target)
+				}
+				return nil
+			}
+		}
+		// The ONE automatic stop: the timelock, read off the chains.
+		if werr := window.check(ops); werr != nil {
+			return fmt.Errorf("%w (our anchor was %d, status %q, needed %d)", werr, anchorH, status, target)
+		}
+		if !announced && logf != nil {
+			logf("anchor precondition: our anchor is %d (status %q); waiting for >= %d before funding the asset leg. "+
+				"This waits as long as the timelock allows (T_seq %d, keeping %d blocks for the claim) — cancel the trade if that is too long.",
+				anchorH, status, target, window.SeqLocktime, window.MinSeqClaimWindow)
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w while waiting for our anchor to reach %d (asset leg NOT funded; nothing of ours was spent)", ErrXcCanceled, target)
+		case <-time.After(timing.Poll):
+		}
+	}
+}
+
+// claimantBtcLegHeight is the height a claimant will measure this BTC leg at, and
+// the funder's wait target is one ABOVE it. Two independent reasons for the slack:
+//
+//   - the claimant derives its height from two non-atomic RPCs (tip, confirmations);
+//     a parent block landing between them yields a height one too HIGH, and the gate
+//     then fails on a leg that was actually fine;
+//   - the counterparty's own reported height (courier data) may be one ahead of what
+//     our node has indexed.
+//
+// Waiting is safety-monotone — a HIGHER anchor never weakens the ordering guarantee —
+// so the funder absorbs the race instead of the claimant refusing mid-swap. `ours` is
+// our own node's verification (authoritative); `theirs` is the courier's claim, used
+// only to raise the bar, never to lower it.
+//
+// ⚠ `theirs` IS COUNTERPARTY-CONTROLLED and is therefore CLAMPED. It arrives as
+// Leg.Height in a courier message, so a hostile peer can put any number in it.
+// Left unbounded it is a denial-of-service on the funder: reporting a height of,
+// say, 2^62 sets a wait target no anchor will ever reach, and the funder then
+// waits out its entire timelock for nothing. Since `ours` comes from our own
+// node's verification of the very same leg, the true height IS `ours`; `theirs`
+// exists only to absorb the claimant's non-atomic derivation and a little courier
+// indexing lag, both of which are a few blocks at most. Anything beyond
+// maxCounterpartyHeightSlack is not lag, it is a bogus report, so the bar is
+// raised to the slack limit and no further. Clamping rather than rejecting keeps
+// a merely-confused peer workable while denying a malicious one the DoS.
+func claimantBtcLegHeight(ours, theirs int64) int64 {
+	limit := ours + maxCounterpartyHeightSlack
+	if theirs > limit {
+		return limit
+	}
+	if theirs > ours {
+		return theirs
+	}
+	return ours
+}
+
+// btcLegConfirmedHeight derives a BTC leg's confirmation height ATOMICALLY enough
+// to be trusted: tip - confirmations + 1 is only meaningful if no block lands
+// between the two reads, so the confirmation count is read on BOTH sides of the
+// tip read and the result is used only when it did not move. Without this a
+// parent block arriving mid-derivation silently inflates the height by one, and
+// the claimant then demands an anchor the funder was never told to reach.
+func btcLegConfirmedHeight(ops XcOps, txid string, minConf int) (height int64, confs int, err error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		before, cerr := ops.BtcConfirmations(txid)
+		if cerr != nil {
+			return 0, 0, cerr
+		}
+		if before < minConf {
+			return 0, before, fmt.Errorf("btc leg %s has %d confirmations, need %d", txid, before, minConf)
+		}
+		tip, terr := ops.BtcTip()
+		if terr != nil {
+			return 0, before, terr
+		}
+		after, cerr := ops.BtcConfirmations(txid)
+		if cerr != nil {
+			return 0, before, cerr
+		}
+		if after == before {
+			return tip - int64(before) + 1, before, nil
+		}
+		// A block landed mid-read; retry so the two halves agree.
+	}
+	return 0, 0, fmt.Errorf("btc leg %s: confirmation count kept moving; could not derive its height consistently", txid)
+}
 
 // atomsToCoins renders atoms as an 8-decimal coin string for wallet RPCs.
 func atomsToCoins(a uint64) string { return fmt.Sprintf("%d.%08d", a/100_000_000, a%100_000_000) }
@@ -213,12 +518,17 @@ func sendXcFail(c *Crypter, send XcSend, code, msg string) {
 // type arrives, the peer fails the session, or the deadline passes. Unknown or
 // out-of-order message types are skipped (the courier is at-least-once-ish and a
 // future peer may add courtesy messages).
+// errXcRecvWindowElapsed marks "this recv window went by with nothing in it",
+// as opposed to a broken courier. Only the former may be re-armed by a caller
+// whose protocol deadline is still open (see recvXcTypeWhile).
+var errXcRecvWindowElapsed = errors.New("courier window elapsed with no message")
+
 func recvXcType(recv XcRecv, c *Crypter, want XcMsgType, wait time.Duration) (*XcMsg, error) {
 	deadline := time.Now().Add(wait)
 	for {
 		remain := time.Until(deadline)
 		if remain <= 0 {
-			return nil, fmt.Errorf("timed out waiting for %q", want)
+			return nil, fmt.Errorf("%w: %q", errXcRecvWindowElapsed, want)
 		}
 		sealed, err := recv(remain)
 		if err != nil {
@@ -242,6 +552,121 @@ func recvXcType(recv XcRecv, c *Crypter, want XcMsgType, wait time.Duration) (*X
 	}
 }
 
+// recvXcTypeWhile waits for `want` for as long as `stillWorthWaiting` says the
+// PROTOCOL allows, using `step` as the size of one courier window rather than as
+// the deadline of the whole wait.
+//
+// Why not just a bigger timeout: the peer on the other side may be legitimately
+// parked in its own anchor precondition, a wait nobody can put a number on
+// (owner ruling 2026-07-25). Cutting it off with a flat constant refunds a swap
+// that was about to succeed and leaves the funder's asset locked until T_seq. So
+// an EMPTY window is re-armed; only a broken courier or a closed claim window
+// ends the wait.
+//
+// Classifying a recv failure: the caller's recv reports its own idle timeout as
+// an error too, so "the window went by quietly" and "the socket died" arrive the
+// same way. They are told apart by WHEN: an idle window returns at the end of its
+// budget, a dead transport returns straight away. Anything that comes back in
+// well under the budget is treated as a real transport failure and aborts.
+func recvXcTypeWhile(recv XcRecv, c *Crypter, want XcMsgType, step time.Duration,
+	stillWorthWaiting func() error, logf func(string, ...interface{})) (*XcMsg, error) {
+	if step <= 0 {
+		step = time.Minute
+	}
+	for {
+		if err := stillWorthWaiting(); err != nil {
+			return nil, err
+		}
+		started := time.Now()
+		m, err := recvXcType(recv, c, want, step)
+		if err == nil {
+			return m, nil
+		}
+		if errors.Is(err, ErrXcPeerFailed) {
+			return nil, err
+		}
+		idled := errors.Is(err, errXcRecvWindowElapsed) || time.Since(started) >= step*3/4
+		if !idled {
+			return nil, err // the courier itself is broken; waiting cannot help
+		}
+		if logf != nil {
+			logf("still waiting for %q after %s (the peer may be waiting for its own anchor to catch up); "+
+				"this continues while the timelock leaves a claim window — cancel the trade to stop it", want, step)
+		}
+	}
+}
+
+// gateSeqLeg is THE claimant-side anchor gate, shared by every side that is about
+// to treat an asset leg as claimable. It re-derives the leg's confirming block on
+// EVERY iteration instead of trusting one captured at verification time.
+//
+// Why re-derive. getblockheader answers for ORPHANED blocks too — it reads the
+// header index, not the chain — so a cached hash keeps returning a verdict about
+// a block that may no longer be part of anything. Two failure modes follow from
+// caching: a Sequentia reorg that re-mines the leg into a BETTER-anchored block
+// stays invisible (we refuse a leg that is now fine), and one that re-mines it
+// into a worse-anchored block leaves us reading the stale, rosier header. So each
+// pass asks the node which block confirms this txid NOW, insists that block is on
+// the ACTIVE chain, and only then reads its committed anchorheight.
+//
+// The gate itself is untouched: anchor >= btcLegHeight AND anchorstatus ok AND
+// (certification absent OR certified), read off the block that CONFIRMED the
+// funding — never a burying block, whose anchor says nothing about whether the
+// funding output survives a Bitcoin reorg.
+//
+// HOW LONG IT WAITS. By the TIMELOCK, never by a clock — see claimWindow. The
+// only stops are the protocol deadline (the tip reaching T_seq minus the claim
+// margin), ctx cancellation, and a terminal ordering verdict. Nothing of ours is
+// committed while this runs: the secret is unrevealed and both legs stay
+// refundable, so a long wait costs only the trade, and the decision to abandon a
+// slow one belongs to the user.
+func gateSeqLeg(ctx context.Context, ops XcOps, legTxid string, btcLegHeight int64,
+	window claimWindow, timing XcTiming, logf func(string, ...interface{})) (*xchain.AnchorEvidence, error) {
+	var lastErr error
+	for {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w while running the anchor gate", ErrXcCanceled)
+		}
+		blockHash, berr := ops.SeqBlockHashOfTx(legTxid)
+		if berr == nil && blockHash != "" {
+			onChain, cerr := ops.SeqBlockOnActiveChain(blockHash)
+			switch {
+			case cerr != nil:
+				lastErr = fmt.Errorf("could not confirm block %s is on the active chain: %w", blockHash, cerr)
+			case !onChain:
+				// The leg is being re-mined: its old block is orphaned and the header
+				// it committed is meaningless now. Wait for the new one.
+				lastErr = fmt.Errorf("the block %s holding the asset leg is no longer on the active chain (the leg is being re-mined)", blockHash)
+			default:
+				ev, gerr := ops.VerifySeqLegSafe(blockHash, btcLegHeight)
+				if gerr == nil {
+					return ev, nil
+				}
+				// The ordering conjunct reads a COMMITTED header field of the block we
+				// just re-derived, so for that block it can never clear: fail fast and
+				// keep the whole refund window instead of re-reading one number.
+				if errors.Is(gerr, xchain.ErrAnchorOrderingTerminal) {
+					return ev, gerr
+				}
+				lastErr = gerr
+			}
+		} else if berr != nil {
+			lastErr = fmt.Errorf("asset leg %s not confirmed yet: %w", legTxid, berr)
+		} else {
+			lastErr = fmt.Errorf("asset leg %s has no confirming block yet", legTxid)
+		}
+		if werr := window.closed(ops); werr != nil {
+			return nil, fmt.Errorf("%w (last anchor-gate reason: %v)", werr, lastErr)
+		}
+		if logf != nil {
+			logf("anchor gate not satisfied yet (%v); re-reading the leg's confirming block. "+
+				"This continues while T_seq %d leaves a claim window — cancel the trade to stop it",
+				lastErr, window.SeqLocktime)
+		}
+		time.Sleep(timing.Poll)
+	}
+}
+
 // --- FORWARD taker -----------------------------------------------------------
 
 // TakerForwardParams configures RunTakerForward. Expectations come from the
@@ -250,6 +675,12 @@ func recvXcType(recv XcRecv, c *Crypter, want XcMsgType, wait time.Duration) (*X
 type TakerForwardParams struct {
 	Ops     XcOps
 	Crypter *Crypter
+
+	// Ctx cancels the lift. The only waits it interrupts are ones where nothing
+	// of ours is committed yet (or is already recoverable), so cancelling is the
+	// user's call to make and never loses funds — the wallet's "cancel this trade"
+	// button wires straight to it. nil == context.Background().
+	Ctx context.Context
 
 	Secret       []byte      // 32-byte preimage; Ops' hashlock must be built from it
 	BtcRefundKey *xchain.Key // refunds our BTC leg after T_btc
@@ -341,6 +772,9 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
+	}
+	if p.Ctx == nil {
+		p.Ctx = context.Background()
 	}
 	res := &TakerForwardResult{}
 	hashH := sha256.Sum256(p.Secret)
@@ -442,13 +876,14 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 	if hp <= 0 {
 		confDeadline := time.Now().Add(p.Timing.BtcConfWait)
 		for {
-			confs, cerr := p.Ops.BtcConfirmations(btcLeg.Funded.TxID)
-			if cerr == nil && confs >= p.MinBTCConf {
-				tip, terr := p.Ops.BtcTip()
-				if terr == nil {
-					hp = tip - int64(confs) + 1
-					break
-				}
+			// Derived ATOMICALLY (confirmations either side of the tip read): a
+			// parent block landing between the two RPCs used to inflate hp by one,
+			// and the maker was then never told to anchor that high — the gate below
+			// failed on a leg that was perfectly fine.
+			h, _, herr := btcLegConfirmedHeight(p.Ops, btcLeg.Funded.TxID, p.MinBTCConf)
+			if herr == nil {
+				hp = h
+				break
 			}
 			if time.Now().After(confDeadline) {
 				sendXcFail(p.Crypter, send, "btc_conf_timeout", "btc leg did not confirm in time")
@@ -485,7 +920,30 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 	// 5. Await + verify the maker's SEQ leg. The redeem script is re-derived
 	// byte-for-byte by VerifySEQLeg (claim = our key, refund = the maker's from
 	// terms), and the amount/asset are bound to the signed offer.
-	locked, err := recvXcType(recv, p.Crypter, XcSeqLegLocked, p.Timing.SeqLockWait)
+	//
+	// HOW LONG WE WAIT for it: not a flat number of minutes. The maker is very
+	// likely parked in its own anchor precondition — waiting for its node's anchor
+	// to reach the height our BTC leg confirmed at — and that wait has no
+	// predictable length (owner ruling 2026-07-25). Cutting it off would abandon a
+	// swap that is about to succeed and leave the maker's asset locked to T_seq for
+	// nothing. So we keep listening while our own claim window is still open, and
+	// stop at the PROTOCOL deadline: once the SEQ tip is within SeqClaimMargin of
+	// T_seq we could not safely claim anyway, and the BTC refund at T_btc is the
+	// exit. Ctx cancellation (the user's decision) stops it at any time.
+	locked, err := recvXcTypeWhile(recv, p.Crypter, XcSeqLegLocked, p.Timing.SeqLockWait, func() error {
+		if p.Ctx.Err() != nil {
+			return fmt.Errorf("%w while waiting for the maker's asset leg (BTC refundable after T_btc %d)", ErrXcCanceled, terms.BtcLocktime)
+		}
+		seqNow, terr := p.Ops.SeqTip()
+		if terr != nil {
+			return nil // a read hiccup is not a verdict; keep listening
+		}
+		if uint32(seqNow)+p.SeqClaimMargin >= terms.SeqLocktime {
+			return fmt.Errorf("no asset leg by the time the claim window closed: SEQ tip %d is within %d of T_seq %d (BTC refundable after T_btc %d)",
+				seqNow, p.SeqClaimMargin, terms.SeqLocktime, terms.BtcLocktime)
+		}
+		return nil
+	}, p.logf)
 	if err != nil {
 		return res, err
 	}
@@ -517,24 +975,21 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 	res.SeqLeg = verified.Leg
 
 	// 6. Anchor gate: the SEQ block holding the leg must anchor at/above our BTC
-	// confirmation height and the node's anchor must be healthy. The block hash
-	// is the SELF-DERIVED one from our own node's view of the leg (VerifySEQLeg),
-	// NEVER the courier-supplied value: a malicious maker could otherwise quote
-	// any well-anchored block for a leg that actually confirmed in a badly
-	// anchored one, voiding the exact ordering guarantee this gate exists for.
-	// Retried: a parent flap makes this transiently fail and anchoring
-	// supremacy sorts it.
-	anchorDeadline := time.Now().Add(p.Timing.AnchorWait)
-	var ev *xchain.AnchorEvidence
-	for {
-		ev, err = p.Ops.VerifySeqLegSafe(verified.BlockHash, hp)
-		if err == nil {
-			break
+	// confirmation height and the node's anchor must be healthy. The block is
+	// SELF-DERIVED from our own node's view of the leg (and re-derived every pass,
+	// see gateSeqLeg), NEVER the courier-supplied value: a malicious maker could
+	// otherwise quote any well-anchored block for a leg that actually confirmed in
+	// a badly anchored one, voiding the exact ordering guarantee this gate exists
+	// for. The transient conjuncts (anchorstatus flap, not-yet-certified) are
+	// retried; the ORDERING one is terminal for the block it was read from.
+	ev, err := gateSeqLeg(p.Ctx, p.Ops, verified.Leg.Funded.TxID, hp,
+		claimWindow{SeqLocktime: terms.SeqLocktime, Margin: p.SeqClaimMargin}, p.Timing, nil)
+	if err != nil {
+		if errors.Is(err, xchain.ErrAnchorOrderingTerminal) {
+			return res, fmt.Errorf("anchor gate terminally failed (waiting cannot help): %w (BTC refundable after T_btc %d)", err, terms.BtcLocktime)
 		}
-		if time.Now().After(anchorDeadline) {
-			return res, fmt.Errorf("anchor gate not passed in %s: %w (BTC refundable after T_btc %d)", p.Timing.AnchorWait, err, terms.BtcLocktime)
-		}
-		time.Sleep(p.Timing.Poll)
+		return res, fmt.Errorf("anchor gate did not pass while T_seq %d left a claim window: %w (BTC refundable after T_btc %d)",
+			terms.SeqLocktime, err, terms.BtcLocktime)
 	}
 	res.Evidence = ev
 
@@ -600,6 +1055,12 @@ type MakerForwardParams struct {
 	NewOps  func(hashH []byte) (XcOps, error)
 	Crypter *Crypter
 
+	// Ctx cancels the lift while nothing of ours is committed — in particular
+	// during the anchor precondition below, which is deliberately not bounded by
+	// any wall clock. The wallet's "cancel this trade and re-rest my order" button
+	// wires here. nil == context.Background().
+	Ctx context.Context
+
 	// Tip queries usable BEFORE the hashlock exists (terms are minted first).
 	BtcTip func() (int64, error)
 	SeqTip func() (int64, error)
@@ -632,8 +1093,22 @@ type MakerForwardParams struct {
 
 	MinBTCConf   int    // confirmations required on the taker's BTC leg (default 1; testnet-grade — depth, not anchoring, protects the maker's BTC side)
 	SpendFeeSats uint64 // fee target in native sats (default 1000)
-	Timing       XcTiming
-	Log          func(format string, args ...interface{})
+
+	// MinSeqClaimWindow is the PROTOCOL bound on the anchor precondition below:
+	// we will wait for our anchor to catch up for as long as T_seq still leaves
+	// this many SEQ blocks for the taker to claim in, and not one block longer.
+	// Default 120 — the same window the taker itself demanded of our terms, so
+	// the two sides agree on when funding stops being safe. This replaces the old
+	// flat wall-clock timeout, which the owner ruled out (2026-07-25).
+	MinSeqClaimWindow uint32
+	// MinBtcClaimWindow is the same idea on the parent chain: below this many
+	// blocks before T_btc we could not claim the taker's BTC after the reveal, so
+	// funding the asset would be one-sided. Default 12 (settleMakerForward gives
+	// up at T_btc-6, so this leaves real room above it).
+	MinBtcClaimWindow uint32
+
+	Timing XcTiming
+	Log    func(format string, args ...interface{})
 
 	// OnUpdate is invoked after every state transition that creates or changes
 	// recoverable value (keys minted, legs funded/verified, secret learned,
@@ -694,6 +1169,15 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
+	}
+	if p.MinSeqClaimWindow == 0 {
+		p.MinSeqClaimWindow = 120
+	}
+	if p.MinBtcClaimWindow == 0 {
+		p.MinBtcClaimWindow = 12
+	}
+	if p.Ctx == nil {
+		p.Ctx = context.Background()
 	}
 	recv := func(timeout time.Duration) ([]byte, error) {
 		select {
@@ -837,6 +1321,59 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 	}
 	p.logf("taker BTC leg verified: %s (height %d)", funded.Leg.Txid, funded.Leg.Height)
 
+	// 2b. ANCHOR PRECONDITION — the taker's gate, honoured BEFORE our asset moves.
+	// The taker will refuse to claim unless the block confirming our funding
+	// commits anchorheight >= the BTC-leg height, and that value is immutable once
+	// the funding confirms. So wait for OUR OWN anchor to reach that height first:
+	// R2 monotonicity then makes every block extending this tip satisfy the gate by
+	// construction. Measured primarily against our own node's view of the leg
+	// (verifiedBtc.Height); the courier-supplied funded.Leg.Height is allowed only
+	// to RAISE the bar, never to lower it, and one block of slack absorbs the
+	// taker's non-atomic height derivation. Waiting longer is never unsafe.
+	//
+	// How long: until the timelock says funding could no longer be claimed, or the
+	// user cancels — never a flat number of minutes (owner ruling 2026-07-25).
+	// Aborting here is clean: no asset has moved and the taker refunds at T_btc.
+	btcLegH := claimantBtcLegHeight(verifiedBtc.Height, funded.Leg.Height)
+	window := fundWindow{
+		SeqLocktime:       seqLocktime,
+		MinSeqClaimWindow: p.MinSeqClaimWindow,
+		BtcLocktime:       btcLocktime,
+		MinBtcClaimWindow: p.MinBtcClaimWindow,
+	}
+	if err := waitSeqAnchorReachesBTCLeg(p.Ctx, ops, btcLegH+1, window, p.Timing, p.logf); err != nil {
+		sendXcFail(p.Crypter, send, "anchor_not_caught_up", "our anchor has not reached your BTC leg; asset leg not funded")
+		return res, fmt.Errorf("%w (BTC-leg height %d; nothing of ours was spent)", err, btcLegH)
+	}
+
+	// 2c. RE-VERIFY THE BTC LEG. The wait above can be long, and a BTC HTLC that
+	// was confirmed when we checked can be GONE by the time it ends: a one-block
+	// parent reorg lets the taker double-spend the input it funded with. Funding
+	// our asset leg against a dead BTC leg is the whole fund-loss case this file
+	// exists to prevent, so the full verification runs again — same txid, vout,
+	// amount, script, locktime, confirmations — immediately before LockSEQLeg. A
+	// changed height means the leg was re-mined, which also invalidates the anchor
+	// precondition we just satisfied, so that is a refusal too (fail closed; the
+	// taker refunds at T_btc and nothing of ours moved).
+	recheckBtc, err := ops.VerifyBTCLeg(hashH, makerBtcClaim.PubKey(), takerBtcRefundPub, script,
+		btcLocktime, funded.Leg.Txid, funded.Leg.Vout, funded.Leg.Amount, p.MinBTCConf)
+	if err != nil {
+		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg no longer verifies; asset leg not funded")
+		return res, fmt.Errorf("%w: re-verifying %s after the anchor wait: %v (nothing of ours was spent)",
+			ErrBtcLegChanged, funded.Leg.Txid, err)
+	}
+	if recheckBtc.Height != verifiedBtc.Height {
+		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg moved to a different block; asset leg not funded")
+		return res, fmt.Errorf("%w: %s was at height %d, now %d (nothing of ours was spent)",
+			ErrBtcLegChanged, funded.Leg.Txid, verifiedBtc.Height, recheckBtc.Height)
+	}
+	// 2d. And the timelock re-check, read at the last possible moment: the wait
+	// may have consumed the claim window right at its boundary.
+	if werr := window.check(ops); werr != nil {
+		sendXcFail(p.Crypter, send, "seq_window_closed", "the asset leg's claim window has run down; asset leg not funded")
+		return res, fmt.Errorf("%w (nothing of ours was spent)", werr)
+	}
+
 	// 3. Lock the SEQ leg and announce it with its anchor evidence. A funded-
 	// but-unconfirmed lock (LockSEQLeg's ~3 min budget on a stalled chain) is
 	// NOT abandoned: the leg is persisted and its confirming block polled out,
@@ -873,32 +1410,72 @@ func RunMakerForward(p MakerForwardParams, in <-chan []byte, send XcSend) (*Make
 	if p.OnUpdate != nil {
 		p.OnUpdate(res)
 	}
-	anchorH, err := ops.SeqAnchorHeightOf(seqBlockHash)
-	if err != nil {
-		// Non-fatal for the announcement: the taker re-checks via its own node.
-		anchorH = 0
+	// POST-FUNDING CHECK: does the block that actually confirmed our funding
+	// satisfy the taker's gate? The precondition above makes it true by
+	// construction on the honest path, but a Sequentia reorg can still land the
+	// funding on a lower-anchored branch. If it did we withhold the announcement
+	// and let the T_seq refund recover the leg.
+	//
+	// WHAT WITHHOLDING BUYS US — and what it does NOT. It is a COURTESY, not a
+	// guarantee: the taker minted the secret and holds MakerRefundPub, so it can
+	// rebuild this exact redeem script and find its P2SH on chain without any
+	// message from us. Withholding only spares an HONEST taker a doomed claim (and
+	// tells it plainly, via the XcFail, not to try). The ACTUAL defence against an
+	// under-anchored asset leg is the PRE-FUNDING precondition at 2b — we do not
+	// commit the asset until our anchor has passed the BTC-leg height — plus the
+	// taker's own claimant gate, which refuses the leg on its own node's reading.
+	// Never treat this branch as if it stopped anybody from claiming.
+	//
+	// The confirming block is RE-DERIVED here rather than reusing the one from the
+	// lock: a reorg between funding and now would leave the cached hash pointing at
+	// an orphan, whose header commits nothing. A transient RPC hiccup is polled out
+	// so we do not abandon a good leg.
+	anchorH := int64(0)
+	var aerr error
+	for i := 0; i < 6; i++ {
+		if bh, berr := ops.SeqBlockHashOfTx(seqLeg.Funded.TxID); berr == nil && bh != "" {
+			seqBlockHash = bh
+		}
+		if onChain, cerr := ops.SeqBlockOnActiveChain(seqBlockHash); cerr != nil || !onChain {
+			aerr = fmt.Errorf("block %s is not on the active chain (cerr %v)", seqBlockHash, cerr)
+			time.Sleep(p.Timing.Poll)
+			continue
+		}
+		if anchorH, aerr = ops.SeqAnchorHeightOf(seqBlockHash); aerr == nil {
+			break
+		}
+		time.Sleep(p.Timing.Poll)
 	}
-	lockedMsg := &XcMsg{
-		Type: XcSeqLegLocked,
-		Leg: &XcLeg{
-			Txid:         seqLeg.Funded.TxID,
-			Vout:         seqLeg.Funded.Vout,
-			Amount:       seqLeg.Funded.Amount,
-			Asset:        seqLeg.Funded.AssetID,
-			RedeemScript: hex.EncodeToString(seqLeg.Script),
-			Locktime:     seqLocktime,
-			BlockHash:    seqBlockHash,
-			AnchorHeight: anchorH,
-		},
+	res.SeqBlockHash = seqBlockHash
+	if aerr != nil || anchorH < btcLegH {
+		p.logf("NOT announcing the SEQ leg: its block %s anchors at %d (read err %v), below the BTC-leg height %d; "+
+			"a Sequentia reorg landed the funding on a lower-anchored branch. An honest taker will not claim it; refunding after T_seq %d.",
+			seqBlockHash, anchorH, aerr, btcLegH, seqLocktime)
+		sendXcFail(p.Crypter, send, "seq_leg_underanchored",
+			"our asset leg confirmed under-anchored; do NOT claim it (we refund it after T_seq); refund your BTC after T_btc")
+	} else {
+		lockedMsg := &XcMsg{
+			Type: XcSeqLegLocked,
+			Leg: &XcLeg{
+				Txid:         seqLeg.Funded.TxID,
+				Vout:         seqLeg.Funded.Vout,
+				Amount:       seqLeg.Funded.Amount,
+				Asset:        seqLeg.Funded.AssetID,
+				RedeemScript: hex.EncodeToString(seqLeg.Script),
+				Locktime:     seqLocktime,
+				BlockHash:    seqBlockHash,
+				AnchorHeight: anchorH,
+			},
+		}
+		if err := sendXc(lockedMsg, p.Crypter, send); err != nil {
+			// The SEQ leg is on-chain: from here the session must end in claim or
+			// refund regardless of courier health, so a failed announce is logged,
+			// not fatal. The taker most likely never learns the leg and never
+			// claims; the T_seq refund below then recovers it automatically.
+			p.logf("seq_leg_locked announce failed (%v); continuing to watch on-chain", err)
+		}
+		p.logf("SEQ leg locked: %s in block %s (anchor %d >= BTC-leg height %d)", seqLeg.Funded.TxID, seqBlockHash, anchorH, btcLegH)
 	}
-	if err := sendXc(lockedMsg, p.Crypter, send); err != nil {
-		// The SEQ leg is on-chain: from here the session must end in claim or
-		// refund regardless of courier health, so a failed announce is logged,
-		// not fatal. The taker most likely never learns the leg and never
-		// claims; the T_seq refund below then recovers it automatically.
-		p.logf("seq_leg_locked announce failed (%v); continuing to watch on-chain", err)
-	}
-	p.logf("SEQ leg locked: %s in block %s (anchor %d)", seqLeg.Funded.TxID, seqBlockHash, anchorH)
 
 	// 4. Watch for the taker's claim (which reveals the secret) and redeem the
 	// BTC leg — or refund the SEQ leg once T_seq passes without a claim. This

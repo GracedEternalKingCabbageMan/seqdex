@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +53,59 @@ type fakeChainState struct {
 	seqClaimedBy []byte // secret revealed by a SEQ claim (extracted by WatchSEQClaim)
 	seqRefunded  bool
 	makerSecret  []byte // reverse: the secret the maker minted (the taker derives its hash from it)
+
+	// --- anchor model (mirrors the node's two DISTINCT anchor readings) ---
+	// seqAnchorTip is the LIVE anchor view (getanchorstatus): it ADVANCES. 0 means
+	// "caught up with the parent tip", which is what every pre-existing fixture
+	// assumed, so those keep passing untouched.
+	seqAnchorTip    int64
+	seqAnchorStatus string // "" => "ok"
+	// legBlockAnchor is the anchor COMMITTED by the block that confirmed the SEQ
+	// leg. Captured from the live view at funding time and IMMUTABLE afterwards,
+	// exactly like a CBlockHeader's m_anchor_height — this is what makes a
+	// post-funding wait futile.
+	legBlockAnchor int64
+	seqFundCalls   int   // how many times the asset leg was actually funded
+	btcLegHeight   int64 // height at which the BTC HTLC confirmed (0 => btcTip)
+	btcLegGone     bool  // the BTC HTLC was double-spent / reorged out: VerifyBTCLeg now fails
+	seqBlockOrphan bool  // the block holding the asset leg is no longer on the active chain
+}
+
+// confirmBtcLegLocked models a BTC HTLC confirming AND the parent chain moving on
+// by one block, which is the ordinary case: a leg confirms in the block that was
+// the tip, and the next block arrives shortly after. Modelling that matters now
+// that the asset funder waits for its anchor to reach legHeight+1 — with a parent
+// chain frozen at exactly the leg's own height that target is unreachable by
+// construction, which is a property of the fixture, not of the protocol.
+// Call with st.mu held.
+func (s *fakeChainState) confirmBtcLegLocked(txid string) {
+	if s.btcLegHeight == 0 {
+		s.btcLegHeight = s.btcTip // it confirmed in what was the tip
+		s.btcTip++                // and the parent chain moved on
+	}
+	s.btcConfs[txid] = int(s.btcTip - s.btcLegHeight + 1)
+}
+
+// anchorTipLocked is the node's live anchor view; call with st.mu held.
+func (s *fakeChainState) anchorTipLocked() int64 {
+	if s.seqAnchorTip > 0 {
+		return s.seqAnchorTip
+	}
+	return s.btcTip
+}
+
+func (s *fakeChainState) anchorStatusLocked() string {
+	if s.seqAnchorStatus == "" {
+		return "ok"
+	}
+	return s.seqAnchorStatus
+}
+
+func (s *fakeChainState) btcLegHeightLocked() int64 {
+	if s.btcLegHeight > 0 {
+		return s.btcLegHeight
+	}
+	return s.btcTip
 }
 
 // fakeOps implements XcOps for one side over the shared state.
@@ -59,6 +113,13 @@ type fakeOps struct {
 	st            *fakeChainState
 	hashH         []byte
 	secretForTest []byte // taker side: preimage exposed by ClaimSEQLeg
+
+	// Per-SIDE lies: each party reads its OWN node, so a test can make one side's
+	// node report a rosier anchor than the chain really committed.
+	lieAnchorTip     bool // SeqAnchorTip always reports "caught up"
+	lieBlockAnchor   bool // SeqAnchorHeightOf always reports "caught up"
+	seqLegSafeCalls  int  // how many times this side ran the claimant's gate
+	seqLegSafeCallMu sync.Mutex
 }
 
 func (f *fakeOps) BtcTip() (int64, error) {
@@ -74,7 +135,7 @@ func (f *fakeOps) BtcConfirmations(txid string) (int, error) {
 func (f *fakeOps) LockBTCLeg(claimPub, refundPub []byte, amountCoins string, locktime uint32) (*xchain.LegLock, int64, error) {
 	// Live-net semantics: broadcast only, Hp=0; a "confirmation" appears shortly.
 	f.st.mu.Lock()
-	f.st.btcConfs["btc-htlc"] = 1 // instant single conf for the test
+	f.st.confirmBtcLegLocked("btc-htlc")
 	f.st.mu.Unlock()
 	script := fakeScript("btc", f.hashH, claimPub, refundPub, locktime)
 	return &xchain.LegLock{
@@ -91,12 +152,22 @@ func (f *fakeOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, providedScr
 	}
 	f.st.mu.Lock()
 	confs := f.st.btcConfs[txid]
+	legHeight := f.st.btcLegHeightLocked()
+	gone := f.st.btcLegGone
 	f.st.mu.Unlock()
+	if gone {
+		// Double-spent / reorged out: the funding output the HTLC lived on is no
+		// longer there. This is what a counterparty's one-block parent reorg looks
+		// like to the asset funder, and it MUST stop the funding.
+		return nil, fmt.Errorf("%w: funding tx %s is not on chain any more", xchain.ErrBTCLegInvalid, txid)
+	}
 	if confs < minConf {
 		return nil, errors.New("btc leg unconfirmed")
 	}
 	return &xchain.VerifiedBTCLeg{
-		Leg: &xchain.LegLock{Script: providedScript, Funded: &xchain.FundedHTLC{TxID: txid, Vout: vout, Amount: amount}, Locktime: btcLocktime},
+		Leg:           &xchain.LegLock{Script: providedScript, Funded: &xchain.FundedHTLC{TxID: txid, Vout: vout, Amount: amount}, Locktime: btcLocktime},
+		Height:        legHeight,
+		Confirmations: confs,
 	}, nil
 }
 func (f *fakeOps) ClaimBTCLeg(leg *xchain.LegLock, key *xchain.Key, fee uint64) (string, error) {
@@ -110,10 +181,49 @@ func (f *fakeOps) SeqTip() (int64, error) {
 	defer f.st.mu.Unlock()
 	return f.st.seqTip, nil
 }
-func (f *fakeOps) SeqAnchorHeightOf(blockHash string) (int64, error) { return f.st.btcTip, nil }
-func (f *fakeOps) SeqBlockHashOfTx(txid string) (string, error)      { return "seq-block-hash", nil }
-func (f *fakeOps) SeqFeeRate(assetHex string) (uint64, bool)         { return 50_000_000_000, true }
+
+// SeqAnchorHeightOf is the COMMITTED per-block value: whatever the live anchor
+// view was when the leg was funded, frozen from then on.
+func (f *fakeOps) SeqAnchorHeightOf(blockHash string) (int64, error) {
+	f.st.mu.Lock()
+	defer f.st.mu.Unlock()
+	if f.lieBlockAnchor {
+		return f.st.btcLegHeightLocked(), nil
+	}
+	if f.st.legBlockAnchor > 0 {
+		return f.st.legBlockAnchor, nil
+	}
+	return f.st.anchorTipLocked(), nil
+}
+
+// SeqAnchorTip is the LIVE view: it advances as the committee anchors forward.
+// The lie reports COMFORTABLY caught up — past the funder's legHeight+1 target —
+// so a test can make one side fund while the chain really commits a lower anchor.
+func (f *fakeOps) SeqAnchorTip() (int64, string, error) {
+	f.st.mu.Lock()
+	defer f.st.mu.Unlock()
+	if f.lieAnchorTip {
+		return f.st.btcLegHeightLocked() + 64, "ok", nil
+	}
+	return f.st.anchorTipLocked(), f.st.anchorStatusLocked(), nil
+}
+func (f *fakeOps) SeqBlockHashOfTx(txid string) (string, error) { return "seq-block-hash", nil }
+
+// SeqBlockOnActiveChain: getblockheader answers for orphans too, so the gate has
+// to ask this separately. seqBlockOrphan models the leg's block being disconnected.
+func (f *fakeOps) SeqBlockOnActiveChain(blockHash string) (bool, error) {
+	f.st.mu.Lock()
+	defer f.st.mu.Unlock()
+	return !f.st.seqBlockOrphan, nil
+}
+func (f *fakeOps) SeqFeeRate(assetHex string) (uint64, bool) { return 50_000_000_000, true }
 func (f *fakeOps) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*xchain.LegLock, string, error) {
+	// Funding COMMITS the node's current anchor view into the confirming block's
+	// header. From here that number is immutable for this block hash.
+	f.st.mu.Lock()
+	f.st.seqFundCalls++
+	f.st.legBlockAnchor = f.st.anchorTipLocked()
+	f.st.mu.Unlock()
 	script := fakeScript("seq", f.hashH, claimPub, refundPub, locktime)
 	return &xchain.LegLock{
 		Script:   script,
@@ -132,8 +242,40 @@ func (f *fakeOps) VerifySEQLeg(hashH, claimPub, refundPub, providedScript []byte
 		BlockHash: "seq-block-hash", // self-derived confirming block (the anchor gate must use THIS, not courier data)
 	}, nil
 }
+
+// VerifySeqLegSafe mirrors pkg/xchain's real predicate, including WHICH conjunct
+// failed: the ordering term reads the leg block's COMMITTED anchor, so it can
+// never clear by waiting (ErrAnchorOrderingTerminal); a bad anchorstatus can.
 func (f *fakeOps) VerifySeqLegSafe(seqBlockHash string, btcLegHeight int64) (*xchain.AnchorEvidence, error) {
-	return &xchain.AnchorEvidence{BTCLegHeight: btcLegHeight, SeqBlockHash: seqBlockHash, OK: true}, nil
+	f.seqLegSafeCallMu.Lock()
+	f.seqLegSafeCalls++
+	f.seqLegSafeCallMu.Unlock()
+	anchor, _ := f.SeqAnchorHeightOf(seqBlockHash)
+	f.st.mu.Lock()
+	status := f.st.anchorStatusLocked()
+	f.st.mu.Unlock()
+	ev := &xchain.AnchorEvidence{
+		BTCLegHeight:   btcLegHeight,
+		SeqBlockHash:   seqBlockHash,
+		SeqBlockAnchor: anchor,
+		AnchorStatus:   status,
+		OK:             anchor >= btcLegHeight && status == "ok",
+	}
+	if !ev.OK {
+		sentinel := xchain.ErrAnchorOrdering
+		if anchor < btcLegHeight {
+			sentinel = xchain.ErrAnchorOrderingTerminal
+		}
+		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, anchorstatus=%q)",
+			sentinel, seqBlockHash, anchor, btcLegHeight, status)
+	}
+	return ev, nil
+}
+
+func (f *fakeOps) seqLegSafeCallCount() int {
+	f.seqLegSafeCallMu.Lock()
+	defer f.seqLegSafeCallMu.Unlock()
+	return f.seqLegSafeCalls
 }
 func (f *fakeOps) ClaimSEQLeg(leg *xchain.LegLock, key *xchain.Key, fee uint64) (string, error) {
 	// The claim reveals the secret "on-chain": expose it to the shared state so
@@ -329,12 +471,13 @@ func TestForwardMakerRefundsWithoutClaim(t *testing.T) {
 		makerClaim, _ := hex.DecodeString(terms.MakerBtcClaimPub)
 		hashH := sha256.Sum256(tp.Secret)
 		st.mu.Lock()
-		st.btcConfs["btc-htlc"] = 1
+		st.confirmBtcLegLocked("btc-htlc")
+		legH := st.btcLegHeightLocked()
 		st.mu.Unlock()
 		leg := &XcLeg{
 			Txid: "btc-htlc", Vout: 0, Amount: terms.BtcAmount,
 			RedeemScript: hex.EncodeToString(fakeScript("btc", hashH[:], makerClaim, tp.BtcRefundKey.PubKey(), terms.BtcLocktime)),
-			Locktime:     terms.BtcLocktime, Height: 1000,
+			Locktime:     terms.BtcLocktime, Height: legH,
 		}
 		_ = sendXc(&XcMsg{
 			Type: XcBtcLegFunded, HashH: hex.EncodeToString(hashH[:]),
@@ -434,7 +577,8 @@ func TestForwardMakerRejectsWrongBtcAmount(t *testing.T) {
 	makerClaim, _ := hex.DecodeString(terms.MakerBtcClaimPub)
 	hashH := sha256.Sum256(tp.Secret)
 	st.mu.Lock()
-	st.btcConfs["btc-htlc"] = 1
+	st.confirmBtcLegLocked("btc-htlc")
+	legH := st.btcLegHeightLocked()
 	st.mu.Unlock()
 	// Announce a leg whose amount is 1 sat short of terms.
 	_ = sendXc(&XcMsg{
@@ -444,7 +588,7 @@ func TestForwardMakerRejectsWrongBtcAmount(t *testing.T) {
 		Leg: &XcLeg{
 			Txid: "btc-htlc", Vout: 0, Amount: terms.BtcAmount - 1,
 			RedeemScript: hex.EncodeToString(fakeScript("btc", hashH[:], makerClaim, tp.BtcRefundKey.PubKey(), terms.BtcLocktime)),
-			Locktime:     terms.BtcLocktime, Height: 1000,
+			Locktime:     terms.BtcLocktime, Height: legH,
 		},
 	}, tp.Crypter, net.takerSend)
 	wg.Wait()
@@ -479,14 +623,24 @@ func TestForwardTakerRejectsWrongSeqLeg(t *testing.T) {
 }
 
 func TestForwardTakerAbortsOnAnchorGateFailure(t *testing.T) {
-	_, net, tp, mp := forwardFixture(t)
+	st, net, tp, mp := forwardFixture(t)
 	failing := &anchorFailOps{fakeOps: tp.Ops.(*fakeOps)}
 	tp.Ops = failing
-	tp.Timing.AnchorWait = 100 * time.Millisecond
+
+	// The gate is bounded by the TIMELOCK, not by a wall clock (round-2 item 2),
+	// so what ends a persistently failing gate is the SEQ chain advancing into the
+	// claim margin — exactly what would end it in production. Driving the tip
+	// forward is what makes this terminate; AnchorWait no longer has any say.
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		st.mu.Lock()
+		st.seqTip = 1 << 30
+		st.mu.Unlock()
+	}()
 
 	go func() { _, _ = RunMakerForward(mp, net.toMaker, net.makerSend) }()
 	res, err := RunTakerForward(tp, net.takerSend, net.takerRecv)
-	if err == nil || !strings.Contains(err.Error(), "anchor gate not passed") {
+	if err == nil || !strings.Contains(err.Error(), "anchor gate did not pass") {
 		t.Fatalf("want anchor-gate abort, got %v", err)
 	}
 	if res.SeqClaimTxid != "" {
