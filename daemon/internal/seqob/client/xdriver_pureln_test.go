@@ -257,3 +257,167 @@ func TestPureLNSellHandshake(t *testing.T) {
 		t.Fatalf("sell: taker should have minted a BTC invoice for %d, got %d", btcMsat, st.invoiceMsat)
 	}
 }
+
+// --- PARTIAL FILLS on the pure-LN rail ----------------------------------------
+
+// TestPureLNBuyPartialFill closes the last rail without partial fills. XcPlnTermsRequest
+// carried NO FIELDS, so the maker advertised and settled the WHOLE offer on every lift —
+// the same protocol gap the submarine rail had, and the reason an ln/ln take could not be
+// presented like the others even once the book was unified.
+func TestPureLNBuyPartialFill(t *testing.T) {
+	st := &plnState{}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const wholeAsset = uint64(1_000_000_000)
+	const wholeBtc = uint64(2_000_000)
+	const take = wholeAsset / 4
+	// BUY: the taker receives the asset and GIVES BTC, so the BTC side floors.
+	const wantBtc = wholeBtc / 4
+
+	var makerRes *MakerPlnResult
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, makerErr = RunMakerPureLNBuy(MakerPlnParams{
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  wholeAsset,
+			BtcAmtMsat:  wholeBtc,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerPureLNBuy(TakerPlnParams{
+		Ops:         &fakePlnTakerOps{st: st},
+		Crypter:     tc,
+		SeqAmtMsat:  wholeAsset,
+		BtcAmtMsat:  wholeBtc,
+		TakeSeqMsat: take,
+		Timing:      XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if makerErr != nil {
+		t.Fatalf("maker: %v", makerErr)
+	}
+	if takerRes.FilledSeqMsat != take || takerRes.FilledBtcMsat != wantBtc {
+		t.Fatalf("taker filled %d asset / %d btc, want %d / %d",
+			takerRes.FilledSeqMsat, takerRes.FilledBtcMsat, take, wantBtc)
+	}
+	if makerRes.FilledSeqMsat != take {
+		t.Fatalf("maker settled %d, want the %d slice (it used to settle the whole offer)",
+			makerRes.FilledSeqMsat, take)
+	}
+	if makerRes.RemainderSeqMsat != wholeAsset-take {
+		t.Fatalf("remainder %d, want %d — the caller re-rests this",
+			makerRes.RemainderSeqMsat, wholeAsset-take)
+	}
+	if !makerRes.Settled {
+		t.Fatalf("partial did not settle: %+v", makerRes)
+	}
+	if hex.EncodeToString(makerRes.Preimage) != hex.EncodeToString(takerRes.Preimage) {
+		t.Fatalf("preimage mismatch on a partial: maker %x taker %x", makerRes.Preimage, takerRes.Preimage)
+	}
+}
+
+// A whole lift is unchanged, so an older taker sending an empty terms request still
+// settles exactly as before.
+func TestPureLNWholeLiftIsUnchanged(t *testing.T) {
+	st := &plnState{}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const wholeAsset = uint64(1_000_000_000)
+	const wholeBtc = uint64(2_000_000)
+
+	var makerRes *MakerPlnResult
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, _ = RunMakerPureLNBuy(MakerPlnParams{
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  wholeAsset,
+			BtcAmtMsat:  wholeBtc,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerPureLNBuy(TakerPlnParams{
+		Ops:        &fakePlnTakerOps{st: st},
+		Crypter:    tc,
+		SeqAmtMsat: wholeAsset,
+		BtcAmtMsat: wholeBtc,
+		// TakeSeqMsat deliberately unset.
+		Timing: XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if takerRes.FilledSeqMsat != wholeAsset || takerRes.FilledBtcMsat != wholeBtc {
+		t.Fatalf("whole lift changed shape: %+v", takerRes)
+	}
+	if makerRes.RemainderSeqMsat != 0 {
+		t.Fatalf("a whole lift must leave no remainder, got %d", makerRes.RemainderSeqMsat)
+	}
+}
+
+// SELL rounds the BTC side the other way: the taker GIVES the asset and RECEIVES
+// BTC, so the BTC it receives ceils — the mirror of BUY, and in each side's favour.
+func TestPureLNSellPartialRoundsTheOtherWay(t *testing.T) {
+	st := &plnState{}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	// Deliberately not divisible, so floor and ceil differ.
+	const wholeAsset = uint64(3_000_000)
+	const wholeBtc = uint64(1_000_001)
+	const take = wholeAsset / 3
+	const wantBtc = uint64(333_334) // ceil(1000001/3)
+
+	var makerRes *MakerPlnResult
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, _ = RunMakerPureLNSell(MakerPlnParams{
+			NewMakerOps: func() PlnMakerOps { return &fakePlnMakerOps{st: st} },
+			Crypter:     mc,
+			SeqAmtMsat:  wholeAsset,
+			BtcAmtMsat:  wholeBtc,
+			HoldTimeout: 3 * time.Second,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerPureLNSell(TakerPlnParams{
+		Ops:         &fakePlnTakerOps{st: st},
+		Crypter:     tc,
+		SeqAmtMsat:  wholeAsset,
+		BtcAmtMsat:  wholeBtc,
+		TakeSeqMsat: take,
+		Timing:      XcTiming{TermsWait: 2 * time.Second, SeqLockWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if takerRes.FilledBtcMsat != wantBtc {
+		t.Fatalf("SELL priced the slice at %d msat, want the ceil %d", takerRes.FilledBtcMsat, wantBtc)
+	}
+	if makerRes.FilledBtcMsat != wantBtc {
+		t.Fatalf("maker and taker disagree on the slice price: %d vs %d", makerRes.FilledBtcMsat, wantBtc)
+	}
+}

@@ -42,6 +42,7 @@ func cmdXPln(args []string) {
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg) (required)")
 	btcAsset := fs.String("btc-asset", "", "counter-leg SETTLEMENT asset id (hex); empty = policy asset / real BTC-LN. Set to route the counter leg over a 2nd issued asset (asset<->asset). MUST match the maker")
 	quoteAssetFlag := fs.String("quote-asset", "", "QUOTE asset id (hex) of the market; empty = the BTC sentinel (asset<->BTC). Set to a real asset id for an asset<->asset market. Numeraire on the QUOTE side to match the maker + the wallet's canonicalPair (e.g. -asset OILX -quote-asset EURX, i.e. OILX priced in EURX); defaults -btc-asset to it")
+	takeSeq := fs.Uint64("take-asset-msat", 0, "PARTIAL FILL: asset-side slice to take, in msat. 0 = the whole offer (the classic lift). The BTC side is derived from the signed offer's ratio and required exactly, so the maker cannot re-price the slice")
 	finalCltv := fs.Uint("final-cltv", 18, "final-hop cltv delta when paying the maker's hold")
 	termsWait := fs.Duration("terms-wait", 2*time.Minute, "max wait for the maker's terms")
 	holdWait := fs.Duration("hold-wait", 2*time.Minute, "max wait for the maker to register its hold after we send the invoice")
@@ -190,24 +191,31 @@ func cmdXPln(args []string) {
 	}
 
 	res, err := client.RunTakerPureLN(client.TakerPlnParams{
-		Direction:  dir,
-		Ops:        ops,
-		Crypter:    crypter,
-		BtcAmtMsat: btcMsat,
-		SeqAmtMsat: seqMsat,
-		FinalCltv:  uint32(*finalCltv),
-		Timing:     client.XcTiming{TermsWait: *termsWait, SeqLockWait: *holdWait},
-		Log:        func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
+		Direction:   dir,
+		Ops:         ops,
+		Crypter:     crypter,
+		BtcAmtMsat:  btcMsat,
+		SeqAmtMsat:  seqMsat,
+		TakeSeqMsat: *takeSeq,
+		FinalCltv:   uint32(*finalCltv),
+		Timing:      client.XcTiming{TermsWait: *termsWait, SeqLockWait: *holdWait},
+		Log:         func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
 	}, send, recv)
 	if err != nil {
 		fmt.Printf("pure-LN swap ended: %v\n", err)
 		return
 	}
+	// Report what actually SETTLED, not the offer's headline size: with a partial
+	// fill those differ, and printing the offer would overstate the trade.
+	filledAtoms, filledSats := res.FilledSeqMsat/1000, res.FilledBtcMsat/1000
+	verb := "sold"
 	if side == "buy" {
-		fmt.Printf("PURE-LN SWAP SETTLED: bought %d %s for %d BTC sats over Lightning; preimage %s\n",
-			assetAtoms, *asset, btcSats, hex.EncodeToString(res.Preimage))
-	} else {
-		fmt.Printf("PURE-LN SWAP SETTLED: sold %d %s for %d BTC sats over Lightning; preimage %s\n",
-			assetAtoms, *asset, btcSats, hex.EncodeToString(res.Preimage))
+		verb = "bought"
+	}
+	fmt.Printf("PURE-LN SWAP SETTLED: %s %d %s for %d BTC sats over Lightning; preimage %s\n",
+		verb, filledAtoms, *asset, filledSats, hex.EncodeToString(res.Preimage))
+	if filledAtoms < assetAtoms {
+		fmt.Printf("  PARTIAL fill: %d of the offer's %d atoms; %d remain resting\n",
+			filledAtoms, assetAtoms, assetAtoms-filledAtoms)
 	}
 }
