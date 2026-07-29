@@ -58,11 +58,6 @@ type ServiceOptsOnePort struct {
 
 	ConnectAddr  string
 	ConnectProto string
-
-	// XchainService, when non-nil, is the integrated cross-chain swap maker.
-	// It is registered on the same multiplexed listener as TradeService (gRPC +
-	// grpc-web + grpc-gateway REST with permissive CORS).
-	XchainService seqdexv1.XchainServiceServer
 }
 
 func (o ServiceOptsOnePort) validate() error {
@@ -390,18 +385,6 @@ func (s *serviceOnePort) newServer(
 			ctx, gwmux, conn,
 		); err != nil {
 			return nil, err
-		}
-
-		// Cross-chain swap maker, folded onto the same listener so one daemon
-		// endpoint serves Trade + Xchain over gRPC / grpc-web / REST.
-		if s.opts.XchainService != nil {
-			seqdexv1.RegisterXchainServiceServer(grpcServer, s.opts.XchainService)
-			if err := seqdexv1.RegisterXchainServiceHandler(
-				ctx, gwmux, conn,
-			); err != nil {
-				return nil, err
-			}
-			log.Info("cross-chain xchain interface registered on the daemon listener")
 		}
 	}
 	grpcGateway := http.Handler(gwmux)
