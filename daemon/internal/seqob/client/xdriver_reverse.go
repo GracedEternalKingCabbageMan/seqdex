@@ -127,8 +127,23 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if p.BtcClaimMargin == 0 {
 		p.BtcClaimMargin = 6
 	}
-	if p.MinBTCConf <= 0 {
-		p.MinBTCConf = 1
+	// 0 IS A REAL CHOICE — accept the counterparty's BTC HTLC straight from the
+	// mempool. It used to be coerced to 1, which made "instant" inexpressible and
+	// forced a Bitcoin confirmation into every rail-crossing take: a taker paying
+	// over Lightning against a best-priced on-chain maker waited ~10 minutes for a
+	// block, even though its own Lightning payment was already held.
+	//
+	// The user's price should never cost them latency. Rail-blind matching means the
+	// best-priced offer wins whatever rail it rests on, and the bridge is supposed to
+	// absorb the difference — not pass a block time back to the taker.
+	//
+	// The trade-off is explicit: at 0 the maker takes double-spend risk on the
+	// counterparty's funding tx. That is bounded here because the bridge counterparty
+	// is the LSP, which is already holding the taker's Lightning payment when it
+	// funds, so it gains nothing by double-spending itself. Raise this for a maker
+	// that faces anonymous takers or real value.
+	if p.MinBTCConf < 0 {
+		p.MinBTCConf = 0
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
@@ -586,8 +601,23 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 	if p.SeqLocktimeDelta == 0 {
 		p.SeqLocktimeDelta = 240
 	}
-	if p.MinBTCConf <= 0 {
-		p.MinBTCConf = 1
+	// 0 IS A REAL CHOICE — accept the counterparty's BTC HTLC straight from the
+	// mempool. It used to be coerced to 1, which made "instant" inexpressible and
+	// forced a Bitcoin confirmation into every rail-crossing take: a taker paying
+	// over Lightning against a best-priced on-chain maker waited ~10 minutes for a
+	// block, even though its own Lightning payment was already held.
+	//
+	// The user's price should never cost them latency. Rail-blind matching means the
+	// best-priced offer wins whatever rail it rests on, and the bridge is supposed to
+	// absorb the difference — not pass a block time back to the taker.
+	//
+	// The trade-off is explicit: at 0 the maker takes double-spend risk on the
+	// counterparty's funding tx. That is bounded here because the bridge counterparty
+	// is the LSP, which is already holding the taker's Lightning payment when it
+	// funds, so it gains nothing by double-spending itself. Raise this for a maker
+	// that faces anonymous takers or real value.
+	if p.MinBTCConf < 0 {
+		p.MinBTCConf = 0
 	}
 	if p.SeqClaimMargin == 0 {
 		p.SeqClaimMargin = 10
@@ -889,8 +919,23 @@ func ResumeMakerReverse(p MakerReverseResumeParams) (*MakerReverseResult, error)
 	if p.Ctx == nil {
 		p.Ctx = context.Background()
 	}
-	if p.MinBTCConf <= 0 {
-		p.MinBTCConf = 1
+	// 0 IS A REAL CHOICE — accept the counterparty's BTC HTLC straight from the
+	// mempool. It used to be coerced to 1, which made "instant" inexpressible and
+	// forced a Bitcoin confirmation into every rail-crossing take: a taker paying
+	// over Lightning against a best-priced on-chain maker waited ~10 minutes for a
+	// block, even though its own Lightning payment was already held.
+	//
+	// The user's price should never cost them latency. Rail-blind matching means the
+	// best-priced offer wins whatever rail it rests on, and the bridge is supposed to
+	// absorb the difference — not pass a block time back to the taker.
+	//
+	// The trade-off is explicit: at 0 the maker takes double-spend risk on the
+	// counterparty's funding tx. That is bounded here because the bridge counterparty
+	// is the LSP, which is already holding the taker's Lightning payment when it
+	// funds, so it gains nothing by double-spending itself. Raise this for a maker
+	// that faces anonymous takers or real value.
+	if p.MinBTCConf < 0 {
+		p.MinBTCConf = 0
 	}
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
