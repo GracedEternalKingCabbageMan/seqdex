@@ -187,7 +187,58 @@ func (s *Server) closeConn(c *wsConn) {
 	for _, pubkey := range s.makerConns.drop(c) {
 		s.store.RemoveByMaker(pubkey)
 	}
+	s.releaseAbandonedLifts(c)
 	c.conn.Close()
+}
+
+// takerReattachGrace is how long an abandoned lift session is held open for the taker
+// to come back (P3.8 re-attach) before it is aborted and the offer's lift slot freed.
+var takerReattachGrace = 45 * time.Second
+
+// releaseAbandonedLifts aborts the lift sessions whose TAKER just disconnected and did
+// not come back.
+//
+// An offer has ONE lift slot, held for as long as its session is live, and a cross
+// session's co-sign deadline is measured in HOURS because it spans real parent-chain
+// confirmations. Nothing released that slot when the taker simply went away — a failed
+// take, a closed tab, a page reload — so one abandoned attempt made the offer answer
+// every subsequent taker with "offer has a lift in progress; retry when it frees" for
+// the rest of that deadline. In a book being probed by real users that poisons offers
+// faster than the makers re-quote them, and the book looks full while being unusable.
+//
+// Router.Abort already exists for exactly this ("maker refused / taker bailed") and
+// re-opens the order; it was simply never called on a disconnect.
+//
+// The grace period is what keeps this compatible with re-attach: a taker mid-swap with
+// funds committed MUST be able to reconnect, and attach() overwrites the recorded
+// connection when it does, so a returning taker is never aborted out from under.
+func (s *Server) releaseAbandonedLifts(c *wsConn) {
+	c.mu.Lock()
+	ids := make([]string, 0, len(c.roles))
+	for sid, role := range c.roles {
+		if role == session.RoleTaker {
+			ids = append(ids, sid)
+		}
+	}
+	c.mu.Unlock()
+	for _, sid := range ids {
+		go func(sid string) {
+			time.Sleep(takerReattachGrace)
+			s.takerMu.Lock()
+			cur, ok := s.takerConns[sid]
+			if ok && cur == c {
+				delete(s.takerConns, sid)
+			}
+			s.takerMu.Unlock()
+			if !ok || cur != c {
+				return // the taker re-attached on a new connection; leave it alone
+			}
+			if _, live := s.sessions.Get(sid); !live {
+				return
+			}
+			s.sessions.Abort(sid)
+		}(sid)
+	}
 }
 
 func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
@@ -532,6 +583,13 @@ func (s *Server) attach(c *wsConn, sess *session.Session, role session.Role) {
 	c.mu.Lock()
 	c.roles[sess.ID] = role
 	c.mu.Unlock()
+	if role == session.RoleTaker {
+		// Remember who holds the taker side, so closeConn can tell an ABANDONED lift
+		// from a taker that merely reconnected (P3.8 re-attach overwrites this).
+		s.takerMu.Lock()
+		s.takerConns[sess.ID] = c
+		s.takerMu.Unlock()
+	}
 	go func() {
 		inbox := sess.Inbox(role)
 		for {
