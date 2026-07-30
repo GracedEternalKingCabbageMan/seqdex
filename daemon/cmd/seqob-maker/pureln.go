@@ -70,6 +70,23 @@ func (cfg pureLNMakerConfig) plnDirection() (client.PlnDirection, uint32) {
 // with a pure-LN ln_direction. maker_ln_node_pubkey advertises the maker's HELD
 // leg (the taker pays its hold there); the load-bearing value is re-sent per-lift
 // in the E2E Terms message.
+// plnMsatToBase converts an asset-side msat amount (how the pure-LN driver measures
+// the asset leg) back into the offer's base atoms. The offer's own asset-msat total is
+// the conversion basis, so this stays exact for a whole fill and rounds DOWN for a
+// slice — never claiming more was taken than actually was.
+func plnMsatToBase(o *seqobv1.Offer, seqMsat uint64) uint64 {
+	if seqMsat == 0 {
+		return 0
+	}
+	wholeMsat := o.GetBaseAmount() * 1000
+	if wholeMsat == 0 || seqMsat >= wholeMsat {
+		return o.GetBaseAmount()
+	}
+	// floor(baseAmount * seqMsat / wholeMsat) in 128 bits — a bare uint64 multiply
+	// overflows at these magnitudes. ProportionalBtcFloor is that exact operation.
+	return client.ProportionalBtcFloor(o.GetBaseAmount(), seqMsat, wholeMsat)
+}
+
 func buildPureLNOffer(cfg pureLNMakerConfig, holdLnNodeID string) *seqobv1.Offer {
 	_, lnDir := cfg.plnDirection()
 	// The QUOTE (counter) leg: a real Sequentia asset id for an asset<->asset pure-LN market
@@ -83,7 +100,7 @@ func buildPureLNOffer(cfg pureLNMakerConfig, holdLnNodeID string) *seqobv1.Offer
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: quoteAsset},
 		BaseAmount:        cfg.assetAmt,
-		AllowPartial:      false, // whole-swap lifts, one at a time
+		AllowPartial:      true, // a taker may take a slice; the remainder is re-rested after the fill
 		CreatedAtUnix:     uint64(time.Now().Unix()),
 		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
 		FeeAssetHint:      cfg.feeAsset,
@@ -269,19 +286,48 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 
 			go func(sid string, in chan []byte) {
 				settled := false
+				// A lift may take a SLICE. Both legs are Lightning, so the driver works in
+				// msat; filledSeqMsat is what this lift settled and partial says the offer
+				// still has size left to re-rest.
+				var filledSeqMsat uint64
+				partial := false
 				defer func() {
 					// Record the executed fill FIRST, before requote/cancel touch the still-resting
 					// offer: the relay records the trade (so the asset/BTC pure-LN pair gets a
 					// last_price + chart) and decrements/finalizes the order. Both legs are Lightning,
 					// so there is no settling txid; min_anchor_depth is 0, so the fill finalizes at once.
 					if settled {
-						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), "")
+						fill := plnMsatToBase(o, filledSeqMsat)
+						if fill == 0 {
+							fill = o.GetBaseAmount()
+						}
+						reportSettledTrade(ws, o, cfg.makerKey, fill, "")
 					}
 					// -requote: re-post a fresh quote while still holding the in-flight slot
 					// (racing lifts are refused as "busy" until it is live -> no double-post).
 					// Both legs are Lightning, so reconnect BOTH LN nodes' dropped channel
 					// peers before re-quoting or the next swap's hold/pay cannot route.
-					if settled && cfg.requote {
+					// PARTIAL FILL: re-rest the REMAINDER at the offer's own rate, rather than
+					// re-posting the full size the maker no longer has.
+					if settled && partial {
+						mu.Lock()
+						taken := plnMsatToBase(o, filledSeqMsat)
+						if taken > 0 && taken < o.GetBaseAmount() {
+							remain := o.GetBaseAmount() - taken
+							if o.GetLightning().GetLnDirection() == offer.LnBTCLNForAssetLN {
+								o.WantAmount = client.ProportionalBtc(o.GetWantAmount(), remain, o.GetBaseAmount())
+								o.OfferAmount = remain
+							} else {
+								o.OfferAmount = client.ProportionalBtcFloor(o.GetOfferAmount(), remain, o.GetBaseAmount())
+								o.WantAmount = remain
+							}
+							o.BaseAmount = remain
+							fmt.Printf("session %s: PARTIAL fill (%d of %d atoms); re-resting the remainder %d\n",
+								sid, taken, taken+remain, remain)
+						}
+						mu.Unlock()
+					}
+					if settled && (cfg.requote || partial) {
 						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
 							reconnectPlnPeers(cfg)
 						})
@@ -289,11 +335,11 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled && !cfg.requote {
+					if settled && !cfg.requote && !partial {
 						filled = true
 					}
 					mu.Unlock()
-					if settled && !cfg.requote {
+					if settled && !cfg.requote && !partial {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 					requoteExitIfPending(idle)
@@ -313,7 +359,10 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 					return
 				}
 				settled = res.Settled
-				fmt.Printf("session %s: PURE-LN SWAP SETTLED: both legs off-chain, no anchor wait\n", sid)
+				filledSeqMsat = res.FilledSeqMsat
+				partial = res.RemainderSeqMsat > 0
+				fmt.Printf("session %s: PURE-LN SWAP SETTLED: %d of %d msat asset-side, both legs off-chain, no anchor wait\n",
+					sid, res.FilledSeqMsat, res.FilledSeqMsat+res.RemainderSeqMsat)
 			}(sid, in)
 
 		case from.GetSwapMsg() != nil:
