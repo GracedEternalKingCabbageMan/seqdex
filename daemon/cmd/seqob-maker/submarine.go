@@ -67,7 +67,7 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
 		BaseAmount:        cfg.assetAmt,
-		AllowPartial:      false, // whole-HTLC lifts, one at a time
+		AllowPartial:      true, // a taker may take a slice; the remainder is re-rested after the fill
 		CreatedAtUnix:     uint64(time.Now().Unix()),
 		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
 		FeeAssetHint:      cfg.feeAsset,
@@ -230,19 +230,47 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 			go func(sid string, in chan []byte) {
 				settled := false
 				var settleTxid string
+				// A lift may take a SLICE. filledSeq is what this one settled; partial says
+				// the offer still has size left, which we re-rest rather than retiring.
+				var filledSeq uint64
+				partial := false
 				defer func() {
 					// Record the executed fill FIRST, before requote/cancel touch the still-resting
 					// offer: the relay records the trade (last_price + chart for the asset/BTC pair)
 					// and decrements/finalizes the order. Maker-signed + offer-keyed, so it lands even
 					// though the courier session may already be gone.
 					if settled {
-						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), settleTxid)
+						fill := filledSeq
+						if fill == 0 {
+							fill = o.GetBaseAmount()
+						}
+						reportSettledTrade(ws, o, cfg.makerKey, fill, settleTxid)
 					}
 					// -requote: re-post a fresh quote while still holding the in-flight slot
 					// (racing lifts are refused as "busy" until it is live -> no double-post).
 					// The asset leg is on-chain; only the BTC-LN leg has channel peers to
 					// reconnect before the next lift's pay.
-					if settled && cfg.requote {
+					// PARTIAL FILL: re-rest the REMAINDER, priced at the offer's own rate.
+					// Without this the maker would re-post the FULL size after selling a slice,
+					// advertising asset it no longer has.
+					if settled && partial {
+						mu.Lock()
+						remain := o.GetBaseAmount() - filledSeq
+						if o.GetLightning().GetLnDirection() == offer.LnBTCForAsset {
+							// The maker SELLS the asset: OfferAmount=asset given, WantAmount=BTC wanted.
+							o.WantAmount = client.ProportionalBtc(o.GetWantAmount(), remain, o.GetBaseAmount())
+							o.OfferAmount = remain
+						} else {
+							// The maker BUYS the asset: OfferAmount=BTC given, WantAmount=asset wanted.
+							o.OfferAmount = client.ProportionalBtcFloor(o.GetOfferAmount(), remain, o.GetBaseAmount())
+							o.WantAmount = remain
+						}
+						o.BaseAmount = remain
+						mu.Unlock()
+						fmt.Printf("session %s: PARTIAL fill (%d of %d atoms); re-resting the remainder %d\n",
+							sid, filledSeq, filledSeq+remain, remain)
+					}
+					if settled && (cfg.requote || partial) {
 						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
 							if n, err := xchain.NewCLNLNLeg(cfg.lnSocket).ReconnectPeers(); err != nil {
 								fmt.Printf("requote: BTC-LN peer reconnect: reconnected %d, err: %v\n", n, err)
@@ -254,11 +282,11 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled && !cfg.requote {
+					if settled && !cfg.requote && !partial {
 						filled = true
 					}
 					mu.Unlock()
-					if settled && !cfg.requote {
+					if settled && !cfg.requote && !partial {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 					requoteExitIfPending(idle)
@@ -294,8 +322,10 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 						return
 					}
 					settled = true
-					fmt.Printf("session %s: REVERSE SUBMARINE SWAP SETTLED: received %d msat over BTC-LN; the taker claimed the asset\n",
-						sid, res.PaidMsat)
+					filledSeq = res.FilledSeq
+					partial = res.RemainderSeq > 0
+					fmt.Printf("session %s: REVERSE SUBMARINE SWAP SETTLED: %d of %d atoms for %d msat over BTC-LN; the taker claimed the asset\n",
+						sid, res.FilledSeq, o.GetBaseAmount(), res.PaidMsat)
 					return
 				}
 				// NORMAL: the taker funds the asset HTLC + hands us a BOLT11; we
@@ -326,8 +356,10 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 				}
 				settled = true
 				settleTxid = res.SeqClaimTxid
-				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN, claimed the asset in %s\n",
-					sid, res.SeqClaimTxid)
+				filledSeq = res.FilledSeq
+				partial = res.RemainderSeq > 0
+				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN for %d of %d atoms, claimed the asset in %s\n",
+					sid, res.FilledSeq, o.GetBaseAmount(), res.SeqClaimTxid)
 			}(sid, in)
 
 		case from.GetSwapMsg() != nil:
