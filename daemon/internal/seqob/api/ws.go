@@ -415,11 +415,39 @@ func (s *Server) wsOfferCancel(c *wsConn, cancel *seqobv1.OfferCancel) {
 	}}})
 }
 
+// liftGuardExempts reports whether an offer may be lifted with NO maker connection
+// present. Only a covenant offer qualifies: the taker settles the fill spend itself, so
+// there is nobody to wait for. Every other settlement needs the maker live to send
+// terms. A nil offer is exempt so the guard never pre-empts openLift's own reporting of
+// an unknown/closed offer.
+func liftGuardExempts(o *seqobv1.Offer) bool {
+	return o == nil || o.GetCovenant() != nil
+}
+
 func (s *Server) wsStartLift(c *wsConn, sl *seqobv1.StartLift) {
 	// openLift -> Router.StartLift fires the notifyMaker hook, which binds the
 	// maker connection and delivers From.lift_requested (with the taker's session
 	// pubkey) BEFORE we reply to the taker. Bind the taker here so it can receive
 	// the maker's couriered reply.
+	// REFUSE A LIFT AGAINST A MAKER THAT IS NOT HERE.
+	//
+	// A cross-chain or Lightning offer survives its maker's WS drop on purpose: the
+	// settlement agent reconnects after a blip, and evicting on every drop emptied the
+	// cross book (see TestCrossSurvivesMakerDisconnect). But surviving a reconnect is not
+	// the same as being liftable while the maker is GONE. Those rails need the maker live
+	// to send terms, so a lift against a departed maker used to be ACCEPTED and then
+	// simply go quiet — the taker waited out its terms timeout, and the trade sat there
+	// while blocks went by, with nothing to retry against because no error was ever sent.
+	//
+	// A covenant offer is genuinely offline-liftable (the taker settles the fill spend
+	// itself), so it is exempt. For everything else, say so immediately: an instant,
+	// explicit refusal is retryable down the book, where silence is not.
+	if o, ok := s.store.Get(offerstore.Key{MakerPubkey: sl.GetMakerPubkey(), OfferID: sl.GetOfferId()}); ok && !liftGuardExempts(o.Offer) {
+		if _, live := s.makerConns.get(sl.GetMakerPubkey()); !live {
+			c.sendErr(409, "maker is not connected; this offer cannot be lifted right now")
+			return
+		}
+	}
 	sess, err := s.openLift(sl)
 	if err != nil {
 		c.sendErr(409, err.Error())
