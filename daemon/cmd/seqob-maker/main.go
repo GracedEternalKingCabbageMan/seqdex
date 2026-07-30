@@ -74,7 +74,7 @@ func main() {
 	xseqWallet := flag.String("xseq-wallet", "", "cross: Sequentia node wallet funding the asset leg")
 	btcDelta := flag.Uint("btc-locktime-delta", 180, "cross: T_btc = parent tip + this (longer leg in time; ~30h). 180 clears the LSP payer-bridge fund gate for T_seq=240 (B1 floor ~150, B3 ceiling ~192); see RunMakerForward's BtcLocktimeDelta comment")
 	seqDelta := flag.Uint("seq-locktime-delta", 240, "cross: T_seq = SEQ tip + this (shorter leg in time; ~2h — must cover the taker's real parent confirmation, or takers refuse the terms)")
-	minBTCConf := flag.Int("min-btc-conf", 1, "cross: confirmations required on the taker's BTC leg (1 = testnet-grade; confirmation depth, not anchoring, protects the maker's BTC side — raise for real value)")
+	minBTCConf := flag.Int("min-btc-conf", 0, "cross: confirmations required on the counterparty's BTC leg. 0 = accept from the mempool, which is what keeps a rail-crossing take INSTANT: a taker paying over Lightning against a best-priced on-chain maker must not wait a Bitcoin block, because the bridge (the LSP) is already holding that taker's Lightning payment when it funds and so gains nothing by double-spending itself. Raise it for a maker facing anonymous takers or real value.")
 	spendFee := flag.Uint64("spend-fee", 1000, "cross: HTLC spend fee target in native sats (converted per-asset via the fee market)")
 	btcFeeRate := flag.Float64("btc-fee-rate", 2, "cross: sat/vB fee rate for funding the BTC HTLC leg (explicit, so it never depends on the node's estimatesmartfee/settxfee; 0 = node default)")
 	xstateDir := flag.String("xstate-dir", "xmaker-sessions", "cross: directory for per-lift session state (keys/legs; the recovery material)")
