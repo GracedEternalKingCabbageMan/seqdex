@@ -61,6 +61,13 @@ type Server struct {
 	// on the same order (the 2nd would waste a session and race the maker's single coins).
 	liftMu     sync.Mutex
 	liftActive map[offerstore.Key]string // offer key -> live session id
+
+	// takerConns tracks which connection currently holds the TAKER side of a lift
+	// session, so a taker that goes away can have its session released instead of
+	// pinning the offer's single lift slot until the co-sign deadline (hours, on the
+	// cross rail). See releaseAbandonedLift.
+	takerMu    sync.Mutex
+	takerConns map[string]*wsConn // session id -> the taker's connection
 }
 
 // New builds a Server.
@@ -81,6 +88,7 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 		},
 		makerConns: newConnRegistry(),
 		liftActive: make(map[offerstore.Key]string),
+		takerConns: make(map[string]*wsConn),
 	}
 	// The relay notifies an online maker (via From.lift_requested) whenever a taker
 	// lifts one of its offers, so the maker can derive the E2E key and co-sign.
