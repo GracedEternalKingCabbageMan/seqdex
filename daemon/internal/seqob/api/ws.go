@@ -229,7 +229,11 @@ func (s *Server) evictGhostOffersAfterGrace(pubkey string) {
 
 // takerReattachGrace is how long an abandoned lift session is held open for the taker
 // to come back (P3.8 re-attach) before it is aborted and the offer's lift slot freed.
-var takerReattachGrace = 45 * time.Second
+// 15s: a genuine P3.8 re-attach happens within a second or two of the socket dropping,
+// while every second beyond that is one where the offer answers other takers with
+// "another lift is in flight". 45s was long enough that a taker retrying down the book
+// collided with offers its own previous attempt had wedged.
+var takerReattachGrace = 15 * time.Second
 
 // releaseAbandonedLifts aborts the lift sessions whose TAKER just disconnected and did
 // not come back.
