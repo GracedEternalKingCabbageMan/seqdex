@@ -873,6 +873,44 @@ func (s *Store) SweepExpired() int {
 //     abandoned offers. See durable-cross-offer design.
 //
 // Returns the number removed.
+// RemoveInteractiveByMaker evicts EVERY offer of a maker that needs the maker online to
+// be lifted — that is all of them except a covenant, which the taker settles itself.
+//
+// RemoveByMaker deliberately spares cross-chain and Lightning offers, because they are
+// durable across a maker RECONNECT and evicting on every transient WS blip emptied the
+// cross book (TestCrossSurvivesMakerDisconnect). But durable-across-a-reconnect is not
+// the same as liftable-while-the-maker-is-GONE: those offers keep resting, keep being
+// served at top of book, and answer every taker with silence or a refusal until they
+// expire. A fleet that restarts its makers leaves the book full of them.
+//
+// The caller applies this only after a grace period in which the maker did not come
+// back, so a blip still costs nothing.
+func (s *Store) RemoveInteractiveByMaker(makerPubkey string) int {
+	s.mu.Lock()
+	victims := make([]Key, 0)
+	for k, e := range s.entries {
+		if k.MakerPubkey == makerPubkey && e.Offer.GetCovenant() == nil {
+			victims = append(victims, k)
+		}
+	}
+	type ev struct {
+		pair *seqobv1.AssetPair
+		conf bool
+		ref  *seqobv1.OfferRef
+	}
+	evs := make([]ev, 0, len(victims))
+	for _, k := range victims {
+		e := s.entries[k]
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.remove(k)
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
+	}
+	return len(victims)
+}
+
 func (s *Store) RemoveByMaker(makerPubkey string) int {
 	s.mu.Lock()
 	victims := make([]Key, 0)
