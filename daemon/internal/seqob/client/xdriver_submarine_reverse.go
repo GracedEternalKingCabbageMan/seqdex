@@ -158,6 +158,22 @@ func (o *LiveSubReverseTakerOps) ClaimSEQLeg(leg *xchain.LegLock, key *xchain.Ke
 
 // --- REVERSE maker -----------------------------------------------------------
 
+// proportionalInvoiceMsat prices a slice of a submarine offer as a whole number of
+// SATOSHIS, returned in msat.
+//
+// The offer's price is quoted in sats, and the taker sizes its side in sats and then
+// multiplies by 1000. Rounding in msat instead produces a sub-satoshi invoice that the
+// taker's exact-match check rejects: an 8% slice of a 77474-sat offer ceils to 6198 sats
+// (6_198_000 msat) for the taker but to 6_197_920 msat for a maker rounding in msat, and
+// the swap dies with "the invoice demands 6197920 msat != the offer's 6198000 msat".
+//
+// So round UP to a whole sat — the same direction and the same unit as the taker — and
+// only then convert. A whole-offer take is unchanged, since wholeMsat is already a whole
+// number of sats.
+func proportionalInvoiceMsat(wholeMsat, takeSeq, wholeSeq uint64) uint64 {
+	return ProportionalBtc(wholeMsat/1000, takeSeq, wholeSeq) * 1000
+}
+
 type MakerReverseSubmarineParams struct {
 	// NewMakerOps binds the settlement engine to the maker-generated secret (the
 	// maker builds the SubmarineSwap with NewHashLock(secret)).
@@ -254,7 +270,9 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 	}
 	// We GIVE the asset and RECEIVE the invoice here, so the invoice rounds UP —
 	// the mirror of the forward direction, and in our favour on the same principle.
-	invoiceMsat := ProportionalBtc(p.InvoiceMsat, takeSeq, p.SeqAmount)
+	// Rounded to a whole SAT, which is the unit the offer is priced in and the unit
+	// the taker rounds in; see proportionalInvoiceMsat.
+	invoiceMsat := proportionalInvoiceMsat(p.InvoiceMsat, takeSeq, p.SeqAmount)
 	if invoiceMsat == 0 {
 		sendXcFail(p.Crypter, send, "DUST", "that slice prices to zero")
 		return res, fmt.Errorf("maker reverse submarine: take %d of %d prices to 0 msat", takeSeq, p.SeqAmount)
@@ -420,7 +438,7 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	if takeSeq == 0 || takeSeq > p.ExpectSeqAmount {
 		takeSeq = p.ExpectSeqAmount
 	}
-	wantMsat := ProportionalBtc(p.ExpectInvoiceMsat, takeSeq, p.ExpectSeqAmount)
+	wantMsat := proportionalInvoiceMsat(p.ExpectInvoiceMsat, takeSeq, p.ExpectSeqAmount)
 	if wantMsat == 0 {
 		return res, fmt.Errorf("%w: take %d of %d prices to 0 msat (dust)", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
 	}
