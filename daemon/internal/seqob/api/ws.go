@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -186,9 +187,44 @@ func (s *Server) closeConn(c *wsConn) {
 	// otherwise linger as un-fillable "ghosts" until their TTL.
 	for _, pubkey := range s.makerConns.drop(c) {
 		s.store.RemoveByMaker(pubkey)
+		s.evictGhostOffersAfterGrace(pubkey)
 	}
 	s.releaseAbandonedLifts(c)
 	c.conn.Close()
+}
+
+// makerReconnectGrace is how long a departed maker's still-resting interactive offers
+// are held before being evicted, giving a reconnecting settlement agent time to re-post.
+var makerReconnectGrace = 60 * time.Second
+
+// evictGhostOffersAfterGrace removes a maker's interactive offers once it is clear the
+// maker is really gone rather than blipping.
+//
+// RemoveByMaker (called immediately above) deliberately spares cross-chain and Lightning
+// offers: they are durable across a reconnect, and evicting on every transient WS drop
+// emptied the cross book and vanished BTC from the DEX. But that left the opposite
+// failure wide open — a maker that is genuinely gone leaves its offers resting, served
+// at top of book, until their TTL. A fleet that restarts its makers fills the book with
+// them, and takers walk the whole book collecting "maker is not connected", "offer not
+// found or not open" and "another lift is in flight" from offers that will never settle.
+//
+// A grace period separates the two cases honestly: a maker that comes back re-registers
+// (makerConns.get finds a live connection) and keeps everything; one that does not has
+// its unliftable offers cleared.
+func (s *Server) evictGhostOffersAfterGrace(pubkey string) {
+	go func() {
+		time.Sleep(makerReconnectGrace)
+		if _, live := s.makerConns.get(pubkey); live {
+			return // it came back; its offers are real again
+		}
+		if n := s.store.RemoveInteractiveByMaker(pubkey); n > 0 {
+			short := pubkey
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			fmt.Printf("[book] evicted %d unliftable offer(s) from departed maker %s\n", n, short)
+		}
+	}()
 }
 
 // takerReattachGrace is how long an abandoned lift session is held open for the taker
