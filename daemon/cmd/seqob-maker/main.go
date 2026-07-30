@@ -1087,6 +1087,54 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			fmt.Printf("cross lift requested: session %s offer %s (take %d of %d)\n",
 				sid, lr.GetOfferId(), lr.GetTakeAmount(), o.GetBaseAmount())
 
+			// QUOTE THE SLICE THE TAKER ASKED FOR, not the whole offer.
+			//
+			// This offer advertises allow_partial with a min_fill, the relay forwards
+			// take_amount, and the post-fill path below already re-rests the remainder via
+			// ProportionalBtc/MinFillBase — but the HANDSHAKE still quoted the offer's whole
+			// OfferAmount/WantAmount. So a taker asking for 8% of a resting offer was told the
+			// price of 100% of it, and the bridge's bind check ("maker wants N sats, above the
+			// offered M — refuse") correctly killed the trade instantly. Partial support was
+			// built everywhere except the one place that names the price.
+			//
+			// Rounding is the maker's favour on both sides, matching the taker's mirrored
+			// arithmetic bit-for-bit (xswap.js proportionalBtcCeil / the Go helpers): CEIL when
+			// the TAKER pays the BTC (forward), FLOOR when the MAKER pays it (reverse). Both
+			// helpers return the whole amount exactly when take >= whole, so a whole-offer lift
+			// is byte-identical to before this change.
+			takeBase := lr.GetTakeAmount()
+			if takeBase == 0 || takeBase > o.GetBaseAmount() {
+				takeBase = o.GetBaseAmount()
+			}
+			if mf := o.GetMinFill(); mf > 0 && takeBase < mf {
+				// Below our own advertised minimum. Say so rather than quoting a slice we do not
+				// offer — a sub-min slice prices to a leg that cannot economically settle.
+				refuse(sid, cr, "below_min_fill",
+					fmt.Sprintf("take %d is below this offer's min_fill %d", takeBase, mf))
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
+				continue
+			}
+			// SELL (forward): OfferAmount=asset given, WantAmount=BTC wanted, Base=asset.
+			// BUY (reverse):  OfferAmount=BTC given,   WantAmount=asset wanted, Base=asset.
+			// The SAME predicate the handshake below branches on (`reverse`), deliberately —
+			// deciding the rounding direction from a different field than the one that picks
+			// the handshake is how the two silently drift into disagreeing.
+			sliceReverse := o.GetCrossChain().GetDirection() == offer.DirAssetToBTC
+			sliceSeq := takeBase
+			var sliceBtc uint64
+			if sliceReverse {
+				sliceBtc = client.ProportionalBtcFloor(o.GetOfferAmount(), takeBase, o.GetBaseAmount())
+			} else {
+				sliceBtc = client.ProportionalBtc(o.GetWantAmount(), takeBase, o.GetBaseAmount())
+			}
+			if takeBase < o.GetBaseAmount() {
+				fmt.Printf("session %s: PARTIAL quote %d of %d atoms for %d sats (whole offer %d/%d)\n",
+					sid, takeBase, o.GetBaseAmount(), sliceBtc, o.GetOfferAmount(), o.GetWantAmount())
+			}
+
 			send := func(sealed []byte) error {
 				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
 			}
@@ -1095,7 +1143,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				swp := xchain.NewSwapBitcoin(btcChain, seqChain, xchain.NewHashLockFromHash(hashH))
 				return &client.LiveXcOps{Swap: swp, BTC: btcChain, SEQ: seqChain}, nil
 			}
-			reverse := o.GetCrossChain().GetDirection() == offer.DirAssetToBTC
+			reverse := sliceReverse
 
 			go func(sid string, in chan []byte, reverse bool) {
 				settled := false
@@ -1195,7 +1243,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 							return &client.LiveXcOps{Swap: swp, BTC: btcChain, SEQ: seqChain}, nil
 						},
 						Crypter: cr, BtcTip: btcChain.BlockCount, SeqTip: seqChain.BlockCount,
-						AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: o.GetWantAmount(), BtcAmount: o.GetOfferAmount(),
+						AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: sliceSeq, BtcAmount: sliceBtc,
 						BtcLocktimeDelta: cfg.btcDelta, SeqLocktimeDelta: cfg.seqDelta,
 						MinBTCConf: cfg.minBTCConf, SpendFeeSats: cfg.spendFee, Log: logf,
 						OnUpdate: func(r *client.MakerReverseResult) { persistXSessionReverse(cfg.stateDir, sid, o.GetOfferId(), r) },
@@ -1219,7 +1267,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 				p := client.MakerForwardParams{
 					NewOps: newOpsFromHash, Crypter: cr,
 					BtcTip: btcChain.BlockCount, SeqTip: seqChain.BlockCount,
-					AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: o.GetOfferAmount(), BtcAmount: o.GetWantAmount(),
+					AssetHex: o.GetPair().GetBaseAsset(), SeqAmount: sliceSeq, BtcAmount: sliceBtc,
 					BtcLocktimeDelta: cfg.btcDelta, SeqLocktimeDelta: cfg.seqDelta,
 					MinBTCConf: cfg.minBTCConf, SpendFeeSats: cfg.spendFee, Log: logf,
 					OnUpdate: func(r *client.MakerForwardResult) { persistXSession(cfg.stateDir, sid, o.GetOfferId(), r) },
