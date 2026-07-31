@@ -336,9 +336,17 @@ func cmdXRefundSeq(args []string) {
 		Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
 		Locktime: st.SeqLocktime,
 	}
-	// The refund path only touches the SEQ side; no bitcoind is needed.
+	// The refund path only touches the SEQ side, but NewSwapBitcoin builds its BTC
+	// backend EAGERLY and reads the chain's params, so passing nil segfaults at
+	// construction — this recovery path would have panicked instead of returning the
+	// asset. Hand it the same inert stand-in xfund-seq uses: never dialled, params only.
+	btcParams, err := xchain.BitcoinChainParams("testnet4")
+	if err != nil {
+		fatal("chain params: %v", err)
+	}
+	dummyBtc := xchain.NewBitcoinChain(xchain.NewRPC("127.0.0.1", 1, "x", "x"), "", btcParams)
 	ops := &client.LiveXcOps{
-		Swap: xchain.NewSwapBitcoin(nil, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
+		Swap: xchain.NewSwapBitcoin(dummyBtc, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
 		SEQ:  seqChain,
 	}
 	txid, err := client.RefundTakerSEQ(ops, leg, xchain.KeyFromBytes(keyBytes), st.SeqLocktime, st.SeqLegAsset, *spendFee, *wait, 15*time.Second)
