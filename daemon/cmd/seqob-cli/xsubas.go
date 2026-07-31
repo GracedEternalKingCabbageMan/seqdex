@@ -167,7 +167,20 @@ func cmdXSubAs(args []string) {
 	}
 	var target *seqobv1.Offer
 	for _, o := range book.GetOffers() {
-		if *offerID != "" && (o.GetOfferId() != *offerID || o.GetMakerPubkey() != *makerPub) {
+		// The maker filter applies WHENEVER a maker is named, not only alongside an offer id.
+		//
+		// It used to live inside the offer-id branch, so -maker-pubkey ALONE was silently ignored and
+		// any maker's offer could be picked. That matters on a RETRY of an already-funded take: the
+		// BTC HTLC has the maker's claim key baked into its redeem script, so only THAT maker can ever
+		// claim it. Offers expire and re-post under new ids every few minutes, so a retry must be able
+		// to say "the same maker, whatever its offer id is now" — and it had no way to.
+		//
+		// Seen live: a resumed GOLD buy re-matched to a different maker, which correctly refused with
+		// 'redeemScript mismatch', the two scripts differing in exactly one field — the maker claim key.
+		if *makerPub != "" && o.GetMakerPubkey() != *makerPub {
+			continue
+		}
+		if *offerID != "" && o.GetOfferId() != *offerID {
 			continue
 		}
 		lt := o.GetLightning()
