@@ -78,6 +78,8 @@ func main() {
 		cmdXHtlcObserve(os.Args[2:])
 	case "xfund-seq":
 		cmdXFundSeq(os.Args[2:])
+	case "xseq-refund":
+		cmdXSeqRefund(os.Args[2:])
 	case "keygen":
 		cmdKeygen(os.Args[2:])
 	default:
@@ -112,7 +114,11 @@ commands:
   xsubas-htlc-spend-status  LSP recoup-vs-refund ORACLE: read the AUTHORITATIVE on-chain fate of the payer-bridge BTC HTLC — UNSPENT | SPENT_VIA_CLAIM (returns P) | SPENT_VIA_REFUND — fail-closed on uncertainty (replaces the racy persisted intent flag; needs txindex + unpruned to read a non-wallet maker claim)
           (flags: -btc-rpc -btc-wallet -btc-chain -txid -vout -redeem-script -require-node-caps)
   xsubas-node-caps  LSP payer-bridge BRING-UP gate: assert the BTC node is UNPRUNED + has a SYNCED txindex (so the HTLC-spend classifier can read a non-wallet maker claim). Exit 0 = capable, 1 = refuse payer bridges
-          (flags: -btc-rpc -btc-wallet -btc-chain)`)
+          (flags: -btc-rpc -btc-wallet -btc-chain)
+  xfund-seq  fund an on-chain Sequentia asset HTLC (claim = the counterparty with P, refund = your own key after T_seq)
+          (flags: -seq-rpc -seq-wallet -asset -seq-amount -hash -maker-claim-pub -refund-priv -seq-locktime -no-wait)
+  xseq-refund  reclaim an asset HTLC by OUTPOINT after T_seq (the state-file-free mirror of xsubas-refund-btc; recovers an LSP FRONTED asset leg a taker never claimed)
+          (flags: -seq-rpc -seq-wallet -txid -vout -amount -asset -redeem-script -t-seq -refund-priv -spend-fee -wait)`)
 	os.Exit(2)
 }
 
