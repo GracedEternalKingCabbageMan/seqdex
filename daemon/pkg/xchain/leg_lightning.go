@@ -186,6 +186,10 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		Valid       bool   `json:"valid"`
 		PaymentHash string `json:"payment_hash"`
 		AmountMsat  uint64 `json:"amount_msat"`
+		// Only for the unannounced-channel fallback below; absent fields simply disable it.
+		Payee         string `json:"payee"`
+		PaymentSecret string `json:"payment_secret"`
+		MinFinalCltv  uint32 `json:"min_final_cltv_expiry"`
 	}
 	if err := l.rpc.call(&dec, "decode", map[string]interface{}{"string": bolt11}); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
@@ -214,7 +218,30 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		params["asset"] = l.assetID // route in this leg's Sequentia asset (Step 1)
 	}
 	if err := l.rpc.call(&res, "pay", params); err != nil {
-		return nil, fmt.Errorf("pay: %w", err)
+		// UNANNOUNCED PAYEE FALLBACK. `pay` plans from the gossip graph plus the invoice's
+		// routehints, so it cannot reach a payee whose only channels are PRIVATE -- it gives up with
+		// "not reachable directly and all routehints were unusable" even when that payee is our own
+		// direct peer. Every wallet-side node here is exactly that: JIT channels, unannounced.
+		//
+		// This broke the whole pure-LN rail. The maker registered its hold correctly, then failed to
+		// pay the taker's asset invoice and cancelled the hold, so the swap ended with the taker's
+		// payment refused and nothing said about why. Reproduced four times running against the same
+		// taker node before the maker log made it visible.
+		//
+		// PayHash already solves this for bare-hash payments: asset-aware getroute, falling back to a
+		// single hop over our own channel to a directly-connected payee. Paying a BOLT11 by its own
+		// hash + payment_secret to its payee is the same payment, so reuse it rather than growing a
+		// second router. The hash was already checked against the swap H above, and PayHash re-verifies
+		// that the revealed preimage hashes to it.
+		payee, secret, amt, ok := payFallbackPlan(dec.Payee, dec.PaymentSecret, dec.AmountMsat, amountMsat)
+		if !ok {
+			return nil, fmt.Errorf("pay: %w", err)
+		}
+		pre, perr := l.PayHash(payee, wantHash, amt, dec.MinFinalCltv, secret)
+		if perr != nil {
+			return nil, fmt.Errorf("pay: %w (direct-hop fallback: %v)", err, perr)
+		}
+		return pre, nil
 	}
 	if res.Status != "complete" {
 		return nil, fmt.Errorf("%w: pay status %q", ErrLNLegInvalid, res.Status)
@@ -571,4 +598,32 @@ func (c *lnRPC) call(out interface{}, method string, params interface{}) error {
 		}
 		return nil
 	}
+}
+
+// payFallbackPlan decides whether a failed `pay` can be retried as a direct-hop PayHash, and
+// with what arguments. Split out from Pay so the decision is testable without a live node.
+//
+// It is deliberately CONSERVATIVE: without a payee and a payment_secret there is no well-formed
+// payment to send, so the original `pay` error is reported unchanged rather than replaced by a
+// second, more confusing one from a request that could never have worked.
+//
+// The amount follows the invoice: a quoted amount wins (it was already checked against the
+// invoice above), and an amountless invoice falls back to the invoice's own amount. Sending 0
+// would be silently wrong, so both being absent disables the fallback.
+func payFallbackPlan(payee, paymentSecretHex string, invoiceMsat, quotedMsat uint64) (string, []byte, uint64, bool) {
+	if payee == "" || paymentSecretHex == "" {
+		return "", nil, 0, false
+	}
+	secret, err := hex.DecodeString(paymentSecretHex)
+	if err != nil || len(secret) == 0 {
+		return "", nil, 0, false
+	}
+	amt := quotedMsat
+	if amt == 0 {
+		amt = invoiceMsat
+	}
+	if amt == 0 {
+		return "", nil, 0, false
+	}
+	return payee, secret, amt, true
 }
