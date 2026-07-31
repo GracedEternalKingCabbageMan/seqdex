@@ -1048,6 +1048,46 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			}
 			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue on-chain)\n", err)
 			ws.redialLoop(wsURL, resubmit)
+
+			// RE-ATTACH EVERY IN-FLIGHT SESSION, or the courier goes silent forever.
+			//
+			// Re-posting the offer restores this connection as the maker's route for NEW
+			// lifts, but it says nothing about lifts already running. On the relay a role's
+			// courier frames are delivered by a pump started in attach(), and that pump exits
+			// as soon as its connection closes. The new connection carries no role binding and
+			// no pump — while Router.Send still SUCCEEDS, because each inbox is a buffered
+			// channel. So the counterparty's next frame is queued into a channel nobody will
+			// ever drain, and both sides wait for each other until their deadlines elapse.
+			//
+			// That is exactly how a rail-crossing take died: the LSP funded the BTC HTLC and
+			// sent btc_leg_funded, we never received it ("courier recv while waiting for
+			// btc_leg_funded: courier timeout"), and the trade stalled with real coin already
+			// locked on-chain. The same fault kills the other direction when the TAKER
+			// reconnects, which is why no rail settled — one courier-delivery bug, not one
+			// per rail.
+			//
+			// The relay has implemented an authenticated session_reattach all along; nothing
+			// had ever sent one. Re-proving the offer key suffices: it is the maker's session
+			// key and the relay already holds it for this session, so no new trust appears.
+			mu.Lock()
+			live := make([]string, 0, len(inboxes))
+			for sid := range inboxes {
+				live = append(live, sid)
+			}
+			mu.Unlock()
+			for _, sid := range live {
+				if e := ws.write(&seqobv1.To{Msg: &seqobv1.To_SessionReattach{
+					SessionReattach: &seqobv1.SessionReattach{
+						SessionId: sid,
+						Role:      "maker",
+						Sig:       offer.SignReattach(sid, "maker", cfg.makerKey),
+					}}}); e != nil {
+					fmt.Printf("reconnect: re-attach of session %s FAILED: %v"+
+						" (its courier frames are stranded; the lift will time out)\n", sid, e)
+					continue
+				}
+				fmt.Printf("reconnect: re-attached session %s; couriered frames resume\n", sid)
+			}
 			continue
 		}
 		var from seqobv1.From
