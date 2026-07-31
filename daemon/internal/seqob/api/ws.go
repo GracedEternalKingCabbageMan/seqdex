@@ -630,7 +630,9 @@ func (s *Server) attach(c *wsConn, sess *session.Session, role session.Role) {
 		s.takerConns[sess.ID] = c
 		s.takerMu.Unlock()
 	}
+	s.pumpAdd(sess.ID, role, 1)
 	go func() {
+		defer s.pumpAdd(sess.ID, role, -1)
 		inbox := sess.Inbox(role)
 		for {
 			select {
@@ -665,10 +667,62 @@ func (s *Server) wsSwapMsg(c *wsConn, msg *seqobv1.SwapMsg) {
 		c.sendErr(403, "not a participant in this session")
 		return
 	}
+	// A frame for a role with no live pump is queued into a buffered inbox nobody
+	// will drain: the counterparty waits out its deadline and NOTHING anywhere says
+	// why. Say it, on both sides — the sender learns its frame is stranded instead
+	// of blaming a slow counterparty, and the log names the session.
+	dst := session.RoleMaker
+	if role == session.RoleMaker {
+		dst = session.RoleTaker
+	}
+	if s.pumpCount(msg.GetSessionId(), dst) == 0 {
+		s.log.Printf("courier: session %s: %s sent a frame but the %s side has no attached"+
+			" connection — it is queued and undeliverable until that side re-attaches",
+			msg.GetSessionId(), roleName(role), roleName(dst))
+		c.sendErr(409, "courier: the "+roleName(dst)+" is not attached to this session")
+		return
+	}
 	// OPAQUE courier: route ciphertext only, never decrypt or parse it.
 	if err := s.sessions.Send(msg.GetSessionId(), role, msg.GetCiphertext()); err != nil {
+		s.log.Printf("courier: session %s: %s send failed: %v", msg.GetSessionId(), roleName(role), err)
 		c.sendErr(409, "courier: "+err.Error())
 	}
+}
+
+func roleName(r session.Role) string {
+	if r == session.RoleMaker {
+		return "maker"
+	}
+	return "taker"
+}
+
+// pumpAdd adjusts the live-pump count for a session role (+1 on attach, -1 when
+// the pump exits).
+func (s *Server) pumpAdd(sessionID string, role session.Role, delta int) {
+	s.pumpMu.Lock()
+	defer s.pumpMu.Unlock()
+	m := s.pumped[sessionID]
+	if m == nil {
+		if delta <= 0 {
+			return
+		}
+		m = make(map[session.Role]int)
+		s.pumped[sessionID] = m
+	}
+	m[role] += delta
+	if m[role] <= 0 {
+		delete(m, role)
+	}
+	if len(m) == 0 {
+		delete(s.pumped, sessionID)
+	}
+}
+
+// pumpCount reports how many live pumps are draining a session role's inbox.
+func (s *Server) pumpCount(sessionID string, role session.Role) int {
+	s.pumpMu.Lock()
+	defer s.pumpMu.Unlock()
+	return s.pumped[sessionID][role]
 }
 
 // wsSettleAck is the interactive-lift settlement commit point. A same-chain lift settles

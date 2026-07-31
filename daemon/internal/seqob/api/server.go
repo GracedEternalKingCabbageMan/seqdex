@@ -68,6 +68,16 @@ type Server struct {
 	// cross rail). See releaseAbandonedLift.
 	takerMu    sync.Mutex
 	takerConns map[string]*wsConn // session id -> the taker's connection
+
+	// pumped counts the LIVE inbox pumps per session role. A courier frame is
+	// delivered by the pump attach() starts, and that pump exits when its
+	// connection closes — but Router.Send still SUCCEEDS afterwards, because each
+	// inbox is a buffered channel. A frame sent to a role with no pump is therefore
+	// queued into a channel nobody will ever drain: the counterparty simply waits
+	// until its deadline with no error anywhere. That silent stranding is worth
+	// naming, so wsSwapMsg reports it instead of letting the frame vanish.
+	pumpMu sync.Mutex
+	pumped map[string]map[session.Role]int // session id -> role -> live pumps
 }
 
 // New builds a Server.
@@ -89,6 +99,7 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 		makerConns: newConnRegistry(),
 		liftActive: make(map[offerstore.Key]string),
 		takerConns: make(map[string]*wsConn),
+		pumped:     make(map[string]map[session.Role]int),
 	}
 	// The relay notifies an online maker (via From.lift_requested) whenever a taker
 	// lifts one of its offers, so the maker can derive the E2E key and co-sign.
