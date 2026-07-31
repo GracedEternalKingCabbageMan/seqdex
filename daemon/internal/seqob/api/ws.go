@@ -679,7 +679,11 @@ func (s *Server) wsSwapMsg(c *wsConn, msg *seqobv1.SwapMsg) {
 		s.log.Printf("courier: session %s: %s sent a frame but the %s side has no attached"+
 			" connection — it is queued and undeliverable until that side re-attaches",
 			msg.GetSessionId(), roleName(role), roleName(dst))
-		c.sendErr(409, "courier: the "+roleName(dst)+" is not attached to this session")
+		// NAME THE SESSION IN THE ERROR. A maker serves ONE lift at a time and holds that slot for the
+		// whole driver run, so it has to know WHICH session died in order to free it. Unattributable,
+		// the maker just waits out its 2-minute TermsRequest deadline — while the wallet gives up after
+		// 30s — so every abandoned take parks a maker on "busy". A handful of them wedged the fleet.
+		c.sendErr(409, "courier: the "+roleName(dst)+" is not attached to session "+msg.GetSessionId())
 		return
 	}
 	// OPAQUE courier: route ciphertext only, never decrypt or parse it.
