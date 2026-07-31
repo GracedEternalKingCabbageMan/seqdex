@@ -1466,11 +1466,48 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			// THE TAKER IS GONE — FREE THE SLOT NOW, DON'T WAIT OUT THE DEADLINE.
+			//
+			// This maker serves ONE lift at a time and holds that slot for the whole driver run. When a
+			// taker abandons a lift (the wallet gives up on terms after 30s; this driver's own
+			// TermsRequest deadline is 2 minutes) the relay answers our next frame with 409 "the taker
+			// is not attached to session <id>" — and we used to print it and keep waiting, refusing
+			// every other taker with "busy" for the remainder. A handful of abandoned takes wedged the
+			// whole fleet that way, which is exactly how it looked from the wallet: every offer
+			// answering "busy — another lift is in flight".
+			//
+			// Closing that session's inbox makes the driver's next receive return "session closed", so
+			// it unwinds through its normal error path and the deferred accounting frees the slot. No
+			// value is at risk: an abandoned lift is pre-lock by construction — the taker never funded.
+			if sid := sessionFromNotAttached(e.GetCode(), e.GetMessage()); sid != "" {
+				mu.Lock()
+				if in, ok := inboxes[sid]; ok {
+					delete(inboxes, sid)
+					close(in)
+					fmt.Printf("session %s: taker detached; releasing the lift slot\n", sid)
+				}
+				mu.Unlock()
+			}
 			if offerRejected(e.GetCode(), e.GetMessage()) {
 				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
 			}
 		}
 	}
+}
+
+// sessionFromNotAttached returns the session id out of the relay's "counterparty is not attached to
+// session <id>" 409, or "" for anything else. Deliberately narrow: it releases a LIVE lift slot, so it
+// must match only that error and never a generic 409.
+func sessionFromNotAttached(code uint32, msg string) string {
+	const marker = "is not attached to session "
+	if code != 409 {
+		return ""
+	}
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(msg[i+len(marker):])
 }
 
 // xmakerSessionState is the on-disk snapshot of one cross lift: with it, an
