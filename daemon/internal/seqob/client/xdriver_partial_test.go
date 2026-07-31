@@ -38,6 +38,10 @@ func TestForwardPartialFill(t *testing.T) {
 		t.Fatalf("proportional BTC = %d, want %d", got, wantBtc)
 	}
 	tp.TakeSeqAmount = takeSeq
+	// TERMS NAME THE SLICE, not the whole resting offer: the maker quotes what THIS
+	// session settles, mirroring seqob-maker, which sizes its terms from the
+	// relay-forwarded take_amount before handing them to RunMakerForward.
+	mp.SeqAmount, mp.BtcAmount = takeSeq, wantBtc
 
 	var (
 		wg   sync.WaitGroup

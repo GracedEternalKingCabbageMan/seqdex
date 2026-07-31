@@ -160,6 +160,8 @@ func TestForwardSmallestSliceSettles(t *testing.T) {
 		t.Fatalf("smallest slice BTC leg = %d, want exactly the floor %d", wantBtc, MinSafeBtcLegSats(1000))
 	}
 	tp.TakeSeqAmount = takeSeq
+	// Terms name the slice this session settles, not the whole resting offer.
+	mp.SeqAmount, mp.BtcAmount = takeSeq, wantBtc
 
 	var (
 		wg   sync.WaitGroup
