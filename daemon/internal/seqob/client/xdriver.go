@@ -815,19 +815,23 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 	res.BtcLocktime = terms.BtcLocktime
 
 	// 2. Bind the terms to the signed offer and sanity-check the locktimes.
-	if terms.BtcAmount != p.ExpectBtcAmount {
-		sendXcFail(p.Crypter, send, "terms_mismatch", "btc_amount differs from the signed offer")
-		return res, fmt.Errorf("%w: btc_amount %d != offer %d", ErrXcBadTerms, terms.BtcAmount, p.ExpectBtcAmount)
-	}
-	if terms.SeqAmount != p.ExpectSeqAmount {
-		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_amount differs from the signed offer")
-		return res, fmt.Errorf("%w: seq_amount %d != offer %d", ErrXcBadTerms, terms.SeqAmount, p.ExpectSeqAmount)
-	}
-	// Partial fills: the maker quotes the WHOLE offer in terms (verified above); we
-	// take a slice of it. The BTC we lock is the PROPORTIONAL price of that slice at
-	// the SIGNED offer's own ratio (ceil, in the maker's favour), computed from OUR
-	// verified offer values so a maker can never quote a worse ratio. takeSeq==0 (or
-	// >= the whole) is the classic whole-HTLC lift; fundBtc then == ExpectBtcAmount.
+	//
+	// TERMS NAME THE SLICE BEING TRADED, NOT THE WHOLE RESTING OFFER.
+	//
+	// This used to demand terms equal to the whole offer and then price the slice
+	// itself, on the reading that the maker quotes its resting order and the taker
+	// decides how much of it to take. But the two ends of a partial then never state
+	// the same numbers: the maker names 100% while the session settles 8%, and every
+	// other taker of this protocol (the wallet, and the LSP's bridge bind check)
+	// reads terms as the price of THIS trade. The maker now quotes the slice, so a
+	// partial lift died here on "btc_amount differs from the signed offer" even
+	// though both sides had computed the identical proportional price.
+	//
+	// Verifying against the slice loses nothing: takeSeq and the price are both
+	// derived from OUR OWN verified copy of the signed offer, never from the terms,
+	// so a maker still cannot quote a worse ratio than the one it signed — it can
+	// only fail to match it exactly. A whole lift is byte-identical to before,
+	// because ProportionalBtc returns the whole amount when take == whole.
 	takeSeq := p.TakeSeqAmount
 	if takeSeq == 0 {
 		takeSeq = p.ExpectSeqAmount
@@ -836,7 +840,20 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 		sendXcFail(p.Crypter, send, "terms_mismatch", "take exceeds the offer")
 		return res, fmt.Errorf("%w: take %d exceeds the offer's %d", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
 	}
-	fundBtc := ProportionalBtc(p.ExpectBtcAmount, takeSeq, p.ExpectSeqAmount)
+	// The price of the slice at the SIGNED offer's own ratio (ceil, the maker's
+	// favour here because the TAKER pays the BTC).
+	wantBtc := ProportionalBtc(p.ExpectBtcAmount, takeSeq, p.ExpectSeqAmount)
+	if terms.SeqAmount != takeSeq {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_amount is not the slice we asked to take")
+		return res, fmt.Errorf("%w: seq_amount %d != the %d we asked to take (offer %d)",
+			ErrXcBadTerms, terms.SeqAmount, takeSeq, p.ExpectSeqAmount)
+	}
+	if terms.BtcAmount != wantBtc {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "btc_amount is not the signed offer's price for that slice")
+		return res, fmt.Errorf("%w: btc_amount %d != the %d that %d of %d prices to at the signed ratio",
+			ErrXcBadTerms, terms.BtcAmount, wantBtc, takeSeq, p.ExpectSeqAmount)
+	}
+	fundBtc := wantBtc
 	if fundBtc == 0 {
 		return res, fmt.Errorf("%w: take %d of %d prices to 0 sats (dust)", ErrXcBadTerms, takeSeq, p.ExpectSeqAmount)
 	}
