@@ -192,7 +192,22 @@ func (t *XcTiming) setDefaults() {
 		t.AnchorWait = 20 * time.Minute
 	}
 	if t.TermsReqWait <= 0 {
-		t.TermsReqWait = 2 * time.Minute
+		// A TAKER SENDS THIS IMMEDIATELY, SO WAITING MINUTES FOR IT ONLY WEDGES THE MAKER.
+		//
+		// XcTermsRequest is the taker's very first frame after its lift is accepted — it arrives in
+		// milliseconds or it is never coming. But a cross maker serves ONE lift at a time, so every
+		// second spent waiting here is a second it refuses every other taker with "busy".
+		//
+		// At two minutes that was catastrophic against a wallet that gives up on terms after 30
+		// SECONDS: each abandoned take parked a maker for four times as long as the taker was even
+		// willing to wait, so a few retries wedged an entire fleet and the whole cross rail answered
+		// "busy, another lift is in flight" at every price level. Nothing was broken; everything was
+		// occupied by takers who had already left.
+		//
+		// 25s sits deliberately just INSIDE the taker's 30s patience: the slot frees before the taker
+		// that abandoned it has even moved on, so a retry down the book finds live makers rather than
+		// the wreckage of its own previous attempt.
+		t.TermsReqWait = 25 * time.Second
 	}
 	if t.BtcFundWait <= 0 {
 		t.BtcFundWait = 2 * time.Hour
