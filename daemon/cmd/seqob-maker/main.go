@@ -19,11 +19,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -45,6 +47,74 @@ import (
 
 var jsonMarshal = protojson.MarshalOptions{UseProtoNames: true}
 var jsonUnmarshal = protojson.UnmarshalOptions{DiscardUnknown: true}
+
+
+// ══ GRACEFUL SHUTDOWN: NEVER DIE MID-SWAP ════════════════════════════════════
+//
+// The maker fleet is repriced by killing the process and starting a fresh one.
+// With no signal handler, SIGTERM killed the maker WHEREVER it was — including
+// after it had locked the asset on-chain and issued its invoice, waiting for the
+// taker to pay. The relay then saw the maker depart and ended the session, so the
+// taker never received the leg it was waiting for: its trade hung until timeout
+// while the maker's asset stayed locked until T_seq. Nothing about the parent
+// chain was involved; the swap died for a process-lifecycle reason alone.
+//
+// The supervisor tried to avoid this by deferring the kill until the maker had
+// been LOG-QUIET for a while — but a maker mid-swap is quiet BY DEFINITION: it has
+// said everything it has to say and is waiting on its counterparty. The heuristic
+// therefore killed precisely the swaps it existed to protect. (subasset-requote.sh
+// says as much in its own comment, and names this as the proper fix.)
+//
+// So the maker now owns the decision, because only it knows whether value is in
+// flight: on SIGTERM it stops taking NEW lifts and exits once the ones it has are
+// done. The cap is a backstop against a wedged session holding a process forever —
+// it is deliberately longer than any honest swap needs, and exiting on it is still
+// safer than exiting immediately because the in-flight count is logged either way.
+var (
+	draining int32
+	busyFn   atomic.Value // func() int — how many swaps this serve loop still has in flight
+)
+
+// setBusyFn is called by whichever serve loop is running.
+func setBusyFn(f func() int) { busyFn.Store(f) }
+
+func inFlightSwaps() int {
+	if f, ok := busyFn.Load().(func() int); ok && f != nil {
+		return f()
+	}
+	return 0
+}
+
+// isDraining reports whether a shutdown has been requested; serve loops refuse NEW
+// lifts once it is set, so the drain can actually finish.
+func isDraining() bool { return atomic.LoadInt32(&draining) == 1 }
+
+func armGracefulShutdown(cap time.Duration) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-ch
+		atomic.StoreInt32(&draining, 1)
+		n := inFlightSwaps()
+		if n == 0 {
+			fmt.Printf("%v: no swap in flight; exiting cleanly\n", sig)
+			os.Exit(0)
+		}
+		fmt.Printf("%v: %d swap(s) IN FLIGHT — refusing new lifts and draining before exit"+
+			" (a kill here would strand a locked asset)\n", sig, n)
+		deadline := time.Now().Add(cap)
+		for time.Now().Before(deadline) {
+			time.Sleep(3 * time.Second)
+			if n = inFlightSwaps(); n == 0 {
+				fmt.Printf("drain complete; exiting cleanly\n")
+				os.Exit(0)
+			}
+		}
+		fmt.Printf("drain cap %s reached with %d swap(s) still in flight; exiting anyway"+
+			" (operator: check for a wedged session)\n", cap, n)
+		os.Exit(0)
+	}()
+}
 
 func main() {
 	relay := flag.String("relay", "http://127.0.0.1:9955", "relay base URL")
@@ -89,6 +159,8 @@ func main() {
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
 	requote := flag.Bool("requote", false, "cross/lightning/pureln: after each settled fill, reconnect dropped channel peers and re-post a FRESH offer (same offer id) instead of cancelling and exiting; keeps a live quote without a manual restart (default off = quote once then exit)")
 	flag.Parse()
+	// A reprice must never kill this process mid-swap; drain first (see armGracefulShutdown).
+	armGracefulShutdown(15 * time.Minute)
 
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
 	// from persisted per-session keys. Handle it before the key/offer setup.
@@ -272,6 +344,11 @@ func main() {
 func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey, wsURL string, expiry time.Duration) {
 	crypters := make(map[string]*client.Crypter)
 	accepted := make(map[string]bool)
+	// What "busy" means for this loop: a lift we have accepted and not yet settled.
+	// The shutdown drain reads this rather than guessing from log silence — a maker
+	// waiting on its counterparty is silent precisely when it must NOT be killed.
+	var serveMu sync.Mutex
+	setBusyFn(func() int { serveMu.Lock(); defer serveMu.Unlock(); return len(accepted) })
 	takes := make(map[string]uint64) // session -> take_amount, for the settle-ack fill_base (B-1)
 	o := maker.Offer
 	// Exit-for-requote (see requote_exit.go). A co-sign session quiet for 10
@@ -1037,6 +1114,8 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 	inFlight := 0
 	filled := false
 	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
+	// The shutdown drain asks the loop that owns the value, not the log.
+	setBusyFn(func() int { mu.Lock(); defer mu.Unlock(); return inFlight })
 	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
@@ -1145,6 +1224,16 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			}
 			if busy {
 				refuse(sid, cr, "busy", "another lift is in flight (whole-HTLC, one at a time)")
+				continue
+			}
+			if isDraining() {
+				// Shutting down: take no NEW value, so the swaps we already hold can drain.
+				// An explicit refusal is retryable against another maker; silence is not.
+				refuse(sid, cr, "draining", "this maker is shutting down for a re-quote; retry on another offer")
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
 				continue
 			}
 			if lr.GetTakeAmount() > o.GetBaseAmount() {
