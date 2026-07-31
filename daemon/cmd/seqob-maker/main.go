@@ -326,6 +326,33 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				time.Sleep(backoff)
 				continue
 			}
+			// RE-ATTACH EVERY IN-FLIGHT SESSION, exactly as serveCross does.
+			//
+			// Re-posting the offer restores this connection as the route for NEW lifts and
+			// says nothing about lifts already running. On the relay a role's courier frames
+			// are delivered by a pump started in attach(), and that pump dies with its
+			// connection; the fresh one carries no role binding, so we can neither receive
+			// the counterparty's frames nor send our own (wsSwapMsg answers 403 "not a
+			// participant"). The session is simply orphaned, in both directions.
+			//
+			// That is what breaks a submarine take across ordinary maker churn: we lock the
+			// asset on-chain, our socket blips, we re-post — and the taker never receives the
+			// leg it is waiting for. It waits out its timeout while our asset sits locked
+			// until T_seq. Nothing about the parent chain is involved; the trade fails for a
+			// courier reason alone, which is exactly the case where the DEX must keep working.
+			for sid := range accepted {
+				if we := writeWS(nc, &seqobv1.To{Msg: &seqobv1.To_SessionReattach{
+					SessionReattach: &seqobv1.SessionReattach{
+						SessionId: sid,
+						Role:      "maker",
+						Sig:       offer.SignReattach(sid, "maker", makerKey),
+					}}}); we != nil {
+					fmt.Printf("reconnect: re-attach of session %s FAILED: %v"+
+						" (its courier frames are stranded; the lift will time out)\n", sid, we)
+					continue
+				}
+				fmt.Printf("reconnect: re-attached session %s; couriered frames resume\n", sid)
+			}
 			return nc
 		}
 	}
