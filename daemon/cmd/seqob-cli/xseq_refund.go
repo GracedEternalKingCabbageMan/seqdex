@@ -75,11 +75,19 @@ func cmdXSeqRefund(args []string) {
 		},
 		Locktime: uint32(*tSeq),
 	}
-	// The refund path only touches the Sequentia side; no bitcoind is needed. The
-	// zero hash is inert here — the refund branch is a CLTV+signature spend and
-	// never evaluates the hashlock.
+	// The refund path only touches the Sequentia side, but NewSwapBitcoin builds its
+	// BTC backend eagerly and dereferences the chain's params, so a nil BTC chain
+	// segfaults at construction rather than staying unused. Hand it the same inert
+	// stand-in xfund-seq uses: never dialled, only its params are read. The zero hash
+	// is likewise inert — the refund branch is a CLTV+signature spend and never
+	// evaluates the hashlock.
+	btcParams, err := xchain.BitcoinChainParams("testnet4")
+	if err != nil {
+		fatal("chain params: %v", err)
+	}
+	dummyBtc := xchain.NewBitcoinChain(xchain.NewRPC("127.0.0.1", 1, "x", "x"), "", btcParams)
 	ops := &client.LiveXcOps{
-		Swap: xchain.NewSwapBitcoin(nil, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
+		Swap: xchain.NewSwapBitcoin(dummyBtc, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
 		SEQ:  seqChain,
 	}
 	refundTxid, err := client.RefundTakerSEQ(ops, leg, xchain.KeyFromBytes(kb), uint32(*tSeq), *asset, *spendFee, *wait, 15*time.Second)
