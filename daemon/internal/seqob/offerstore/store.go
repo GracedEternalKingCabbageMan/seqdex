@@ -911,6 +911,35 @@ func (s *Store) RemoveInteractiveByMaker(makerPubkey string) int {
 	return len(victims)
 }
 
+// RemoveInteractiveByKeys removes exactly the named non-covenant offers. It is the
+// per-CONNECTION eviction primitive: pubkey-scoped eviction cannot tell two maker
+// processes sharing one identity key apart, so a dead sibling's offers ghosted while
+// any live sibling pinned the pubkey — and won price-time ties with prices no live
+// process would honor. The caller names the keys the departed connection itself
+// posted; a key re-posted since (and so owned by a live connection) is not passed in.
+func (s *Store) RemoveInteractiveByKeys(keys []Key) int {
+	s.mu.Lock()
+	type ev struct {
+		pair *seqobv1.AssetPair
+		conf bool
+		ref  *seqobv1.OfferRef
+	}
+	evs := make([]ev, 0, len(keys))
+	for _, k := range keys {
+		e, ok := s.entries[k]
+		if !ok || e.Offer.GetCovenant() != nil {
+			continue
+		}
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.remove(k)
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
+	}
+	return len(evs)
+}
+
 func (s *Store) RemoveByMaker(makerPubkey string) int {
 	s.mu.Lock()
 	victims := make([]Key, 0)

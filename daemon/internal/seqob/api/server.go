@@ -56,6 +56,13 @@ type Server struct {
 	// routed to an online maker. Best-effort (Phase-1).
 	makerConns *connRegistry
 
+	// offerOwners tracks which CONNECTION posted each resting offer. Pubkey-scoped
+	// eviction cannot tell two maker processes sharing one identity key apart (a
+	// requote overlap, a stray sibling), so a dead process's offers ghosted while any
+	// live sibling pinned the pubkey. Ownership transfers on a re-post of the same key.
+	ownerMu     sync.Mutex
+	offerOwners map[offerstore.Key]*wsConn
+
 	// liftMu guards liftActive, the per-offer active-lift-session map (P3.10): one live
 	// lift session per NON-covenant offer, so two takers cannot open concurrent sessions
 	// on the same order (the 2nd would waste a session and race the maker's single coins).
@@ -96,10 +103,11 @@ func New(store *offerstore.Store, v *validator.Validator, sessions *session.Rout
 			WriteBufferSize: 4096,
 			CheckOrigin:     func(*http.Request) bool { return true },
 		},
-		makerConns: newConnRegistry(),
-		liftActive: make(map[offerstore.Key]string),
-		takerConns: make(map[string]*wsConn),
-		pumped:     make(map[string]map[session.Role]int),
+		makerConns:  newConnRegistry(),
+		offerOwners: make(map[offerstore.Key]*wsConn),
+		liftActive:  make(map[offerstore.Key]string),
+		takerConns:  make(map[string]*wsConn),
+		pumped:      make(map[string]map[session.Role]int),
 	}
 	// The relay notifies an online maker (via From.lift_requested) whenever a taker
 	// lifts one of its offers, so the maker can derive the E2E key and co-sign.

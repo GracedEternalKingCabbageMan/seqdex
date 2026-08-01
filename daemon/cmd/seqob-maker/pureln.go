@@ -260,6 +260,15 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 				fmt.Printf("swap %s: crypter error: %v\n", sid, err)
 				continue
 			}
+			// A lift NAMES the offer it takes, but the relay routes it to this maker by PUBKEY —
+			// and a stable identity key can be shared by siblings (a requote overlap, a stray
+			// process). Negotiating someone else's offer with OUR terms rejects the taker only
+			// AFTER it may have committed funds ("btc leg X != required Y", seen live). Refuse
+			// up front instead: an honest, instant "wrong maker process" costs the taker nothing.
+			if lr.GetOfferId() != o.GetOfferId() {
+				refuse(sid, cr, "stale_offer", "this maker process serves offer "+o.GetOfferId()+", not "+lr.GetOfferId())
+				continue
+			}
 			mu.Lock()
 			busy, done := inFlight > 0, filled
 			var in chan []byte

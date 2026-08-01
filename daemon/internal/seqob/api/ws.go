@@ -189,6 +189,19 @@ func (s *Server) closeConn(c *wsConn) {
 		s.store.RemoveByMaker(pubkey)
 		s.evictGhostOffersAfterGrace(pubkey)
 	}
+	// Per-CONNECTION eviction: the pubkey paths above only fire when this connection was
+	// the pubkey's registered endpoint at close time. A sibling under the same identity
+	// key overwrites that registration, so the offers THIS connection posted are evicted
+	// by ownership instead — after the same grace, sparing anything re-posted since.
+	ownKeys := make([]offerstore.Key, 0)
+	s.ownerMu.Lock()
+	for k, owner := range s.offerOwners {
+		if owner == c {
+			ownKeys = append(ownKeys, k)
+		}
+	}
+	s.ownerMu.Unlock()
+	s.evictConnOffersAfterGrace(c, ownKeys)
 	s.releaseAbandonedLifts(c)
 	c.conn.Close()
 }
@@ -420,6 +433,7 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 			// maker no rate budget; do not re-submit (the store would reject the
 			// duplicate key). Re-register reachability and re-ack the live status.
 			s.registerMaker(c, o.GetMakerPubkey())
+			s.ownOffer(c, o)
 			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 			return
 		}
@@ -437,6 +451,7 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 				return
 			}
 			s.registerMaker(c, o.GetMakerPubkey())
+			s.ownOffer(c, o)
 			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 			return
 		}
@@ -445,6 +460,7 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 	}
 	// Register this connection as the maker's reachable endpoint for live lifts.
 	s.registerMaker(c, o.GetMakerPubkey())
+	s.ownOffer(c, o)
 
 	// Continuous matching under the order's time-in-force: cross the freshly-rested
 	// order against the resting opposite side, routing From.matched to the
@@ -476,6 +492,7 @@ func (s *Server) wsOfferEdit(c *wsConn, o *seqobv1.Offer, ip string) {
 		c.sendErr(409, "edit: "+err.Error())
 		return
 	}
+	s.ownOffer(c, o)
 	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: &seqobv1.OrderStatus{
 		OfferId: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey(),
 		Status: seqobv1.OfferStatus_OFFER_STATUS_OPEN, ActiveAmount: o.GetBaseAmount(),
@@ -489,6 +506,44 @@ func (s *Server) registerMaker(c *wsConn, makerPubkey string) {
 	c.makerPubkey = makerPubkey
 	c.mu.Unlock()
 	s.makerConns.set(makerPubkey, c)
+}
+
+// ownOffer records that THIS connection posted (or re-posted) the offer, so eviction
+// can be scoped to the connection rather than the pubkey. A re-post of the same key by
+// a sibling or a reconnected agent transfers ownership, which is exactly what spares
+// it at grace time.
+func (s *Server) ownOffer(c *wsConn, o *seqobv1.Offer) {
+	k := offerstore.Key{OfferID: o.GetOfferId(), MakerPubkey: o.GetMakerPubkey()}
+	s.ownerMu.Lock()
+	s.offerOwners[k] = c
+	s.ownerMu.Unlock()
+}
+
+// evictConnOffersAfterGrace removes the interactive offers a departed connection still
+// OWNS once the reconnect grace passes. Ownership — not the pubkey — decides: a live
+// sibling process under the same identity key keeps the pubkey registered forever, so
+// the pubkey-scoped evictGhostOffersAfterGrace never fired and the dead sibling's
+// offers ghosted at top of book until TTL (seen live: two prices resting under one
+// key, takers routed to the process that would not honor the one they took).
+func (s *Server) evictConnOffersAfterGrace(c *wsConn, keys []offerstore.Key) {
+	if len(keys) == 0 {
+		return
+	}
+	go func() {
+		time.Sleep(makerReconnectGrace)
+		stale := make([]offerstore.Key, 0, len(keys))
+		s.ownerMu.Lock()
+		for _, k := range keys {
+			if s.offerOwners[k] == c { // not re-posted by anyone since; still the dead conn's
+				delete(s.offerOwners, k)
+				stale = append(stale, k)
+			}
+		}
+		s.ownerMu.Unlock()
+		if n := s.store.RemoveInteractiveByKeys(stale); n > 0 {
+			fmt.Printf("[book] evicted %d unliftable offer(s) posted by a departed maker connection\n", n)
+		}
+	}()
 }
 
 // restingStatus returns the live OrderStatus for o's key, falling back to a fresh
