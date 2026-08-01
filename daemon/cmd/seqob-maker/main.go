@@ -459,6 +459,16 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				fmt.Printf("lift %s: crypter error: %v\n", lr.GetSessionId(), err)
 				continue
 			}
+			// The relay routes lifts to this maker by PUBKEY, and a stable identity key can be
+			// shared by sibling processes; a lift for an offer this process never posted must not
+			// be negotiated with OUR offer's terms. Same-chain lifts commit nothing before the
+			// co-sign, so skipping registration is a safe refusal — the taker's request finds no
+			// session and times out on its own short deadline.
+			if lr.GetOfferId() != o.GetOfferId() {
+				fmt.Printf("lift %s: for offer %s, but this process serves %s; ignoring (sibling maker owns it)\n",
+					lr.GetSessionId(), lr.GetOfferId(), o.GetOfferId())
+				continue
+			}
 			crypters[lr.GetSessionId()] = cr
 			takes[lr.GetSessionId()] = lr.GetTakeAmount()
 			fmt.Printf("lift requested: session %s offer %s take %d\n",
