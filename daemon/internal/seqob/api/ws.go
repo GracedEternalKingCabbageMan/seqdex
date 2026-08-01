@@ -277,6 +277,18 @@ func (s *Server) releaseAbandonedLifts(c *wsConn) {
 				return
 			}
 			s.sessions.Abort(sid)
+			// AND TELL THE MAKER, or it waits out a deadline measured in hours.
+			//
+			// Abort tears down the relay's side of the session, but the maker learns nothing from that:
+			// it is BLOCKED on a receive (waiting for the taker's funded-BTC announcement, up to 2h on
+			// the cross rail) and only ever discovers a dead counterparty by trying to SEND. So the one
+			// lift slot that offer has stayed held long after the taker was gone, and every other taker
+			// was refused "busy, another lift is in flight" for the rest of it.
+			//
+			// This is the same error the maker already acts on when its own send fails, carrying the
+			// session id so it can free exactly that slot. Push it rather than waiting for the maker to
+			// speak first.
+			s.notifyMakerTakerGone(sid)
 		}(sid)
 	}
 }
@@ -602,6 +614,33 @@ func (s *Server) wsSessionReattach(c *wsConn, ra *seqobv1.SessionReattach) {
 // From.lift_requested to the maker's live connection (if any) carrying the
 // taker's session pubkey, and bind the maker so it receives couriered frames.
 // The relay never decrypts; it only routes.
+// notifyMakerTakerGone tells the maker that a session's taker has gone, so it can release that
+// offer's single lift slot instead of blocking on a receive until its deadline expires.
+//
+// It reuses the SAME error the maker already handles when one of its own sends is refused, id and
+// all, so there is one shape to understand on the maker side rather than two.
+//
+// Best-effort by design: the session is already aborted, so a maker that is itself offline simply
+// finds the session gone when it returns. Called after Abort, when the session is no longer in the
+// router, so the maker pubkey is read from the connection registry via the recorded lift.
+func (s *Server) notifyMakerTakerGone(sid string) {
+	s.liftMu.Lock()
+	var maker string
+	for k, live := range s.liftActive {
+		if live == sid {
+			maker = k.MakerPubkey
+			break
+		}
+	}
+	s.liftMu.Unlock()
+	if maker == "" {
+		return
+	}
+	if mc, ok := s.makerConns.get(maker); ok {
+		mc.sendErr(409, "courier: the taker is not attached to session "+sid)
+	}
+}
+
 func (s *Server) notifyMaker(sess *session.Session) {
 	mc, ok := s.makerConns.get(sess.MakerPubkey)
 	if !ok {
