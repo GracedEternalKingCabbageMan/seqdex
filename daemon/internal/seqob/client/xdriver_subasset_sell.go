@@ -537,3 +537,67 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	p.logf("subasset-sell taker: claimed BTC on-chain in %s (asset paid over LN, BTC received)", claimTxid)
 	return res, nil
 }
+
+// --- mixed same-chain ops (rails 7/8, SELL orientation): the on-chain leg is
+// an ISSUED asset ------------------------------------------------------------
+//
+// The sub-asset SELL construction with the QUOTE asset standing in BTC's
+// structural place: the maker LOCKS the quote asset in an on-chain HTLC on the
+// SEQUENTIA chain (claim=taker with P, refund=maker) and receives the base
+// asset over Lightning; the taker pays the base over LN (learning P) and
+// claims the on-chain quote HTLC. Identical courier protocol and drivers —
+// these ops re-point the chain-facing methods at the Sequentia chain + quote
+// asset (xchain.NewSwapAsset).
+
+// LiveSubAssetSellMakerOpsSeq is LiveSubAssetSellMakerOps for the mixed
+// same-chain shape. Heights/locktimes are SEQUENTIA heights; LockBTCLeg funds
+// the HTLC with the QUOTE asset from the node wallet behind seq.
+type LiveSubAssetSellMakerOpsSeq struct {
+	LiveSubAssetSellMakerOps
+	Seq *xchain.Chain
+}
+
+// NewLiveSubAssetSellMakerOpsSeq builds the sell-maker's mixed same-chain ops
+// over a HashLock that KNOWS P (NewHashLock), like the live ops it wraps.
+func NewLiveSubAssetSellMakerOpsSeq(seq *xchain.Chain, quoteAsset string, assetLN xchain.LNLeg, preimage []byte) *LiveSubAssetSellMakerOpsSeq {
+	return &LiveSubAssetSellMakerOpsSeq{
+		LiveSubAssetSellMakerOps: LiveSubAssetSellMakerOps{
+			Swap:    xchain.NewSwapAsset(seq, quoteAsset, xchain.NewHashLock(preimage)),
+			AssetLN: assetLN,
+		},
+		Seq: seq,
+	}
+}
+
+func (o *LiveSubAssetSellMakerOpsSeq) BtcTip() (int64, error) { return o.Seq.BlockCount() }
+func (o *LiveSubAssetSellMakerOpsSeq) BtcConfirmations(txid string) (int, error) {
+	return o.Seq.TxConfirmations(txid)
+}
+
+// LiveSubAssetSellTakerOpsSeq is LiveSubAssetSellTakerOps for the mixed
+// same-chain shape: the taker verifies + claims the maker's on-chain HTLC on
+// the QUOTE asset on the Sequentia chain.
+type LiveSubAssetSellTakerOpsSeq struct {
+	LiveSubAssetSellTakerOps
+	Seq        *xchain.Chain
+	QuoteAsset string
+}
+
+// NewLiveSubAssetSellTakerOpsSeq builds the sell-taker's mixed same-chain ops
+// over a hash-only lock (the taker learns P by paying the asset over LN).
+func NewLiveSubAssetSellTakerOpsSeq(seq *xchain.Chain, quoteAsset string, assetLN xchain.LNLeg, hashH []byte) *LiveSubAssetSellTakerOpsSeq {
+	return &LiveSubAssetSellTakerOpsSeq{
+		LiveSubAssetSellTakerOps: LiveSubAssetSellTakerOps{
+			Swap:    xchain.NewSwapAsset(seq, quoteAsset, xchain.NewHashLockFromHash(hashH)),
+			AssetLN: assetLN,
+		},
+		Seq:        seq,
+		QuoteAsset: quoteAsset,
+	}
+}
+
+func (o *LiveSubAssetSellTakerOpsSeq) BtcTip() (int64, error) { return o.Seq.BlockCount() }
+func (o *LiveSubAssetSellTakerOpsSeq) VerifyBTCLeg(hashH, takerClaimPub, makerRefundPub, providedScript []byte, btcLocktime uint32,
+	txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error) {
+	return o.Swap.VerifyBTCLeg(hashH, takerClaimPub, makerRefundPub, providedScript, btcLocktime, txid, vout, amount, o.QuoteAsset, minConf)
+}

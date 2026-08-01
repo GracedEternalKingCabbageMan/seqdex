@@ -43,6 +43,7 @@ type xsubasState struct {
 	OfferID          string `json:"offer_id"`
 	MakerPubkey      string `json:"maker_pubkey"`
 	Asset            string `json:"asset"`
+	QuoteAsset       string `json:"quote_asset,omitempty"` // mixed same-chain: the on-chain leg's REAL asset (empty = BTC)
 	AssetAmount      uint64 `json:"asset_amount"`
 	BtcAmount        uint64 `json:"btc_amount"`
 	SecretHex        string `json:"secret_hex"`
@@ -87,6 +88,9 @@ func cmdXSubAs(args []string) {
 	btcWallet := fs.String("btc-wallet", "", "bitcoind wallet funding the BTC HTLC")
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's SeqLN-on-Sequentia lightning-rpc unix socket (asset leg) (required)")
+	quoteAsset := fs.String("quote-asset", "", "MIXED SAME-CHAIN (rails 7/8): the QUOTE asset id (hex). The on-chain leg becomes an HTLC on THIS Sequentia asset (funded/refunded via -xseq-rpc) instead of BTC; the pair is <asset>/<quote-asset>.")
+	xseqRPCURL := fs.String("xseq-rpc", "", "mixed same-chain: Sequentia node RPC URL http://user:pass@host:port (funds + refunds the on-chain quote-asset HTLC)")
+	xseqWallet := fs.String("xseq-wallet", "", "mixed same-chain: Sequentia node wallet funding the quote-asset HTLC")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations to wait on our own BTC leg before announcing")
 	takeAmount := fs.Uint64("amount", 0, "T8 PARTIAL FILL: asset atoms to take (<= the offer). 0 = the whole offer. The BTC you lock is the proportional price, rounded up; the maker re-rests the remainder.")
 	invoiceMode := fs.String("asset-invoice", "plain", "asset LN invoice mode: plain (bare BOLT11 whose payment_hash=H; no plugin) | hold (holdinvoice-plugin invoice; explicit settle). Both are equally atomic: the on-chain BTC HTLC is the hold.")
@@ -161,8 +165,13 @@ func cmdXSubAs(args []string) {
 	}
 
 	// 1. Find + verify a matching sub-asset offer (maker SELLS: LnAssetLNForBTC).
+	// Mixed same-chain: the pair's quote is the REAL asset the on-chain leg pays.
+	quote := offer.BTCSentinel
+	if *quoteAsset != "" {
+		quote = *quoteAsset
+	}
 	var book seqobv1.PublicBook
-	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, offer.BTCSentinel), &book); err != nil {
+	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, quote), &book); err != nil {
 		fatal("get book: %v", err)
 	}
 	var target *seqobv1.Offer
@@ -195,7 +204,7 @@ func cmdXSubAs(args []string) {
 		break
 	}
 	if target == nil {
-		fatal("no verified sub-asset offer found to buy %s with on-chain BTC (use `seqob-cli book -base %s -quote BTC`)", *asset, *asset)
+		fatal("no verified sub-asset offer found to buy %s with on-chain %s (use `seqob-cli book -base %s -quote %s`)", *asset, quote, *asset, quote)
 	}
 
 	wholeAsset := target.GetOfferAmount() // the asset the maker gives over LN (the whole offer)
@@ -218,18 +227,35 @@ func cmdXSubAs(args []string) {
 			return ""
 		}())
 
-	// 2. Wire bitcoind (BTC leg) + the asset LN node (asset leg). Validate both.
-	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
-	if err != nil {
-		fatal("-btc-rpc: %v", err)
-	}
-	params, err := xchain.BitcoinChainParams(*btcChainName)
-	if err != nil {
-		fatal("-btc-chain: %v", err)
-	}
-	btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
-	if _, err := btcChain.BlockCount(); err != nil {
-		fatal("bitcoind unreachable: %v", err)
+	// 2. Wire the on-chain leg (bitcoind, or the Sequentia chain for the mixed
+	// same-chain shape) + the asset LN node (asset leg). Validate both.
+	var btcChain *xchain.BitcoinChain
+	var seqChain *xchain.Chain
+	if *quoteAsset != "" {
+		if *xseqRPCURL == "" {
+			fatal("-quote-asset requires -xseq-rpc (the Sequentia node funding the on-chain quote-asset HTLC)")
+		}
+		seqRPC, err := xliftRPCFromURL(*xseqRPCURL)
+		if err != nil {
+			fatal("-xseq-rpc: %v", err)
+		}
+		seqChain = xchain.NewChain(seqRPC, *xseqWallet)
+		if _, err := seqChain.BlockCount(); err != nil {
+			fatal("sequentia node unreachable: %v", err)
+		}
+	} else {
+		btcRPC, err := xliftRPCFromURL(*btcRPCURL)
+		if err != nil {
+			fatal("-btc-rpc: %v", err)
+		}
+		params, err := xchain.BitcoinChainParams(*btcChainName)
+		if err != nil {
+			fatal("-btc-chain: %v", err)
+		}
+		btcChain = xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
+		if _, err := btcChain.BlockCount(); err != nil {
+			fatal("bitcoind unreachable: %v", err)
+		}
 	}
 	if _, err := xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset).NodeID(); err != nil {
 		fatal("asset lightning-rpc %s unreachable: %v", *assetLnSocket, err)
@@ -259,6 +285,7 @@ func cmdXSubAs(args []string) {
 		OfferID:          target.GetOfferId(),
 		MakerPubkey:      target.GetMakerPubkey(),
 		Asset:            *asset,
+		QuoteAsset:       *quoteAsset,
 		AssetAmount:      assetAtoms,
 		BtcAmount:        btcSats,
 		SecretHex:        secretHex,
@@ -324,11 +351,18 @@ func cmdXSubAs(args []string) {
 	if extHashH != nil {
 		htlcLock = xchain.NewHashLockFromHash(extHashH)
 	}
-	takerOps := &client.LiveSubAssetTakerOps{
-		Swap:    xchain.NewSwapBitcoin(btcChain, nil, htlcLock),
-		AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
-		BTC:     btcChain,
-		Plain:   *invoiceMode == "plain" && *takerLnNodeID == "",
+	var takerOps client.SubAssetTakerOps
+	if *quoteAsset != "" {
+		takerOps = client.NewLiveSubAssetTakerOpsSeq(seqChain, *quoteAsset,
+			xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset), htlcLock,
+			*invoiceMode == "plain" && *takerLnNodeID == "")
+	} else {
+		takerOps = &client.LiveSubAssetTakerOps{
+			Swap:    xchain.NewSwapBitcoin(btcChain, nil, htlcLock),
+			AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
+			BTC:     btcChain,
+			Plain:   *invoiceMode == "plain" && *takerLnNodeID == "",
+		}
 	}
 	res, err := client.RunTakerSubAsset(client.TakerSubAssetParams{
 		Ops:                  takerOps,
@@ -368,8 +402,8 @@ func cmdXSubAs(args []string) {
 			st.Status = "aborted_refundable"
 			st.save(*stateFile)
 			if *refundWait {
-				fmt.Printf("refunding the BTC HTLC after T_btc=%d (polling)...\n", res.BtcLocktime)
-				txid, rerr := refundSubAsBTC(btcChain, res.BtcLeg, btcRefundKey, hashArr[:], res.BtcLocktime, *spendFee, true)
+				fmt.Printf("refunding the on-chain HTLC after T=%d (polling)...\n", res.BtcLocktime)
+				txid, rerr := client.RefundTakerOnchainLeg(takerOps, res.BtcLeg, btcRefundKey, res.BtcLocktime, *spendFee, true, 15*time.Second)
 				if rerr != nil {
 					fatal("refund: %v", rerr)
 				}
@@ -406,9 +440,11 @@ func cmdXSubAs(args []string) {
 func cmdXSubAsRefund(args []string) {
 	fs := newFlagSet("xsubas-refund")
 	stateFile := fs.String("state-file", "xsubas-session.json", "session state written by xsubas")
-	btcRPCURL := fs.String("btc-rpc", "", "bitcoind RPC URL http://user:pass@host:port (required)")
+	btcRPCURL := fs.String("btc-rpc", "", "bitcoind RPC URL http://user:pass@host:port (required for a BTC leg)")
 	btcWallet := fs.String("btc-wallet", "", "bitcoind wallet")
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
+	xseqRPCURL := fs.String("xseq-rpc", "", "mixed same-chain (state has quote_asset): Sequentia node RPC URL")
+	xseqWallet := fs.String("xseq-wallet", "", "mixed same-chain: Sequentia node wallet")
 	spendFee := fs.Uint64("spend-fee", 1000, "refund fee (sats)")
 	wait := fs.Bool("wait", false, "poll until T_btc passes instead of failing when early")
 	_ = fs.Parse(args)
@@ -427,19 +463,6 @@ func cmdXSubAsRefund(args []string) {
 	if st.Status == "settled" {
 		fatal("session settled (the maker owns the BTC leg); nothing to refund")
 	}
-	if *btcRPCURL == "" {
-		fatal("xsubas-refund requires -btc-rpc")
-	}
-	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
-	if err != nil {
-		fatal("-btc-rpc: %v", err)
-	}
-	params, err := xchain.BitcoinChainParams(*btcChainName)
-	if err != nil {
-		fatal("-btc-chain: %v", err)
-	}
-	btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
-
 	script, err := hex.DecodeString(st.BtcLegScriptHex)
 	if err != nil {
 		fatal("state btc_leg_script_hex: %v", err)
@@ -457,7 +480,34 @@ func cmdXSubAsRefund(args []string) {
 		Funded:   &xchain.FundedHTLC{TxID: st.BtcLegTxid, Vout: st.BtcLegVout, Amount: st.BtcLegAmount},
 		Locktime: st.BtcLocktime,
 	}
-	txid, err := refundSubAsBTC(btcChain, leg, xchain.KeyFromBytes(keyBytes), hashH, st.BtcLocktime, *spendFee, *wait)
+	var txid string
+	if st.QuoteAsset != "" {
+		// Mixed same-chain: the funded leg is a Sequentia HTLC on the quote asset.
+		if *xseqRPCURL == "" {
+			fatal("state has quote_asset %s: xsubas-refund requires -xseq-rpc", st.QuoteAsset)
+		}
+		seqRPC, rerr := xliftRPCFromURL(*xseqRPCURL)
+		if rerr != nil {
+			fatal("-xseq-rpc: %v", rerr)
+		}
+		seqChain := xchain.NewChain(seqRPC, *xseqWallet)
+		ops := client.NewLiveSubAssetTakerOpsSeq(seqChain, st.QuoteAsset, nil, xchain.NewHashLockFromHash(hashH), false)
+		txid, err = client.RefundTakerOnchainLeg(ops, leg, xchain.KeyFromBytes(keyBytes), st.BtcLocktime, *spendFee, *wait, 15*time.Second)
+	} else {
+		if *btcRPCURL == "" {
+			fatal("xsubas-refund requires -btc-rpc")
+		}
+		btcRPC, rerr := xliftRPCFromURL(*btcRPCURL)
+		if rerr != nil {
+			fatal("-btc-rpc: %v", rerr)
+		}
+		params, perr := xchain.BitcoinChainParams(*btcChainName)
+		if perr != nil {
+			fatal("-btc-chain: %v", perr)
+		}
+		btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
+		txid, err = refundSubAsBTC(btcChain, leg, xchain.KeyFromBytes(keyBytes), hashH, st.BtcLocktime, *spendFee, *wait)
+	}
 	if err != nil {
 		if errors.Is(err, client.ErrXcRefundNotDue) {
 			fatal("%v (re-run with -wait to poll until due)", err)

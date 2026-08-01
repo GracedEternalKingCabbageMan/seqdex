@@ -813,3 +813,71 @@ func RefundSubAssetBTC(ops SubAssetTakerOps, leg *xchain.LegLock, refundKey *xch
 	}
 	return ops.RefundBTCLeg(leg, refundKey, btcLocktime, xcSafeFee(spendFeeSats, btcAmount))
 }
+
+// --- mixed same-chain ops (rails 7/8): the on-chain leg is an ISSUED asset --
+//
+// The sub-asset construction with the QUOTE asset standing in BTC's structural
+// place (Principle 3: no privileged unit): the base asset moves over Lightning
+// exactly as in the sub-asset swap, and the "BTC leg" is an on-chain HTLC on
+// the quote ASSET, on the SAME Sequentia chain, verified/claimed/refunded in
+// Elements format (xchain.NewSwapAsset). Everything else — the courier
+// protocol, the hold-invoice discipline, the drivers (RunMakerSubAsset /
+// RunTakerSubAsset) — is IDENTICAL, so these ops are the live ops with the
+// chain-facing methods re-pointed at the Sequentia chain + quote asset.
+
+// LiveSubAssetMakerOpsSeq is LiveSubAssetMakerOps for the mixed same-chain
+// shape. "BtcTip"/locktimes are SEQUENTIA heights; VerifyBTCLeg requires the
+// funded leg to pay the quote asset.
+type LiveSubAssetMakerOpsSeq struct {
+	LiveSubAssetMakerOps
+	Seq        *xchain.Chain
+	QuoteAsset string
+}
+
+// NewLiveSubAssetMakerOpsSeq builds the maker's mixed same-chain ops for a swap
+// whose taker H is hashH: the quote-asset HTLC swap embeds hashH so
+// VerifyBTCLeg/ClaimBTCLeg recompute and match it.
+func NewLiveSubAssetMakerOpsSeq(seq *xchain.Chain, quoteAsset string, assetLN xchain.LNLeg, hashH []byte) *LiveSubAssetMakerOpsSeq {
+	return &LiveSubAssetMakerOpsSeq{
+		LiveSubAssetMakerOps: LiveSubAssetMakerOps{
+			Swap:    xchain.NewSwapAsset(seq, quoteAsset, xchain.NewHashLockFromHash(hashH)),
+			AssetLN: assetLN,
+		},
+		Seq:        seq,
+		QuoteAsset: quoteAsset,
+	}
+}
+
+func (o *LiveSubAssetMakerOpsSeq) BtcTip() (int64, error) { return o.Seq.BlockCount() }
+func (o *LiveSubAssetMakerOpsSeq) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, providedScript []byte, btcLocktime uint32,
+	txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error) {
+	return o.Swap.VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, providedScript, btcLocktime, txid, vout, amount, o.QuoteAsset, minConf)
+}
+
+// LiveSubAssetTakerOpsSeq is LiveSubAssetTakerOps for the mixed same-chain
+// shape: the taker funds/refunds the on-chain HTLC on the QUOTE asset via the
+// Sequentia chain (LockBTCLeg routes through the asset-aware Swap; amountCoins
+// is denominated in the quote asset's coins).
+type LiveSubAssetTakerOpsSeq struct {
+	LiveSubAssetTakerOps
+	Seq *xchain.Chain
+}
+
+// NewLiveSubAssetTakerOpsSeq builds the taker's mixed same-chain ops. lock is
+// the HTLC hashlock (NewHashLock(secret) or NewHashLockFromHash for an
+// external/device H), matching the CLI's construction of the live ops.
+func NewLiveSubAssetTakerOpsSeq(seq *xchain.Chain, quoteAsset string, assetLN xchain.LNLeg, lock *xchain.HashLock, plain bool) *LiveSubAssetTakerOpsSeq {
+	return &LiveSubAssetTakerOpsSeq{
+		LiveSubAssetTakerOps: LiveSubAssetTakerOps{
+			Swap:    xchain.NewSwapAsset(seq, quoteAsset, lock),
+			AssetLN: assetLN,
+			Plain:   plain,
+		},
+		Seq: seq,
+	}
+}
+
+func (o *LiveSubAssetTakerOpsSeq) BtcTip() (int64, error) { return o.Seq.BlockCount() }
+func (o *LiveSubAssetTakerOpsSeq) BtcConfirmations(txid string) (int, error) {
+	return o.Seq.TxConfirmations(txid)
+}

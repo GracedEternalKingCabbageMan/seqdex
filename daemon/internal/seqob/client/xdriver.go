@@ -1078,6 +1078,21 @@ func RunTakerForward(p TakerForwardParams, send XcSend, recv XcRecv) (*TakerForw
 var ErrXcRefundNotDue = errors.New("btc refund locktime not yet reached")
 
 func RefundTakerBTC(ops XcOps, leg *xchain.LegLock, key *xchain.Key, locktime uint32, spendFeeSats uint64, wait bool, poll time.Duration) (string, error) {
+	return RefundTakerOnchainLeg(ops, leg, key, locktime, spendFeeSats, wait, poll)
+}
+
+// OnchainRefunder is the minimal seam RefundTakerOnchainLeg needs: every taker
+// ops family (cross XcOps, sub-asset, and the mixed same-chain Seq variants)
+// exposes exactly these two calls, so one refund loop serves them all.
+type OnchainRefunder interface {
+	BtcTip() (int64, error)
+	RefundBTCLeg(leg *xchain.LegLock, key *xchain.Key, nLockTime uint32, fee uint64) (string, error)
+}
+
+// RefundTakerOnchainLeg reclaims a taker-funded on-chain HTLC leg (BTC, or the
+// quote ASSET in the mixed same-chain shape) via the CLTV refund branch once
+// the leg's chain tip reaches locktime; wait=true polls until due.
+func RefundTakerOnchainLeg(ops OnchainRefunder, leg *xchain.LegLock, key *xchain.Key, locktime uint32, spendFeeSats uint64, wait bool, poll time.Duration) (string, error) {
 	if poll <= 0 {
 		poll = 15 * time.Second
 	}

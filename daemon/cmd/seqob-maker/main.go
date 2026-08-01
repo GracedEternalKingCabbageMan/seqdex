@@ -189,6 +189,9 @@ func main() {
 			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
 			feeAsset: *feeAsset, expiry: *expiry, offerID: *offerID,
 			btcRPCURL: *btcRPCURL, btcWallet: *btcWallet, btcChainName: *btcChainName,
+			// Mixed same-chain (rails 7/8): -quote-asset makes the on-chain leg an
+			// HTLC on that Sequentia asset (via -xseq-rpc/-xseq-wallet), no bitcoind.
+			quoteAsset: *quoteAsset, seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet,
 			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
 			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
 		})
@@ -202,6 +205,9 @@ func main() {
 			asset:       *base, assetAmt: *baseAmt, btcSats: *quoteAmt,
 			feeAsset: *feeAsset, expiry: *expiry, minAnchor: uint32(*minAnchor), offerID: *offerID,
 			btcRPCURL: *btcRPCURL, btcWallet: *btcWallet, btcChainName: *btcChainName,
+			// Mixed same-chain (rails 7/8): -quote-asset makes the on-chain leg an
+			// HTLC on that Sequentia asset (via -xseq-rpc/-xseq-wallet), no bitcoind.
+			quoteAsset: *quoteAsset, seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet,
 			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
 			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
 		})
