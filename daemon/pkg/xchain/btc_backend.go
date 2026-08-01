@@ -90,8 +90,12 @@ func (b *elementsBTCBackend) LockBTCLeg(script []byte, amountCoins string, lockt
 	if err != nil {
 		return nil, 0, err
 	}
+	// Regtest harness convenience: mine the funding in and report its height.
+	// On a LIVE network (the PoS testnet/mainnet cannot generatetoaddress) this
+	// fails — that is not an error: return height 0 (broadcast-only) and let
+	// the caller poll confirmations, exactly the bitcoin backend's live path.
 	if err := b.chain.Mine(1); err != nil {
-		return nil, 0, err
+		return &LegLock{Script: script, Funded: funded, Locktime: locktime}, 0, nil
 	}
 	hp, err := b.chain.BlockCount()
 	if err != nil {
