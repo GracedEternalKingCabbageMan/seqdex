@@ -82,6 +82,9 @@ func cmdXSubAsSell(args []string) {
 	btcWallet := fs.String("btc-wallet", "", "bitcoind wallet that RECEIVES the claimed BTC")
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
 	assetLnSocket := fs.String("asset-ln-socket", "", "the taker's asset LN node (pays the asset over LN) (required)")
+	quoteAsset := fs.String("quote-asset", "", "MIXED SAME-CHAIN (rails 7/8): the QUOTE asset id (hex). The maker's on-chain HTLC is on THIS Sequentia asset (verified + claimed via -xseq-rpc) instead of BTC; the pair is <asset>/<quote-asset>.")
+	xseqRPCURL := fs.String("xseq-rpc", "", "mixed same-chain: Sequentia node RPC URL (verifies + claims the on-chain quote-asset HTLC)")
+	xseqWallet := fs.String("xseq-wallet", "", "mixed same-chain: Sequentia node wallet that receives the claimed quote asset")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations required on the maker's BTC HTLC before paying the asset")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC claim fee target (sats)")
 	claimPrivHex := fs.String("btc-claim-priv", "", "device BTC claim privkey (32-byte hex); generated if empty (the key that claims the BTC — never given to the LSP)")
@@ -92,16 +95,21 @@ func cmdXSubAsSell(args []string) {
 	payWait := fs.Duration("pay-wait", 15*time.Minute, "max wait for the asset LN payment to settle")
 	_ = fs.Parse(args)
 
-	if *asset == "" || *btcRPCURL == "" || *assetLnSocket == "" {
-		fatal("xsubas-sell requires -asset, -btc-rpc, -asset-ln-socket")
+	if *asset == "" || *assetLnSocket == "" || (*btcRPCURL == "" && *quoteAsset == "") {
+		fatal("xsubas-sell requires -asset, -asset-ln-socket, and -btc-rpc (or -quote-asset + -xseq-rpc for the mixed same-chain shape)")
 	}
 	if *claimPubHex != "" && *claimPrivHex != "" {
 		fatal("-btc-claim-pub (device-claim mode) and -btc-claim-priv are mutually exclusive")
 	}
 
 	// 1. Find + verify a matching sub-asset-SELL offer (maker BUYS: LnBTCForAssetLN).
+	// Mixed same-chain: the pair's quote is the REAL asset the maker locked on-chain.
+	quote := offer.BTCSentinel
+	if *quoteAsset != "" {
+		quote = *quoteAsset
+	}
 	var book seqobv1.PublicBook
-	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, offer.BTCSentinel), &book); err != nil {
+	if err := getJSON(fmt.Sprintf("%s/v1/market/%s/%s/orderbook", *relay, *asset, quote), &book); err != nil {
 		fatal("get book: %v", err)
 	}
 	var target *seqobv1.Offer
@@ -120,25 +128,42 @@ func cmdXSubAsSell(args []string) {
 		break
 	}
 	if target == nil {
-		fatal("no verified sub-asset-SELL offer found to sell %s for on-chain BTC", *asset)
+		fatal("no verified sub-asset-SELL offer found to sell %s for on-chain %s", *asset, quote)
 	}
 	assetAtoms := target.GetWantAmount() // the asset the taker pays over LN
 	btcSats := target.GetOfferAmount()   // the BTC sats the taker receives on-chain
 	fmt.Printf("taking sub-asset-SELL offer %s by %s: pay %d %s OVER LIGHTNING, receive %d BTC sats ON-CHAIN\n",
 		target.GetOfferId(), short(target.GetMakerPubkey()), assetAtoms, *asset, btcSats)
 
-	// 2. Wire bitcoind (BTC claim leg) + the taker's asset LN node (pays). Validate.
-	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
-	if err != nil {
-		fatal("-btc-rpc: %v", err)
-	}
-	params, err := xchain.BitcoinChainParams(*btcChainName)
-	if err != nil {
-		fatal("-btc-chain: %v", err)
-	}
-	btcChain := xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
-	if _, err := btcChain.BlockCount(); err != nil {
-		fatal("bitcoind unreachable: %v", err)
+	// 2. Wire the on-chain claim leg (bitcoind, or the Sequentia chain for the
+	// mixed same-chain shape) + the taker's asset LN node (pays). Validate.
+	var btcChain *xchain.BitcoinChain
+	var seqChain *xchain.Chain
+	if *quoteAsset != "" {
+		if *xseqRPCURL == "" {
+			fatal("-quote-asset requires -xseq-rpc")
+		}
+		seqRPC, rerr := xliftRPCFromURL(*xseqRPCURL)
+		if rerr != nil {
+			fatal("-xseq-rpc: %v", rerr)
+		}
+		seqChain = xchain.NewChain(seqRPC, *xseqWallet)
+		if _, rerr := seqChain.BlockCount(); rerr != nil {
+			fatal("sequentia node unreachable: %v", rerr)
+		}
+	} else {
+		btcRPC, rerr := xliftRPCFromURL(*btcRPCURL)
+		if rerr != nil {
+			fatal("-btc-rpc: %v", rerr)
+		}
+		params, perr := xchain.BitcoinChainParams(*btcChainName)
+		if perr != nil {
+			fatal("-btc-chain: %v", perr)
+		}
+		btcChain = xchain.NewBitcoinChain(btcRPC, *btcWallet, params)
+		if _, rerr := btcChain.BlockCount(); rerr != nil {
+			fatal("bitcoind unreachable: %v", rerr)
+		}
 	}
 	if _, err := xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset).NodeID(); err != nil {
 		fatal("asset lightning-rpc %s unreachable: %v", *assetLnSocket, err)
@@ -213,6 +238,10 @@ func cmdXSubAsSell(args []string) {
 		// Bind the BTC-leg swap to the maker's H once Terms arrive (VerifyBTCLeg/
 		// ClaimBTCLeg recompute against it); a fresh asset LN leg pays the invoice.
 		NewTakerOps: func(hashH []byte) client.SubAssetSellTakerOps {
+			if *quoteAsset != "" {
+				return client.NewLiveSubAssetSellTakerOpsSeq(seqChain, *quoteAsset,
+					xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset), hashH)
+			}
 			return &client.LiveSubAssetSellTakerOps{
 				Swap:    xchain.NewSwapBitcoin(btcChain, nil, xchain.NewHashLockFromHash(hashH)),
 				AssetLN: xchain.NewCLNAssetLNLeg(*assetLnSocket, *asset),
