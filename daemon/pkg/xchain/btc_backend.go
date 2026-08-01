@@ -182,9 +182,10 @@ func (b *elementsBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64
 	if err != nil {
 		return "", err
 	}
-	if err := b.chain.Mine(1); err != nil {
-		return "", err
-	}
+	// Regtest harness convenience only: on a live network the mine fails, but
+	// the claim is ALREADY broadcast — failing here would misreport a
+	// successful claim as retryable. The network mines it.
+	_ = b.chain.Mine(1)
 	return txid, nil
 }
 
@@ -208,9 +209,8 @@ func (b *elementsBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTim
 	if err != nil {
 		return "", err
 	}
-	if err := b.chain.Mine(1); err != nil {
-		return "", err
-	}
+	// Same live-network rule as ClaimBTCLeg: the refund is already broadcast.
+	_ = b.chain.Mine(1)
 	return txid, nil
 }
 
