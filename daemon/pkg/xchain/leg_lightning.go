@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -367,14 +368,27 @@ func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uin
 sent:
 
 	// 3. Block until the payee resolves it (settle => complete, cancel => fail).
-	//    Use a dedicated connection whose deadline is this leg's timeout, since
-	//    the hold can outlast a single RPC round-trip.
-	wrpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: l.rpc.timeout}
+	//    A HODL payee holds the HTLC until its device settles, which can far
+	//    outlast one socket read (seen live: the mixed same-chain maker died
+	//    here at the 120s read deadline while the payment sat legitimately
+	//    'pending', orphaning the swap). Ask waitsendpay itself to time-box
+	//    each wait (CLN code 200 = still pending) and LOOP on a fresh
+	//    connection until the payment RESOLVES: abandoning while pending is
+	//    never safe — if it settles later the node holds P (listsendpays) but
+	//    nothing would claim the on-chain leg with it.
 	var res struct {
 		Status     string `json:"status"`
 		PaymentPre string `json:"payment_preimage"`
 	}
-	if err := wrpc.call(&res, "waitsendpay", map[string]interface{}{"payment_hash": phHex}); err != nil {
+	for {
+		wrpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: l.rpc.timeout}
+		err := wrpc.call(&res, "waitsendpay", map[string]interface{}{"payment_hash": phHex, "timeout": 60})
+		if err == nil {
+			break
+		}
+		if waitsendpayStillPending(err) {
+			continue
+		}
 		return nil, fmt.Errorf("waitsendpay: %w", err)
 	}
 	if res.Status != "complete" {
@@ -618,6 +632,24 @@ func (c *lnRPC) call(out interface{}, method string, params interface{}) error {
 		}
 		return nil
 	}
+}
+
+// waitsendpayStillPending reports whether a waitsendpay error means the payment
+// is STILL PENDING (so the caller should keep waiting on a fresh connection):
+// CLN's own wait timeout (code 200), or a transport-level timeout/read error on
+// the blocking socket. Anything else is a real resolution (failure) and must
+// surface.
+func waitsendpayStillPending(err error) bool {
+	var re *rpcErr
+	if errors.As(err, &re) {
+		return re.Code == 200 // "Timed out while waiting"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	// The deadline can also surface as a wrapped plain read error.
+	return strings.Contains(err.Error(), "i/o timeout")
 }
 
 // payFallbackPlan decides whether a failed `pay` can be retried as a direct-hop PayHash, and
