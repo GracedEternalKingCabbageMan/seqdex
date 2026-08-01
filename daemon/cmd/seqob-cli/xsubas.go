@@ -116,8 +116,8 @@ func cmdXSubAs(args []string) {
 	if *asset == "" {
 		fatal("xsubas requires -asset (the hex asset id; the pair is <asset>/BTC)")
 	}
-	if *btcRPCURL == "" {
-		fatal("xsubas requires -btc-rpc (the bitcoind that funds + refunds the BTC HTLC)")
+	if *btcRPCURL == "" && *quoteAsset == "" {
+		fatal("xsubas requires -btc-rpc (the bitcoind that funds + refunds the BTC HTLC), or -quote-asset + -xseq-rpc for the mixed same-chain shape")
 	}
 	if *assetLnSocket == "" {
 		fatal("xsubas requires -asset-ln-socket (the taker's SeqLN-on-Sequentia lightning-rpc, asset leg)")
