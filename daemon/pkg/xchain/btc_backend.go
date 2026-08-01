@@ -62,10 +62,23 @@ type btcBackend interface {
 type elementsBTCBackend struct {
 	chain *Chain
 	leg   *ElementsLeg
+	// lockAsset is the asset LockBTCLeg funds the HTLC with ("" = the pegged
+	// bitcoin asset, the original behaviour). Set (via newElementsBTCBackendAsset)
+	// when this "BTC-position" leg is actually a Sequentia ISSUED asset — the
+	// mixed same-chain shape (rails 7/8), where the quote asset stands in BTC's
+	// structural place. Verify/Claim were always asset-aware (the caller passes
+	// the expected asset id; the claim spends whatever asset the leg holds).
+	lockAsset string
 }
 
 func newElementsBTCBackend(chain *Chain, prim LockPrimitive) *elementsBTCBackend {
 	return &elementsBTCBackend{chain: chain, leg: NewElementsLeg(LegBTC, prim)}
+}
+
+// newElementsBTCBackendAsset is newElementsBTCBackend with the funding asset for
+// LockBTCLeg pinned to an issued asset id (the mixed same-chain quote leg).
+func newElementsBTCBackendAsset(chain *Chain, prim LockPrimitive, lockAsset string) *elementsBTCBackend {
+	return &elementsBTCBackend{chain: chain, leg: NewElementsLeg(LegBTC, prim), lockAsset: lockAsset}
 }
 
 func (b *elementsBTCBackend) HTLCScript(claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
@@ -73,12 +86,16 @@ func (b *elementsBTCBackend) HTLCScript(claimPub, refundPub []byte, locktime uin
 }
 
 func (b *elementsBTCBackend) LockBTCLeg(script []byte, amountCoins string, locktime uint32) (*LegLock, int64, error) {
-	funded, err := b.chain.LockHTLC(script, amountCoins, "") // "" => pegged bitcoin asset
+	funded, err := b.chain.LockHTLC(script, amountCoins, b.lockAsset) // "" => pegged bitcoin asset
 	if err != nil {
 		return nil, 0, err
 	}
+	// Regtest harness convenience: mine the funding in and report its height.
+	// On a LIVE network (the PoS testnet/mainnet cannot generatetoaddress) this
+	// fails — that is not an error: return height 0 (broadcast-only) and let
+	// the caller poll confirmations, exactly the bitcoin backend's live path.
 	if err := b.chain.Mine(1); err != nil {
-		return nil, 0, err
+		return &LegLock{Script: script, Funded: funded, Locktime: locktime}, 0, nil
 	}
 	hp, err := b.chain.BlockCount()
 	if err != nil {
@@ -165,9 +182,10 @@ func (b *elementsBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64
 	if err != nil {
 		return "", err
 	}
-	if err := b.chain.Mine(1); err != nil {
-		return "", err
-	}
+	// Regtest harness convenience only: on a live network the mine fails, but
+	// the claim is ALREADY broadcast — failing here would misreport a
+	// successful claim as retryable. The network mines it.
+	_ = b.chain.Mine(1)
 	return txid, nil
 }
 
@@ -191,9 +209,8 @@ func (b *elementsBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTim
 	if err != nil {
 		return "", err
 	}
-	if err := b.chain.Mine(1); err != nil {
-		return "", err
-	}
+	// Same live-network rule as ClaimBTCLeg: the refund is already broadcast.
+	_ = b.chain.Mine(1)
 	return txid, nil
 }
 

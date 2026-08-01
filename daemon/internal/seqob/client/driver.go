@@ -116,3 +116,20 @@ func (m *Maker) HandleRequest(sealedReq []byte, c *Crypter) (sealedAccept []byte
 	}
 	return sealedAccept, nil
 }
+
+// HandleComplete opens the taker's sealed SwapComplete and returns the settling txid, so the
+// maker can ack settlement to the relay. The relay never parses the opaque courier, so this
+// ack is its only signal that an interactive lift settled (without it the resting order lingers
+// as a ghost and the trades feed stays empty). Best-effort on the txid: a parse failure returns
+// "" and the caller should still ack — the relay's trade record + decrement do not need it.
+func (m *Maker) HandleComplete(sealedComplete []byte, c *Crypter) (txid string, err error) {
+	pt, err := c.Open(sealedComplete)
+	if err != nil {
+		return "", fmt.Errorf("open complete: %w", err)
+	}
+	var cmp seqdexv1.SwapComplete
+	if err := proto.Unmarshal(pt, &cmp); err != nil {
+		return "", fmt.Errorf("unmarshal complete: %w", err)
+	}
+	return txidFromSignedPset(cmp.GetTransaction()), nil
+}

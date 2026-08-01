@@ -14,6 +14,10 @@ import (
 type fakeLNLeg struct{ t *testing.T }
 
 func (f *fakeLNLeg) NodeID() (string, error) { f.t.Fatal("NodeID unexpected"); return "", nil }
+func (f *fakeLNLeg) PayHash(string, []byte, uint64, uint32, []byte) ([]byte, error) {
+	f.t.Fatal("PayHash unexpected")
+	return nil, nil
+}
 func (f *fakeLNLeg) Pay(string, []byte, uint64) ([]byte, error) {
 	f.t.Fatal("Pay unexpected")
 	return nil, nil
@@ -34,6 +38,10 @@ func (f *fakeLNLeg) CreateInvoice([]byte, uint64, uint32, string, string) (strin
 }
 func (f *fakeLNLeg) WaitInvoicePaid(string, time.Duration) (uint64, error) {
 	f.t.Fatal("WaitInvoicePaid unexpected")
+	return 0, nil
+}
+func (f *fakeLNLeg) WaitPaidByHash([]byte, time.Duration) (uint64, error) {
+	f.t.Fatal("WaitPaidByHash unexpected")
 	return 0, nil
 }
 

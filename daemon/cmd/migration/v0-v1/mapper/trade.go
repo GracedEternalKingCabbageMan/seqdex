@@ -1,10 +1,10 @@
 package mapper
 
 import (
-	"github.com/shopspring/decimal"
 	"github.com/aejkcs50/seqdex/daemon/internal/core/domain"
 	swap_parser "github.com/aejkcs50/seqdex/daemon/internal/infrastructure/swap-parser"
 	v0domain "github.com/aejkcs50/seqdex/daemon/old-v0"
+	"github.com/shopspring/decimal"
 )
 
 var statuses = map[int]int{

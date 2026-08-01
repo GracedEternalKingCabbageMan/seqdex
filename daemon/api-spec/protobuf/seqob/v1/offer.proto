@@ -12,12 +12,40 @@ package seqob.v1;
 message AssetPair {
   string base_asset  = 1; // hex asset id; for cross-chain/LN one side is the BTC sentinel id
   string quote_asset = 2;
+  // Book NAMESPACE selector, used ONLY on a market_subscribe/market_unsubscribe: false
+  // (default) is the transparent book, true is the separate confidential/blinded book, so a
+  // WS subscriber's snapshot + deltas stay in ONE namespace — the same disjoint split REST
+  // serves via ?confidential= and the matcher enforces on crossing. Ignored on an Offer's
+  // pair (an offer's own `confidential` field governs which book it rests in).
+  bool confidential = 3;
 }
 
 enum TradeDir {
   TRADE_DIR_UNSPECIFIED = 0;
   TRADE_DIR_SELL = 1; // maker sells base
   TRADE_DIR_BUY  = 2; // maker buys base
+}
+
+// TimeInForce is the incoming order's execution option for the CONTINUOUS auto-cross
+// (offer_submit -> the book-walking matcher). It falls out of price-time-priority
+// book-walking; Market/Limit are unchanged (GTC). Additive; the proto3 default 0 =
+// GTC preserves every existing offer's behavior.
+enum TimeInForce {
+  // GTC (good-till-cancel / Limit): cross what you can at the limit price or better,
+  // then REST the unfilled remainder as a maker order until filled/cancelled/expired.
+  // A non-allow_partial GTC order is all-or-nothing-then-REST (unchanged behavior).
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  // IOC (immediate-or-cancel): cross what you can NOW, then CANCEL the remainder — it
+  // never rests. A Market order is IOC at any price.
+  TIME_IN_FORCE_IOC = 1;
+  // FOK (fill-or-kill): all-or-nothing IMMEDIATELY. If the crossing liquidity cannot
+  // fill the WHOLE incoming at once, execute NOTHING and cancel (never rest a partially
+  // unfilled order). Differs from a non-allow_partial GTC only in that it CANCELS
+  // instead of resting.
+  TIME_IN_FORCE_FOK = 2;
+  // POST_ONLY: rest-only. If the incoming would TAKE (cross) any resting order, REJECT
+  // it (execute nothing, do not rest); otherwise rest as a pure maker order.
+  TIME_IN_FORCE_POST_ONLY = 3;
 }
 
 // Offer is the signed, self-contained intent. The authoritative exchange ratio
@@ -60,11 +88,32 @@ message Offer {
   string maker_ln_node_pubkey = 17;
   repeated string ln_connect_hints = 18;
 
+  // Execution option for the continuous auto-cross (see TimeInForce). Additive;
+  // default 0 = GTC (rest the remainder) so Market/Limit are unchanged. IOC cancels
+  // the remainder, FOK is all-or-nothing-then-cancel, POST_ONLY rejects if it would
+  // take. Part of the signed canonical bytes, so it is authenticated by maker_sig.
+  TimeInForce time_in_force = 24;
+
+  // Confidential book namespace. When true, this offer rests in the SEPARATE
+  // BLINDED book and may ONLY cross another confidential offer, so BOTH swap legs
+  // are CT-blinded on-chain (blinded amounts + assets + rangeproofs on every swap
+  // output). This is REQUIRED for confidentiality: if one leg were transparent an
+  // observer would derive the confidential leg's amount from the public swap ratio
+  // (the order price). A confidential offer MUST use SameChainTerms (the interactive
+  // co-sign rail: the covenant rail introspects EXPLICIT amounts and is
+  // CT-incompatible), MUST publish maker_blinding_pub + a blinded (blech32) receive
+  // address, and MUST NOT involve the BTC sentinel (the parent chain has no CT).
+  // Being part of the signed canonical bytes, the namespace is authenticated by
+  // maker_sig automatically. Transparent-by-default: an offer with this unset (the
+  // proto3 default false) rests in the existing unblinded book, unchanged.
+  bool confidential = 19;
+
   // Settlement variant. Reserved field numbers keep future variants additive.
   oneof settlement {
     SameChainTerms  same_chain  = 20;
     CrossChainTerms cross_chain = 21;
     LightningTerms  lightning   = 22; // reserved; not implemented before LN phases
+    CovenantTerms   covenant    = 23; // funded, self-enforcing resting order (passive CLOB)
   }
 
   // secp256k1 signature by maker_pubkey over the canonical serialization of all
@@ -96,6 +145,47 @@ message LightningTerms {
   uint32 onchain_cltv              = 4; // CLTV on the asset HTLC (shorter leg)
   bool   maker_issues_hold_invoice = 5;
   uint64 max_0conf_amount          = 6; // per-offer 0-conf cap for the on-chain leg
+}
+
+// CovenantTerms is a FUNDED, self-enforcing resting order: the maker locks N
+// atoms of asset A in ONE taproot UTXO (internal key NUMS => no key-path spend;
+// tree {FILL, REFUND}) and can then go OFFLINE. ANYONE who pays the maker the
+// baked-in price of asset B may spend it — enforced entirely by the tapscript
+// interpreter (see seqob_covenant.py / feature_seqob_covenant_fill.py). Unlike
+// the interactive settlement variants, the offer here is NOT a signed price
+// PROMISE the maker must later co-sign: it is a POINTER to the on-chain UTXO
+// plus the exact commitment a taker re-derives and verifies without trusting the
+// relay (reconstruct the taproot output key from internal_key + the FILL-leaf
+// constants + merkle_path, confirm it equals the on-chain scriptPubKey). The
+// order IS the coin, so oversell is impossible (first spend wins). maker_sig on
+// the enclosing Offer still authenticates the POSTER for relay rate-limiting /
+// cancel, but is not load-bearing for settlement correctness (the chain is
+// authoritative). Design: doc/sequentia/simplicity-dex-covenant-offers-design.md
+// section 4.
+message CovenantTerms {
+  string covenant_txid       = 1;  // the funded taproot UTXO (display txid hex)
+  uint32 covenant_vout       = 2;
+
+  // Order constants baked into the FILL leaf (INTERNAL byte order, as on-chain
+  // introspection returns them). asset_a rests; asset_b pays for it.
+  string asset_a             = 3;  // 32-byte internal-order asset id hex
+  string asset_b             = 4;  // 32-byte internal-order asset id hex
+  uint64 rate_num            = 5;  // required_B = ceil(filled * rate_num / rate_den)
+  uint64 rate_den            = 6;
+  bytes  maker_prog          = 7;  // maker credit witness program (32 bytes for v1)
+  uint32 maker_prog_ver      = 8;  // witness version of the maker credit output (1)
+  uint64 min_lot             = 9;  // dust-griefing floor on filled and on any remainder
+
+  // REFUND leaf: <expiry_locktime> CLTV DROP <maker_x> CHECKSIG.
+  uint32 expiry_locktime     = 10; // absolute-height CLTV the maker reclaims after
+  bytes  maker_x             = 11; // maker x-only key (32 bytes) authorizing REFUND
+
+  // Taproot reconstruction inputs. internal_key is the 32-byte x-only internal
+  // key (NUMS by default; a NON-NUMS key is a maker-cancellable/key-path-rug
+  // offer a taker MUST treat with suspicion). merkle_path is the control-block
+  // merkle branch (sibling hashes) proving the FILL leaf under the output key.
+  bytes  internal_key        = 12; // 32-byte x-only internal key (NUMS default)
+  repeated bytes merkle_path = 13; // taproot merkle branch (32-byte sibling hashes)
 }
 
 // A signed cancel. nonce defeats replay against a re-posted same offer_id.

@@ -202,3 +202,174 @@ func TestSubmarineNormalTakerRejectsBadAmount(t *testing.T) {
 		t.Fatal("taker must reject a maker quoting the wrong seq_amount")
 	}
 }
+
+// --- PARTIAL FILLS (both submarine directions) --------------------------------
+
+// TestSubmarineNormalPartialFill pins the protocol gap: the taker never told the
+// maker a size, so XcSubTermsRequest went out with NO FIELDS AT ALL and the maker
+// locked the WHOLE offer on every lift. A taker wanting a tenth of an offer had
+// to take all of it or nothing, while the cross rail had been doing real partials
+// for some time.
+//
+// XcMsg already carried SeqAmount — the cross path uses exactly that field — so
+// this is populating an existing field, not a wire change.
+func TestSubmarineNormalPartialFill(t *testing.T) {
+	st := &subState{seqTip: 5000}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+
+	const whole = uint64(100_000_000_000)
+	const wholeMsat = uint64(1_000_000)
+	const take = whole / 4         // a quarter of the offer
+	const wantMsat = wholeMsat / 4 // its proportional price
+
+	var makerRes *MakerSubmarineResult
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, makerErr = RunMakerSubmarineNormal(MakerSubmarineParams{
+			NewMakerOps: func(hashH []byte) SubMakerOps { return &fakeSubMakerOps{st: st} },
+			Crypter:     mc,
+			SeqTip:      func() (int64, error) { return st.seqTip, nil },
+			AssetHex:    "asset-hex",
+			SeqAmount:   whole,
+			InvoiceMsat: wholeMsat,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerSubmarineNormal(TakerSubmarineParams{
+		Ops:               &fakeSubTakerOps{st: st},
+		Crypter:           tc,
+		Secret:            secret,
+		SeqRefundKey:      mustKey(t),
+		ExpectAsset:       "asset-hex",
+		ExpectSeqAmount:   whole,
+		ExpectInvoiceMsat: wholeMsat,
+		TakeSeqAmount:     take,
+		Timing:            XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if makerErr != nil {
+		t.Fatalf("maker: %v", makerErr)
+	}
+	if takerRes.FilledSeq != take {
+		t.Fatalf("taker funded %d atoms, want the %d slice", takerRes.FilledSeq, take)
+	}
+	if takerRes.FilledMsat != wantMsat || takerRes.PaidMsat != wantMsat {
+		t.Fatalf("taker priced the slice at %d/%d msat, want %d", takerRes.FilledMsat, takerRes.PaidMsat, wantMsat)
+	}
+	if makerRes.FilledSeq != take {
+		t.Fatalf("maker locked %d atoms, want the %d slice (it used to lock the whole offer)", makerRes.FilledSeq, take)
+	}
+	if makerRes.RemainderSeq != whole-take {
+		t.Fatalf("remainder %d, want %d — the caller re-rests this", makerRes.RemainderSeq, whole-take)
+	}
+	if !takerRes.Settled || !makerRes.Settled {
+		t.Fatalf("partial did not settle: taker=%+v maker=%+v", takerRes, makerRes)
+	}
+}
+
+// A whole-offer lift is unchanged: TakeSeqAmount 0 means the whole thing, so an
+// older taker that sends an empty terms request still works.
+func TestSubmarineNormalWholeLiftIsUnchanged(t *testing.T) {
+	st := &subState{seqTip: 5000}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	const whole = uint64(100_000_000_000)
+	const wholeMsat = uint64(1_000_000)
+
+	var makerRes *MakerSubmarineResult
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, _ = RunMakerSubmarineNormal(MakerSubmarineParams{
+			NewMakerOps: func(hashH []byte) SubMakerOps { return &fakeSubMakerOps{st: st} },
+			Crypter:     mc,
+			SeqTip:      func() (int64, error) { return st.seqTip, nil },
+			AssetHex:    "asset-hex",
+			SeqAmount:   whole,
+			InvoiceMsat: wholeMsat,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerSubmarineNormal(TakerSubmarineParams{
+		Ops:               &fakeSubTakerOps{st: st},
+		Crypter:           tc,
+		Secret:            secret,
+		SeqRefundKey:      mustKey(t),
+		ExpectAsset:       "asset-hex",
+		ExpectSeqAmount:   whole,
+		ExpectInvoiceMsat: wholeMsat,
+		// TakeSeqAmount deliberately unset.
+		Timing: XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if takerRes.FilledSeq != whole || takerRes.PaidMsat != wholeMsat {
+		t.Fatalf("whole lift changed shape: %+v", takerRes)
+	}
+	if makerRes.RemainderSeq != 0 {
+		t.Fatalf("a whole lift must leave no remainder, got %d", makerRes.RemainderSeq)
+	}
+}
+
+// An over-ask must be refused rather than silently clamped: a taker asking for
+// more than the offer holds is a mismatch, and the maker has nothing to lock it
+// against. (Genuine partials pass; only strictly-greater is rejected.)
+func TestSubmarineNormalRejectsOverAsk(t *testing.T) {
+	st := &subState{seqTip: 5000}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	const whole = uint64(100_000_000_000)
+
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, makerErr = RunMakerSubmarineNormal(MakerSubmarineParams{
+			NewMakerOps: func(hashH []byte) SubMakerOps { return &fakeSubMakerOps{st: st} },
+			Crypter:     mc,
+			SeqTip:      func() (int64, error) { return st.seqTip, nil },
+			AssetHex:    "asset-hex",
+			SeqAmount:   whole,
+			InvoiceMsat: 1_000_000,
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: time.Second},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	// Ask the maker directly for more than the offer holds (the taker's own params
+	// clamp, so this drives the wire message the maker must defend against).
+	_ = sendXc(&XcMsg{Type: XcSubTermsRequest, SeqAmount: whole + 1}, tc, net.takerSend)
+	wg.Wait()
+
+	if makerErr == nil {
+		t.Fatal("maker accepted a slice larger than its own offer")
+	}
+	_ = secret
+	_ = net
+}

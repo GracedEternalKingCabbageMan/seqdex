@@ -71,48 +71,14 @@ const (
 	// account (legacy behavior). Env: SEQDEX_NODE_RPC.
 	NodeRpcKey = "NODE_RPC"
 
-	// --- Cross-chain (XchainService) maker config ---
-	// The integrated cross-chain swap maker is enabled only when
-	// XchainParentRPCKey is set (the daemon must reach a parent "BTC" node and an
-	// anchored Sequentia node). Secrets are carried inside the RPC URLs
-	// (http://user:pass@host:port) read from env/file, never argv.
-
-	// XchainParentRPCKey: parent ("BTC") node RPC url. Presence enables Xchain.
-	XchainParentRPCKey = "XCHAIN_PARENT_RPC"
-	// XchainParentKindKey: parent ("BTC") leg format: "elements" (default) or
-	// "bitcoin" (a real bitcoind regtest/testnet4). When "bitcoin" the maker
-	// verifies/claims the BTC HTLC in Bitcoin transaction format.
-	XchainParentKindKey = "XCHAIN_PARENT_KIND"
-	// XchainParentChainKey: when XCHAIN_PARENT_KIND=bitcoin, the Bitcoin network:
-	// "regtest" (default) or "testnet4".
-	XchainParentChainKey = "XCHAIN_PARENT_CHAIN"
-	// XchainSeqRPCKey: anchored Sequentia node RPC url for the SEQ leg.
-	XchainSeqRPCKey = "XCHAIN_SEQ_RPC"
-	// XchainWalletKey: wallet name on both nodes.
-	XchainWalletKey = "XCHAIN_WALLET"
-	// XchainSeqAssetKey: the SEQ-side asset id (hex) the maker offers.
-	XchainSeqAssetKey = "XCHAIN_SEQ_ASSET"
-	// XchainMarketsKey: optional JSON array of BTC<->asset markets the maker
-	// offers, e.g. [{"seq_asset":"<hex>","name":"BTC/GOLD","price_seq_per_btc":27.2,"fee_bps":50}].
-	// When set it takes precedence over the single XCHAIN_SEQ_ASSET market.
-	XchainMarketsKey = "XCHAIN_MARKETS"
-	// XchainPriceSeqPerBtcKey: SEQ atoms given per BTC atom (maker ask).
-	XchainPriceSeqPerBtcKey = "XCHAIN_PRICE_SEQ_PER_BTC"
-	// XchainFeeBpsKey: maker fee in basis points charged on the BTC leg.
-	XchainFeeBpsKey = "XCHAIN_FEE_BPS"
-	// XchainBtcLocktimeDeltaKey: blocks above tip for T_btc (taker refund).
-	XchainBtcLocktimeDeltaKey = "XCHAIN_BTC_LOCKTIME_DELTA"
-	// XchainSeqLocktimeDeltaKey: blocks above tip for T_seq (maker refund).
-	XchainSeqLocktimeDeltaKey = "XCHAIN_SEQ_LOCKTIME_DELTA"
-	// XchainMinBtcConfKey: required BTC-leg confirmations before locking SEQ.
-	XchainMinBtcConfKey = "XCHAIN_MIN_BTC_CONF"
-	// XchainSpendFeeKey: explicit fee (atoms) for the maker's spends.
-	XchainSpendFeeKey = "XCHAIN_SPEND_FEE"
-	// XchainQuoteTtlSecsKey: how long a cross-chain quote is honoured (seconds).
-	// A FORWARD (BTC->asset) taker must lock its BTC leg and reach XCHAIN_MIN_BTC_CONF
-	// confirmations before proposing; on a ~10-min, erratic testnet4 that is far longer
-	// than a same-chain quote needs, so this defaults well above the 2-min same-chain TTL.
-	XchainQuoteTtlSecsKey = "XCHAIN_QUOTE_TTL_SECS"
+	// AssetRegistryURLKey is the Sequentia Asset Registry minimal-index url the
+	// daemon queries at market creation to source each asset's precision
+	// (decimal places / nDenomination). Defaults to the local registry
+	// (http://localhost:3005/index.minimal.json). An explicit per-market CLI
+	// precision flag overrides this; if the registry is unreachable or the asset
+	// is unknown, precision falls back to the default (8). Env:
+	// SEQDEX_ASSET_REGISTRY_URL. Set empty to disable registry lookups.
+	AssetRegistryURLKey = "ASSET_REGISTRY_URL"
 
 	DbLocation        = "db"
 	TLSLocation       = "tls"
@@ -144,18 +110,7 @@ func InitConfig() error {
 	vip.SetDefault(NoOperatorTlsKey, false)
 	vip.SetDefault(ConnectProtoKey, httpsProtocol)
 	vip.SetDefault(DBTypeKey, application.DBBadger)
-
-	// Cross-chain maker defaults (only consulted when XCHAIN_PARENT_RPC is set).
-	vip.SetDefault(XchainParentKindKey, "elements")
-	vip.SetDefault(XchainParentChainKey, "regtest")
-	vip.SetDefault(XchainWalletKey, "w")
-	vip.SetDefault(XchainPriceSeqPerBtcKey, 100)
-	vip.SetDefault(XchainFeeBpsKey, 0)
-	vip.SetDefault(XchainBtcLocktimeDeltaKey, 100)
-	vip.SetDefault(XchainSeqLocktimeDeltaKey, 50)
-	vip.SetDefault(XchainMinBtcConfKey, 1)
-	vip.SetDefault(XchainSpendFeeKey, 1000)
-	vip.SetDefault(XchainQuoteTtlSecsKey, 3600) // 60 min: covers a testnet4 BTC-leg lock + confirmation
+	vip.SetDefault(AssetRegistryURLKey, "http://localhost:3005/index.minimal.json")
 
 	if err := validate(); err != nil {
 		return fmt.Errorf("error while validating config: %s", err)

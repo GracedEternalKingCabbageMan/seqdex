@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 	"github.com/aejkcs50/seqdex/daemon/cmd/migration/service"
 	v0migration "github.com/aejkcs50/seqdex/daemon/cmd/migration/v0-v1"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 var (

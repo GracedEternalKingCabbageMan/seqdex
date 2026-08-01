@@ -72,6 +72,7 @@ func cmdXSell(args []string) {
 	seqRPCURL := fs.String("seq-rpc", "", "Sequentia node RPC URL http://user:pass@host:port (required)")
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet funding the asset leg")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations required on the maker's BTC leg before we fund the asset")
+	takeAmount := fs.Uint64("amount", 0, "PARTIAL FILL: asset atoms to sell (<= the offer). 0 = the whole offer. The BTC you receive is the proportional price (floor, in the maker's favour); the maker re-rests the remainder.")
 	spendFee := fs.Uint64("spend-fee", 1000, "HTLC spend fee target in native sats (converted per-asset)")
 	btcFeeRate := fs.Float64("btc-fee-rate", 2, "sat/vB fee rate for BTC-side spends (explicit; 0 = node default)")
 	maxFeeBtc := fs.Uint64("max-fee-btc", 0, "max maker fee_btc (sats) we accept")
@@ -109,10 +110,33 @@ func cmdXSell(args []string) {
 		fatal("no verified reverse cross offer found for %s/BTC", *asset)
 	}
 	expectAsset := target.GetPair().GetBaseAsset()
-	expectSeq := target.GetWantAmount()  // maker BUY: wants the asset
-	expectBtc := target.GetOfferAmount() // maker gives BTC
-	fmt.Printf("selling into cross offer %s by %s: %d %s for %d sats\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectBtc)
+	wholeSeq := target.GetWantAmount()  // maker BUY: wants the asset (whole offer)
+	wholeBtc := target.GetOfferAmount() // maker gives BTC (whole offer)
+	// Partial fill: sell a slice and receive the PROPORTIONAL BTC (floor, so the
+	// maker — who GIVES the BTC — never overpays; the maker requires the same and
+	// re-rests the remainder).
+	takeSeq := wholeSeq
+	if *takeAmount > 0 && *takeAmount < wholeSeq {
+		takeSeq = *takeAmount
+	} else if *takeAmount > wholeSeq {
+		fatal("-amount %d exceeds the offer's %d %s", *takeAmount, wholeSeq, expectAsset)
+	}
+	recvBtc := client.ProportionalBtcFloor(wholeBtc, takeSeq, wholeSeq)
+	if recvBtc == 0 {
+		fatal("-amount %d of %d prices to 0 sats (too small a slice for this offer)", takeSeq, wholeSeq)
+	}
+	// Minimum-slice guard: a partial that prices to a sub-dust BTC leg (or is below
+	// the offer's advertised min_fill) would strand an unclaimable HTLC leg. Reject
+	// it here, before any coins move; the driver re-checks defensively.
+	if err := guardPartialBtcLeg(takeSeq, wholeSeq, recvBtc, target.GetMinFill(), *spendFee); err != nil {
+		fatal("%v", err)
+	}
+	// The amounts THIS lift settles: the slice of asset, and its proportional BTC.
+	expectSeq := takeSeq
+	expectBtc := recvBtc
+	fmt.Printf("selling into cross offer %s by %s: %d %s for %d sats%s\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectBtc,
+		partialNote(takeSeq, wholeSeq))
 
 	btcRPC, err := xliftRPCFromURL(*btcRPCURL)
 	if err != nil {
@@ -167,7 +191,7 @@ func cmdXSell(args []string) {
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId:            target.GetOfferId(),
 		MakerPubkey:        target.GetMakerPubkey(),
-		TakeAmount:         target.GetBaseAmount(),
+		TakeAmount:         takeSeq, // the slice we're selling (== base_amount for a whole lift)
 		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
 	}}})
 	la := readWS(conn)
@@ -219,8 +243,9 @@ func cmdXSell(args []string) {
 		BtcClaimKey:     btcClaimKey,
 		SeqRefundKey:    seqRefundKey,
 		ExpectAsset:     expectAsset,
-		ExpectSeqAmount: expectSeq,
-		ExpectBtcAmount: expectBtc,
+		ExpectSeqAmount: wholeSeq, // the WHOLE signed offer; the driver checks terms against it
+		ExpectBtcAmount: wholeBtc,
+		TakeSeqAmount:   takeSeq, // the slice; the driver requires the proportional BTC for it
 		MaxFeeBtc:       *maxFeeBtc,
 		MinBTCConf:      *minBTCConf,
 		SpendFeeSats:    *spendFee,
@@ -311,9 +336,17 @@ func cmdXRefundSeq(args []string) {
 		Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
 		Locktime: st.SeqLocktime,
 	}
-	// The refund path only touches the SEQ side; no bitcoind is needed.
+	// The refund path only touches the SEQ side, but NewSwapBitcoin builds its BTC
+	// backend EAGERLY and reads the chain's params, so passing nil segfaults at
+	// construction — this recovery path would have panicked instead of returning the
+	// asset. Hand it the same inert stand-in xfund-seq uses: never dialled, params only.
+	btcParams, err := xchain.BitcoinChainParams("testnet4")
+	if err != nil {
+		fatal("chain params: %v", err)
+	}
+	dummyBtc := xchain.NewBitcoinChain(xchain.NewRPC("127.0.0.1", 1, "x", "x"), "", btcParams)
 	ops := &client.LiveXcOps{
-		Swap: xchain.NewSwapBitcoin(nil, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
+		Swap: xchain.NewSwapBitcoin(dummyBtc, seqChain, xchain.NewHashLockFromHash(make([]byte, 32))),
 		SEQ:  seqChain,
 	}
 	txid, err := client.RefundTakerSEQ(ops, leg, xchain.KeyFromBytes(keyBytes), st.SeqLocktime, st.SeqLegAsset, *spendFee, *wait, 15*time.Second)

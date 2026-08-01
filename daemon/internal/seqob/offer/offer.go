@@ -169,6 +169,115 @@ func VerifyCancel(c *seqobv1.OfferCancel) error {
 	return nil
 }
 
+// CanonicalSettledTradeBytes returns the deterministic encoding of st with sig
+// cleared. The signed payload is {offer_id, maker_pubkey, fill_base, settle_txid,
+// anchor_confs, nonce}; the nonce defeats replay of an old settled-trade against a
+// re-posted same offer_id (which -requote reuses). Unlike a session ack, this record
+// is keyed to the offer and stands on its own signature, so the relay can attribute a
+// cross/LN settlement even after the courier session is gone.
+func CanonicalSettledTradeBytes(st *seqobv1.SettledTrade) ([]byte, error) {
+	if st == nil {
+		return nil, errors.New("nil settled_trade")
+	}
+	cc := proto.Clone(st).(*seqobv1.SettledTrade)
+	cc.Sig = nil
+	return deterministic(cc)
+}
+
+// SettledTradeHash is sha256 over the canonical settled-trade bytes.
+func SettledTradeHash(st *seqobv1.SettledTrade) ([32]byte, error) {
+	b, err := CanonicalSettledTradeBytes(st)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(b), nil
+}
+
+// SignSettledTrade fills st.Sig with a DER secp256k1 signature over
+// SettledTradeHash(st). As with SignOffer, st.MakerPubkey is set from priv if empty,
+// else must match priv's compressed public key.
+func SignSettledTrade(st *seqobv1.SettledTrade, priv *btcec.PrivateKey) error {
+	if st == nil {
+		return errors.New("nil settled_trade")
+	}
+	pubHex := hex.EncodeToString(priv.PubKey().SerializeCompressed())
+	if st.MakerPubkey == "" {
+		st.MakerPubkey = pubHex
+	} else if !strings.EqualFold(st.MakerPubkey, pubHex) {
+		return fmt.Errorf("maker_pubkey %q does not match signing key %q", st.MakerPubkey, pubHex)
+	}
+	h, err := SettledTradeHash(st)
+	if err != nil {
+		return err
+	}
+	st.Sig = ecdsa.Sign(priv, h[:]).Serialize()
+	return nil
+}
+
+// VerifySettledTrade checks st.Sig against st.MakerPubkey over SettledTradeHash(st).
+// The relay additionally keys the record to (maker_pubkey, offer_id), so a valid
+// signature proves only the offer's own maker can record/decrement its fill.
+func VerifySettledTrade(st *seqobv1.SettledTrade) error {
+	if st == nil {
+		return errors.New("nil settled_trade")
+	}
+	if len(st.Sig) == 0 {
+		return errors.New("missing settled_trade sig")
+	}
+	pub, err := parsePubkeyHex(st.MakerPubkey)
+	if err != nil {
+		return err
+	}
+	sig, err := ecdsa.ParseDERSignature(st.Sig)
+	if err != nil {
+		return fmt.Errorf("bad settled_trade sig encoding: %w", err)
+	}
+	h, err := SettledTradeHash(st)
+	if err != nil {
+		return err
+	}
+	if !sig.Verify(h[:], pub) {
+		return errors.New("settled_trade sig verification failed")
+	}
+	return nil
+}
+
+// ReattachHash is the sha256 challenge a participant signs to re-bind a
+// reconnected WebSocket to a live lift session (P3.8). Binding the session_id AND
+// the role prevents replaying a maker's signature as a taker (or across sessions).
+func ReattachHash(sessionID, role string) [32]byte {
+	return sha256.Sum256([]byte("seqob-reattach|" + sessionID + "|" + role))
+}
+
+// SignReattach returns a DER secp256k1 signature over ReattachHash(sessionID, role)
+// with priv — the session participant's key (the maker's offer key, or the taker's
+// ephemeral session key).
+func SignReattach(sessionID, role string, priv *btcec.PrivateKey) []byte {
+	h := ReattachHash(sessionID, role)
+	return ecdsa.Sign(priv, h[:]).Serialize()
+}
+
+// VerifyReattach checks a DER secp256k1 signature over ReattachHash(sessionID, role)
+// against the compressed session-key bytes that the relay already holds for that role.
+func VerifyReattach(sessionID, role string, pubkey, sig []byte) error {
+	if len(sig) == 0 {
+		return errors.New("missing reattach sig")
+	}
+	pub, err := btcec.ParsePubKey(pubkey)
+	if err != nil {
+		return fmt.Errorf("bad session pubkey: %w", err)
+	}
+	s, err := ecdsa.ParseDERSignature(sig)
+	if err != nil {
+		return fmt.Errorf("bad reattach sig encoding: %w", err)
+	}
+	h := ReattachHash(sessionID, role)
+	if !s.Verify(h[:], pub) {
+		return errors.New("reattach sig verification failed")
+	}
+	return nil
+}
+
 func parsePubkeyHex(s string) (*btcec.PublicKey, error) {
 	b, err := hex.DecodeString(s)
 	if err != nil {

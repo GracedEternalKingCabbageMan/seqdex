@@ -46,8 +46,10 @@ type submarineMakerConfig struct {
 	seqDelta    uint32 // T_seq = SEQ tip + this
 	subAnchor   int64  // the submarine cross-leg anchor-depth gate (>=2)
 	onchainCltv uint32 // advisory CLTV in the resting LightningTerms
-	spendFee    uint64 // maker asset-claim fee (atoms)
+	spendFee    uint64 // maker asset-claim fee target (native sats; sized per-asset)
+	max0conf    uint64 // 0-conf LP-fronting cap (asset atoms): trades <= it settle instantly
 	reverse     bool   // true = SELL the asset for BTC-LN (maker-secret REVERSE); false = BUY (NORMAL)
+	requote     bool   // true = re-post a fresh offer after each settled fill instead of exiting
 }
 
 // buildSubmarineOffer builds a Lightning offer (base=asset, quote=the BTC
@@ -65,7 +67,7 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
 		BaseAmount:        cfg.assetAmt,
-		AllowPartial:      false, // whole-HTLC lifts, one at a time
+		AllowPartial:      true, // a taker may take a slice; the remainder is re-rested after the fill
 		CreatedAtUnix:     uint64(time.Now().Unix()),
 		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
 		FeeAssetHint:      cfg.feeAsset,
@@ -75,7 +77,8 @@ func buildSubmarineOffer(cfg submarineMakerConfig, makerLnNodeID string) *seqobv
 			MakerClaimPub:          cfg.makerPubKey,
 			MakerRefundPub:         cfg.makerPubKey,
 			OnchainCltv:            cfg.onchainCltv,
-			MakerIssuesHoldInvoice: false, // both v1 modes are plugin-free
+			MakerIssuesHoldInvoice: false,        // both v1 modes are plugin-free
+			Max_0ConfAmount:        cfg.max0conf, // advertise the 0-conf cap so takers can front small amounts
 		}},
 	}
 	if cfg.reverse {
@@ -128,14 +131,21 @@ func runSubmarineMaker(cfg submarineMakerConfig) {
 		fatal("dial ws %s: %v", wsURL, err)
 	}
 	if cfg.reverse {
+		// The reverse-submarine T_seq is COUPLED to the invoice min_final_cltv (not cfg.seqDelta,
+		// which sizes the cross W1/W2 leg); RunMakerReverseSubmarine raises a short delta to the
+		// coupled minimum. Print the effective coupled values so the operator sees what takers gate on.
+		effDelta := cfg.seqDelta
+		if effDelta < client.SubReverseSeqLocktimeDelta {
+			effDelta = client.SubReverseSeqLocktimeDelta
+		}
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
-			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  maker sells %d %s for up to %d BTC sats over Lightning (REVERSE maker-secret: taker buys the asset)  T_seq=+%d min-final-cltv=%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, effDelta, client.SubReverseInvoiceCLTV, cfg.subAnchor, cfg.max0conf, lnID)
 		fmt.Printf("  taker lifts with: seqob-cli xsubbuy -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
 	} else {
 		fmt.Printf("seqob-maker up (LIGHTNING/submarine): posted BUY offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-		fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d  ln-node=%s\n",
-			cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, lnID)
+		fmt.Printf("  maker pays up to %d BTC sats over Lightning for %d %s (NORMAL: taker sells the asset)  T_seq=+%d min-anchor-depth=%d max-0conf=%d  ln-node=%s\n",
+			cfg.btcSats, cfg.assetAmt, cfg.asset, cfg.seqDelta, cfg.subAnchor, cfg.max0conf, lnID)
 		fmt.Printf("  taker lifts with: seqob-cli xsublift -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), cfg.makerPubHex)
 	}
 
@@ -151,6 +161,8 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
 	filled := false
+	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
+	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -191,6 +203,15 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 				fmt.Printf("lift %s: crypter error: %v\n", sid, err)
 				continue
 			}
+			// A lift NAMES the offer it takes, but the relay routes it to this maker by PUBKEY —
+			// and a stable identity key can be shared by siblings (a requote overlap, a stray
+			// process). Negotiating someone else's offer with OUR terms rejects the taker only
+			// AFTER it may have committed funds ("btc leg X != required Y", seen live). Refuse
+			// up front instead: an honest, instant "wrong maker process" costs the taker nothing.
+			if lr.GetOfferId() != o.GetOfferId() {
+				refuse(sid, cr, "stale_offer", "this maker process serves offer "+o.GetOfferId()+", not "+lr.GetOfferId())
+				continue
+			}
 			mu.Lock()
 			busy, done := inFlight > 0, filled
 			var in chan []byte
@@ -217,17 +238,67 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 
 			go func(sid string, in chan []byte) {
 				settled := false
+				var settleTxid string
+				// A lift may take a SLICE. filledSeq is what this one settled; partial says
+				// the offer still has size left, which we re-rest rather than retiring.
+				var filledSeq uint64
+				partial := false
 				defer func() {
+					// Record the executed fill FIRST, before requote/cancel touch the still-resting
+					// offer: the relay records the trade (last_price + chart for the asset/BTC pair)
+					// and decrements/finalizes the order. Maker-signed + offer-keyed, so it lands even
+					// though the courier session may already be gone.
+					if settled {
+						fill := filledSeq
+						if fill == 0 {
+							fill = o.GetBaseAmount()
+						}
+						reportSettledTrade(ws, o, cfg.makerKey, fill, settleTxid)
+					}
+					// -requote: re-post a fresh quote while still holding the in-flight slot
+					// (racing lifts are refused as "busy" until it is live -> no double-post).
+					// The asset leg is on-chain; only the BTC-LN leg has channel peers to
+					// reconnect before the next lift's pay.
+					// PARTIAL FILL: re-rest the REMAINDER, priced at the offer's own rate.
+					// Without this the maker would re-post the FULL size after selling a slice,
+					// advertising asset it no longer has.
+					if settled && partial {
+						mu.Lock()
+						remain := o.GetBaseAmount() - filledSeq
+						if o.GetLightning().GetLnDirection() == offer.LnBTCForAsset {
+							// The maker SELLS the asset: OfferAmount=asset given, WantAmount=BTC wanted.
+							o.WantAmount = client.ProportionalBtc(o.GetWantAmount(), remain, o.GetBaseAmount())
+							o.OfferAmount = remain
+						} else {
+							// The maker BUYS the asset: OfferAmount=BTC given, WantAmount=asset wanted.
+							o.OfferAmount = client.ProportionalBtcFloor(o.GetOfferAmount(), remain, o.GetBaseAmount())
+							o.WantAmount = remain
+						}
+						o.BaseAmount = remain
+						mu.Unlock()
+						fmt.Printf("session %s: PARTIAL fill (%d of %d atoms); re-resting the remainder %d\n",
+							sid, filledSeq, filledSeq+remain, remain)
+					}
+					if settled && (cfg.requote || partial) {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
+							if n, err := xchain.NewCLNLNLeg(cfg.lnSocket).ReconnectPeers(); err != nil {
+								fmt.Printf("requote: BTC-LN peer reconnect: reconnected %d, err: %v\n", n, err)
+							} else if n > 0 {
+								fmt.Printf("requote: reconnected %d BTC-LN peer(s)\n", n)
+							}
+						})
+					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled {
+					if settled && !cfg.requote && !partial {
 						filled = true
 					}
 					mu.Unlock()
-					if settled {
+					if settled && !cfg.requote && !partial {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
+					requoteExitIfPending(idle)
 				}()
 				if o.GetLightning().GetLnDirection() == offer.LnBTCForAsset {
 					// REVERSE (maker-secret): the maker locks the asset + issues a
@@ -237,12 +308,17 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 							sub := xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(cfg.lnSocket), xchain.NewHashLock(secret))
 							return &client.LiveSubReverseMakerOps{Sub: sub}
 						},
-						Crypter:          cr,
-						SeqTip:           seqChain.BlockCount,
-						AssetHex:         o.GetPair().GetBaseAsset(),
-						SeqAmount:        o.GetOfferAmount(),       // the asset the maker sells
-						InvoiceMsat:      o.GetWantAmount() * 1000, // BTC sats wanted -> msat
+						Crypter:     cr,
+						SeqTip:      seqChain.BlockCount,
+						AssetHex:    o.GetPair().GetBaseAsset(),
+						SeqAmount:   o.GetOfferAmount(),       // the asset the maker sells
+						InvoiceMsat: o.GetWantAmount() * 1000, // BTC sats wanted -> msat
+						// T_seq and the invoice min_final_cltv are COUPLED from ONE invariant so an honest
+						// offer clears the taker's hold-CLTV masquerade gate. This is the single-chain
+						// submarine gate, NOT the cross W1/W2 delta (cfg.seqDelta) — coupleSubReverse inside
+						// RunMakerReverseSubmarine raises T_seq to the coupled minimum if cfg.seqDelta is short.
 						SeqLocktimeDelta: cfg.seqDelta,
+						InvoiceCLTV:      client.SubReverseInvoiceCLTV,
 						Log:              logf,
 					}
 					res, err := client.RunMakerReverseSubmarine(p, in, send)
@@ -255,8 +331,10 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 						return
 					}
 					settled = true
-					fmt.Printf("session %s: REVERSE SUBMARINE SWAP SETTLED: received %d msat over BTC-LN; the taker claimed the asset\n",
-						sid, res.PaidMsat)
+					filledSeq = res.FilledSeq
+					partial = res.RemainderSeq > 0
+					fmt.Printf("session %s: REVERSE SUBMARINE SWAP SETTLED: %d of %d atoms for %d msat over BTC-LN; the taker claimed the asset\n",
+						sid, res.FilledSeq, o.GetBaseAmount(), res.PaidMsat)
 					return
 				}
 				// NORMAL: the taker funds the asset HTLC + hands us a BOLT11; we
@@ -273,6 +351,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					InvoiceMsat:      o.GetOfferAmount() * 1000, // BTC sats the maker pays -> msat
 					SeqLocktimeDelta: cfg.seqDelta,
 					MinAnchorDepth:   cfg.subAnchor,
+					Max0ConfAmount:   cfg.max0conf,
 					SpendFeeAtoms:    cfg.spendFee,
 					Log:              logf,
 				}
@@ -285,8 +364,11 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					return
 				}
 				settled = true
-				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN, claimed the asset in %s\n",
-					sid, res.SeqClaimTxid)
+				settleTxid = res.SeqClaimTxid
+				filledSeq = res.FilledSeq
+				partial = res.RemainderSeq > 0
+				fmt.Printf("session %s: SUBMARINE SWAP SETTLED: paid the taker's BTC-LN for %d of %d atoms, claimed the asset in %s\n",
+					sid, res.FilledSeq, o.GetBaseAmount(), res.SeqClaimTxid)
 			}(sid, in)
 
 		case from.GetSwapMsg() != nil:
@@ -312,6 +394,9 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			if offerRejected(e.GetCode(), e.GetMessage()) {
+				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			}
 		}
 	}
 }

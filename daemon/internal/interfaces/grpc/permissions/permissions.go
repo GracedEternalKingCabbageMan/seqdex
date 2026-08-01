@@ -239,23 +239,6 @@ func Whitelist() map[string][]bakery.Op {
 			Entity: EntityTransport,
 			Action: "read",
 		}},
-		// Cross-chain (XchainService) maker RPCs are public, like TradeService.
-		fmt.Sprintf("/%s/ListXchainMarkets", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
-			Entity: EntityTrade,
-			Action: "read",
-		}},
-		fmt.Sprintf("/%s/GetXchainQuote", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
-			Entity: EntityTrade,
-			Action: "read",
-		}},
-		fmt.Sprintf("/%s/ProposeXchainSwap", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
-			Entity: EntityTrade,
-			Action: "write",
-		}},
-		fmt.Sprintf("/%s/GetXchainSwap", seqdexv1.XchainService_ServiceDesc.ServiceName): {{
-			Entity: EntityTrade,
-			Action: "read",
-		}},
 		fmt.Sprintf("/%s/GetInfo", reflectionv1.ReflectionService_ServiceDesc.ServiceName): {{
 			Entity: EntityReflection,
 			Action: "read",

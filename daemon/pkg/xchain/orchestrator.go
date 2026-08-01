@@ -88,6 +88,22 @@ func NewSwapBitcoin(btc *BitcoinChain, seq *Chain, prim *HashLock) *Swap {
 	}
 }
 
+// NewSwapAsset wires an orchestrator whose "BTC-position" leg is a Sequentia
+// ISSUED asset on the SAME Sequentia chain — the mixed same-chain shape
+// (rails 7/8): one leg over Lightning, the other an on-chain HTLC on `assetID`,
+// standing exactly where BTC stands in the submarine/sub-asset constructions
+// (Principle 3: no structurally privileged unit). Both "sides" run against the
+// one Sequentia node; verify/claim/refund are Elements-format and check the
+// leg's output pays `assetID`.
+func NewSwapAsset(seq *Chain, assetID string, prim *HashLock) *Swap {
+	return &Swap{
+		btcBackend: newElementsBTCBackendAsset(seq, prim, assetID),
+		seq:        seq,
+		seqLeg:     NewElementsLeg(LegSEQ, prim),
+		hash:       prim,
+	}
+}
+
 // LegLock records a funded HTLC leg.
 type LegLock struct {
 	Script   []byte
@@ -110,12 +126,32 @@ func (s *Swap) LockBTCLeg(claimPub, refundPub []byte, amountCoins string, lockti
 // on-chain (paper principle 7). It mines one Sequentia block and returns the
 // funded leg plus the hash of the block that confirmed it (for the ordering
 // check). The caller must then call VerifySeqLegSafe before treating it as safe.
-func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, string, error) {
+// lockSEQLegBroadcast builds the SEQ HTLC on H and funds (broadcasts) it, returning the funded leg WITHOUT
+// waiting for confirmation. Shared by LockSEQLeg (which then waits for the anchored block) and
+// LockSEQLegNoWait (which returns immediately so the caller can relay the leg at 0-conf).
+func (s *Swap) lockSEQLegBroadcast(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, error) {
 	script, err := s.seqLeg.HTLCScript(claimPub, refundPub, locktime)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	funded, err := s.seq.LockHTLC(script, amountCoins, assetLabel)
+	if err != nil {
+		return nil, err
+	}
+	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, nil
+}
+
+// LockSEQLegNoWait funds the SEQ HTLC and returns as soon as it is broadcast (no confirmation wait, empty
+// block hash). Used by the bridged-SELL taker so it can relay the funded asset leg to the maker IMMEDIATELY
+// — the maker polls VerifySEQLeg until the leg confirms — instead of holding the LSP's courier session idle
+// through a whole SEQ block, which is what intermittently dropped the relay (the maker then never learned
+// the leg and could not claim).
+func (s *Swap) LockSEQLegNoWait(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, error) {
+	return s.lockSEQLegBroadcast(claimPub, refundPub, amountCoins, assetLabel, locktime)
+}
+
+func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel string, locktime uint32) (*LegLock, string, error) {
+	leg, err := s.lockSEQLegBroadcast(claimPub, refundPub, amountCoins, assetLabel, locktime)
 	if err != nil {
 		return nil, "", err
 	}
@@ -129,7 +165,7 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 	// caller fails with "not confirmed (no blockhash)" the instant the leg is funded.
 	var blockHash string
 	for i := 0; i < 90; i++ { // up to ~3 min at 2s
-		if blockHash, err = s.seq.BlockHashOfTx(funded.TxID); err == nil && blockHash != "" {
+		if blockHash, err = s.seq.BlockHashOfTx(leg.Funded.TxID); err == nil && blockHash != "" {
 			break
 		}
 		time.Sleep(2 * time.Second)
@@ -138,10 +174,9 @@ func (s *Swap) LockSEQLeg(claimPub, refundPub []byte, amountCoins, assetLabel st
 		// The leg IS funded on-chain at this point: return it WITH the error so
 		// the caller can persist the outpoint/script/locktime and refund after
 		// the CLTV instead of orphaning coins behind an unknowable redeem script.
-		return &LegLock{Script: script, Funded: funded, Locktime: locktime}, "",
-			fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", funded.TxID, err)
+		return leg, "", fmt.Errorf("SEQ leg %s funded but not confirmed in time: %w", leg.Funded.TxID, err)
 	}
-	return &LegLock{Script: script, Funded: funded, Locktime: locktime}, blockHash, nil
+	return leg, blockHash, nil
 }
 
 // AnchorEvidence captures what VerifySeqLegSafe checked, for proof/printing.
@@ -190,8 +225,18 @@ func (s *Swap) VerifySeqLegSafe(seqBlockHash string, btcLegHeight int64) (*Ancho
 		OK:               anchor >= btcLegHeight && status.AnchorStatus == "ok" && (!certPresent || certified),
 	}
 	if !ev.OK {
-		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, anchorstatus=%q, quorum-certified=%v)",
-			ErrAnchorOrdering, seqBlockHash, anchor, btcLegHeight, status.AnchorStatus, certified)
+		// Which conjunct failed decides whether waiting can ever help. The ordering
+		// term reads the leg block's COMMITTED anchorheight, so it is immutable for
+		// this block hash: report it as TERMINAL so the caller refunds now instead
+		// of re-reading the same number until its timelock window is gone. The
+		// status/certification terms genuinely flap, so they stay retryable.
+		// Same verdict either way — this only distinguishes futile from transient.
+		sentinel := ErrAnchorOrdering
+		if anchor < btcLegHeight {
+			sentinel = ErrAnchorOrderingTerminal
+		}
+		return ev, fmt.Errorf("%w (seq block %s anchorheight=%d, btc-leg height=%d, node anchorheight=%d, anchorstatus=%q, quorum-certified=%v)",
+			sentinel, seqBlockHash, anchor, btcLegHeight, status.AnchorHeight, status.AnchorStatus, certified)
 	}
 	return ev, nil
 }
@@ -223,6 +268,32 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 	// fail the claim (otherwise the reveal stalls and the secret is never surfaced).
 	_ = s.seq.Mine(1)
 	return txid, nil
+}
+
+// sizeSeqSpendFee converts a native-sats TARGET fee into the leg asset's own atoms
+// via the open-fee-market exchange rate (asset_atoms = ceil(target*1e8/rate)),
+// exactly like the RFQ watcher / order-book driver / wallet, then clamps it to half
+// the leg so the spend output stays positive. Emitting the flat native target as a
+// raw atom count of a VALUABLE asset (e.g. GOLD, rate ~5e12) yields an absurd
+// native-equivalent fee that sendrawtransaction rejects (maxfeerate); sizing keeps the
+// fee's native value inside the node's relay bounds — a valuable asset correctly pays
+// FEWER atoms. Falls back to the flat target when no positive rate is published (the
+// native asset, where atoms == native sats) or the SEQ chain is unavailable (tests).
+func (s *Swap) sizeSeqSpendFee(assetHex string, legAmount, targetNativeFee uint64) uint64 {
+	fee := targetNativeFee
+	if s.seq != nil {
+		if rate, ok := s.seq.FeeExchangeRate(assetHex); ok && rate > 0 {
+			const scale = 100_000_000 // 1e8; matches price_server.py / exchangerates.cpp
+			fee = (targetNativeFee*scale + rate - 1) / rate // ceil
+			if fee == 0 {
+				fee = 1
+			}
+		}
+	}
+	if maxFee := legAmount / 2; fee > maxFee {
+		fee = maxFee
+	}
+	return fee
 }
 
 // ClaimBTCLeg performs step 5: Bob redeems the BTC leg with the now-revealed

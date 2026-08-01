@@ -50,6 +50,10 @@ type RealBackend struct {
 	// validates the maker-returned SwapAccept against it before signing, so it is
 	// authentic taker-side state (never relay-supplied).
 	lastReq *seqdexv1.SwapRequest
+	// lastConfidential records whether the last proposal was a BLINDED-book lift, so
+	// ProposerFinalize can fail closed (reject a maker-returned tx that is not fully
+	// blinded) before the taker signs its inputs.
+	lastConfidential bool
 }
 
 // NewRealBackend builds a RealBackend with the taker's signing + blinding keys.
@@ -128,6 +132,7 @@ func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidential
 	// Remember the request so ProposerFinalize can assert the maker-returned tx
 	// still pays this exact receive leg to this taker before signing.
 	b.lastReq = &out
+	b.lastConfidential = req.Confidential
 	return &out, nil
 }
 
@@ -190,6 +195,13 @@ func (b *RealBackend) ProposerFinalize(acc *seqdexv1.SwapAccept) (*seqdexv1.Swap
 		AmountR:            b.lastReq.GetAmountR(),
 	}); err != nil {
 		return nil, "", fmt.Errorf("refusing to sign maker-returned swap: %w", err)
+	}
+	// Blinded-book fail-closed: for a confidential-book lift, refuse to sign unless
+	// EVERY non-fee output of the maker-returned tx is blinded (both legs CT). A tx
+	// with any explicit recipient output would leak the confidential leg's amount via
+	// the public swap ratio.
+	if b.lastConfidential && !allOutputsBlinded(acc.GetTransaction()) {
+		return nil, "", fmt.Errorf("confidential book: refusing to sign a swap that is not fully blinded")
 	}
 	signed, err := b.taker.Sign(acc.GetTransaction())
 	if err != nil {

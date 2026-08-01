@@ -11,9 +11,16 @@
 package offerstore
 
 import (
+	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 
@@ -34,6 +41,39 @@ type Entry struct {
 	SettleTxid   string
 	AnchorConfs  uint32
 	CreatedAt    time.Time
+	heldFill     uint64 // B1: active size captured when a mempool spend zeroed it, so the confirmed fill's trade size isn't lost
+	reRested     bool   // F3: this covenant order was re-rested to a remainder outpoint at least once (its funding is no longer the original), so a Ghost of the current outpoint may be a reorg-undone fill whose earlier outpoint is restored — hold it, don't invalidate.
+	demoted      bool   // P3.10: this INTERACTIVE offer pushed the maker's committed capital in its offer_asset past the soft cap (likely phantom depth). Advisory; still resting/liftable.
+}
+
+// Trade is one recorded cross, captured at on-chain SETTLEMENT: the chain watcher records a
+// covenant fill on confirmation, and the interactive-lift SettleAck records its fill. (The matcher
+// no longer records at match.) Feeds last_price, the trades feed, and candles. Price is
+// quote-per-base, the same convention as displayPrice / best_bid|ask.
+type Trade struct {
+	TS    time.Time
+	Price float64 // quote per base (matches best_bid/best_ask units)
+	Size  uint64  // base atoms filled
+	// Txid is the settling tx this trade was recorded for (empty for a match-time or
+	// txid-less record). It lets a Bitcoin-driven reorg RETRACT the phantom trade
+	// (RetractTrade) so a reorged-away fill no longer leaves a stale last_price (P3.9).
+	Txid string
+}
+
+const maxTradesPerPair = 1000 // ring cap per market; oldest dropped
+
+// tradeRec is one line of the durable JSONL trade log: the pairKey plus the trade, so
+// last_price/trades/candles can be replayed after a relay restart (the book itself is ephemeral).
+// A record with RetractTxid set is a RETRACTION (P3.9): on replay it removes any already-
+// replayed trades with that txid for that pair, so a reorged-away fill does not resurrect
+// after a restart. The append-only log stays append-only (no rewrite on a reorg).
+type tradeRec struct {
+	PK          string    `json:"pk"`
+	TS          time.Time `json:"ts"`
+	Price       float64   `json:"price"`
+	Size        uint64    `json:"size"`
+	Txid        string    `json:"txid,omitempty"`
+	RetractTxid string    `json:"retract_txid,omitempty"`
 }
 
 // EventType is the kind of book delta.
@@ -50,28 +90,225 @@ const (
 
 // Event is a single book delta delivered to subscribers.
 type Event struct {
-	Type   EventType
-	Pair   *seqobv1.AssetPair
-	Offer  *seqobv1.Offer       // set for EventCreated
-	Ref    *seqobv1.OfferRef    // set for EventRemoved
-	Status *seqobv1.OrderStatus // set for EventStatus
+	Type EventType
+	Pair *seqobv1.AssetPair
+	// Confidential is the delta's book NAMESPACE (the resting offer's confidential flag),
+	// carried here because EventRemoved/EventStatus reference an offer by key only (no Offer
+	// pointer) yet must still be filtered to their namespace. Subscribers see only deltas whose
+	// Confidential matches their own — the same disjoint transparent/blinded split SnapshotPair
+	// and the matcher enforce.
+	Confidential bool
+	Offer        *seqobv1.Offer       // set for EventCreated
+	Ref          *seqobv1.OfferRef    // set for EventRemoved
+	Status       *seqobv1.OrderStatus // set for EventStatus
+	// Seq is the monotonic per-subscription sequence number of this delta (P3.8),
+	// stamped at delivery time. A subscriber that sees Seq skip a value missed a
+	// dropped delta and must re-snapshot. 0 until stamped.
+	Seq uint64
 }
 
 type subscriber struct {
-	pair string // pairKey filter, or "" for all pairs
-	ch   chan Event
+	pair         string // pairKey filter, or "" for all pairs
+	confidential bool   // book namespace this subscriber is bound to (only matching-namespace deltas are delivered)
+	ch           chan Event
+	// seq is the per-subscription delta counter (P3.8). It is incremented for EVERY
+	// event ROUTED to this subscriber — delivered OR dropped — so a dropped delta
+	// leaves a hole in the delivered sequence that the subscriber (and the WS
+	// forwarder) detect as a gap. Atomic: concurrent broadcasts may route here.
+	seq atomic.Uint64
 }
 
 // Store is the in-memory order book.
 type Store struct {
-	mu          sync.RWMutex
-	entries     map[Key]*Entry
-	pairs       map[string]map[Key]bool // pairKey -> set of keys
-	subs        map[int]*subscriber
-	nextSub     int
-	cancelNonce map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
-	subBuf      int
-	now         func() time.Time
+	mu             sync.RWMutex
+	entries        map[Key]*Entry
+	pairs          map[string]map[Key]bool // pairKey -> set of keys
+	subs           map[int]*subscriber
+	nextSub        int
+	cancelNonce    map[Key]uint64 // highest cancel nonce seen per key (replay defense, survives removal)
+	settledNonce   map[Key]uint64 // highest settled-trade nonce seen per key (replay defense; offer_id is reused across -requote)
+	subBuf         int
+	now            func() time.Time
+	trades         map[string][]Trade // pairKey -> recent trades ring (newest last), lazy
+	tradeLog       *os.File           // B1: append-only JSONL sink so trade history survives a relay restart (nil = disabled)
+	interactiveCap uint64             // P3.10: per-maker soft cap on committed capital per offer_asset (0 = disabled). An interactive offer that pushes the maker's cumulative offer_amount in an asset past this is demoted.
+}
+
+// RecordTrade appends one executed cross for the resting offer's pair at its execution
+// price (displayPrice of the resting order). Called by the matcher when a fill is produced.
+// Best-effort + non-blocking: bad inputs are ignored, never an error on the match path.
+func (s *Store) RecordTrade(restingOffer *seqobv1.Offer, sizeBase uint64) {
+	s.RecordTradeTx(restingOffer, sizeBase, "")
+}
+
+// RecordTradeTx is RecordTrade with the SETTLING TXID attached, so a later Bitcoin
+// reorg can retract this exact trade (RetractTrade). Callers with a settle txid (the
+// interactive-lift SettleAck, cross/LN SettledTrade) pass it; a txid-less record ("")
+// behaves exactly like RecordTrade.
+func (s *Store) RecordTradeTx(restingOffer *seqobv1.Offer, sizeBase uint64, txid string) {
+	if restingOffer == nil || sizeBase == 0 {
+		return
+	}
+	price, _ := displayPrice(restingOffer)
+	pair := restingOffer.GetPair()
+	if price <= 0 || pair == nil {
+		return
+	}
+	pk := pairKey(pair)
+	ts := s.now()
+	s.mu.Lock()
+	if s.trades == nil {
+		s.trades = make(map[string][]Trade)
+	}
+	t := append(s.trades[pk], Trade{TS: ts, Price: price, Size: sizeBase, Txid: txid})
+	if len(t) > maxTradesPerPair {
+		t = t[len(t)-maxTradesPerPair:]
+	}
+	s.trades[pk] = t
+	logf := s.tradeLog
+	s.mu.Unlock()
+	// Durably append AFTER releasing the lock (B-4): a slow/networked disk must never serialize the whole
+	// book behind the trade-log write on the match/settle hot path. os.File appends (O_APPEND) are atomic
+	// and Write is goroutine-safe, so concurrent appends are fine. Best-effort — a log error never breaks.
+	if logf != nil {
+		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, Price: price, Size: sizeBase, Txid: txid}); err == nil {
+			_, _ = logf.Write(append(b, '\n'))
+		}
+	}
+}
+
+// RetractTrade removes every recorded trade for pair whose settling tx is txid, then
+// durably appends a RETRACTION to the JSONL so the trade does not resurrect on a
+// restart replay (P3.9). It is the trade-feed half of reorg-undo: when a Bitcoin
+// reorg orphans a settling tx, the fill un-happened, so the phantom trade print, its
+// contribution to last_price (the newest ring entry), and its candle volume must go.
+// The append-only log stays append-only (no rewrite). Returns the number removed.
+// No-op for an empty txid (a txid-less trade cannot be targeted).
+func (s *Store) RetractTrade(pair *seqobv1.AssetPair, txid string) int {
+	if pair == nil || txid == "" {
+		return 0
+	}
+	pk := pairKey(pair)
+	ts := s.now()
+	s.mu.Lock()
+	ring := s.trades[pk]
+	kept := ring[:0:0]
+	removed := 0
+	for _, tr := range ring {
+		if tr.Txid == txid {
+			removed++
+			continue
+		}
+		kept = append(kept, tr)
+	}
+	if removed > 0 {
+		s.trades[pk] = kept
+	}
+	logf := s.tradeLog
+	s.mu.Unlock()
+	if removed > 0 && logf != nil {
+		if b, err := json.Marshal(tradeRec{PK: pk, TS: ts, RetractTxid: txid}); err == nil {
+			_, _ = logf.Write(append(b, '\n'))
+		}
+	}
+	return removed
+}
+
+// EnableTradeLog makes the trade history durable: it replays an existing append-only JSONL log into
+// the in-memory rings, then keeps appending new trades to it. The book itself is ephemeral, but
+// last_price/trades/candles should survive a relay restart. Best-effort; call once at startup.
+func (s *Store) EnableTradeLog(path string) error {
+	if f, err := os.Open(path); err == nil {
+		s.mu.Lock()
+		if s.trades == nil {
+			s.trades = make(map[string][]Trade)
+		}
+		// bufio.Reader (not Scanner): a single over-long/corrupt line must not silently END the replay
+		// (Scanner returns false past its cap) — read line by line, skip a bad one, keep going (B-5).
+		rd := bufio.NewReaderSize(f, 1<<20)
+		for {
+			line, rerr := rd.ReadBytes('\n')
+			if len(line) > 0 {
+				var r tradeRec
+				if json.Unmarshal(line, &r) == nil && r.PK != "" {
+					if r.RetractTxid != "" {
+						// A reorg retraction (P3.9): drop any already-replayed trades with this
+						// txid so a reorged-away fill does not resurrect after a restart.
+						ring := s.trades[r.PK]
+						kept := ring[:0:0]
+						for _, tr := range ring {
+							if tr.Txid != r.RetractTxid {
+								kept = append(kept, tr)
+							}
+						}
+						s.trades[r.PK] = kept
+					} else if r.Price > 0 && r.Size != 0 {
+						t := append(s.trades[r.PK], Trade{TS: r.TS, Price: r.Price, Size: r.Size, Txid: r.Txid})
+						if len(t) > maxTradesPerPair {
+							t = t[len(t)-maxTradesPerPair:]
+						}
+						s.trades[r.PK] = t
+					}
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		s.mu.Unlock()
+		_ = f.Close()
+		// Compact to just the retained tail (<= maxTradesPerPair per pair) so the log can't grow without
+		// bound and each restart's replay stays O(retained), not O(all history ever) (B-5).
+		s.compactTradeLog(path)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.tradeLog = f
+	s.mu.Unlock()
+	return nil
+}
+
+// compactTradeLog rewrites the log to exactly the retained in-memory trades (best-effort; startup only,
+// before any concurrent RecordTrade writer is armed).
+func (s *Store) compactTradeLog(path string) {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	for pk, ring := range s.trades {
+		for _, tr := range ring {
+			if b, mErr := json.Marshal(tradeRec{PK: pk, TS: tr.TS, Price: tr.Price, Size: tr.Size, Txid: tr.Txid}); mErr == nil {
+				_, _ = f.Write(append(b, '\n'))
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if f.Close() == nil {
+		_ = os.Rename(tmp, path)
+	} else {
+		_ = os.Remove(tmp)
+	}
+}
+
+// TradesFor returns the most recent trades for a pair (up to limit; 0 = all held), newest last.
+func (s *Store) TradesFor(pair *seqobv1.AssetPair, limit int) []Trade {
+	if pair == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := s.trades[pairKey(pair)]
+	if limit > 0 && len(t) > limit {
+		t = t[len(t)-limit:]
+	}
+	out := make([]Trade, len(t))
+	copy(out, t)
+	return out
 }
 
 // New returns an empty store. If now is nil, time.Now is used.
@@ -80,13 +317,65 @@ func New(now func() time.Time) *Store {
 		now = time.Now
 	}
 	return &Store{
-		entries:     make(map[Key]*Entry),
-		pairs:       make(map[string]map[Key]bool),
-		subs:        make(map[int]*subscriber),
-		cancelNonce: make(map[Key]uint64),
-		subBuf:      256,
-		now:         now,
+		entries:      make(map[Key]*Entry),
+		pairs:        make(map[string]map[Key]bool),
+		subs:         make(map[int]*subscriber),
+		cancelNonce:  make(map[Key]uint64),
+		settledNonce: make(map[Key]uint64),
+		subBuf:       256,
+		now:          now,
 	}
+}
+
+// SetInteractiveCap sets the P3.10 soft per-maker committed-capital cap: an
+// INTERACTIVE offer whose offer_amount pushes the maker's cumulative committed
+// capital in that offer_asset past n is DEMOTED (flagged as likely phantom depth,
+// but still resting/liftable). 0 (the default) disables demotion. Covenant offers
+// are funded on-chain and never demoted. Set at startup.
+func (s *Store) SetInteractiveCap(n uint64) {
+	s.mu.Lock()
+	s.interactiveCap = n
+	s.mu.Unlock()
+}
+
+// CommittedInteractiveCapital returns the maker's cumulative committed capital in
+// offerAsset across its LIVE interactive (non-covenant) offers — the sum of their
+// offer_amounts. It is the soft-accounting quantity the relay uses to spot phantom
+// depth (many resting offers drawing on the same coins), exported so a UI/monitor can
+// read it. Covenant offers are excluded (funded on-chain, no oversell).
+func (s *Store) CommittedInteractiveCapital(makerPubkey, offerAsset string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.committedInteractiveLocked(makerPubkey, offerAsset)
+}
+
+// committedInteractiveLocked sums live interactive offer_amounts for (maker, asset).
+// Caller holds s.mu.
+func (s *Store) committedInteractiveLocked(makerPubkey, offerAsset string) uint64 {
+	var total uint64
+	for k, e := range s.entries {
+		if k.MakerPubkey != makerPubkey || e.Offer.GetCovenant() != nil {
+			continue
+		}
+		if e.Offer.GetOfferAsset() != offerAsset {
+			continue
+		}
+		total += e.Offer.GetOfferAmount()
+	}
+	return total
+}
+
+// SetSubBuf sets the per-subscriber delta-channel capacity for subscribers created
+// AFTER this call (the default is 256). Lower it to make a buffer overflow — and the
+// resulting delta-sequence gap (P3.8) — deterministic in tests, or raise it for a
+// bursty deployment. Call before Subscribe.
+func (s *Store) SetSubBuf(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.mu.Lock()
+	s.subBuf = n
+	s.mu.Unlock()
 }
 
 func pairKey(p *seqobv1.AssetPair) string {
@@ -97,8 +386,13 @@ func keyOf(o *seqobv1.Offer) Key {
 	return Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()}
 }
 
+// ErrExists is returned by Submit when the (maker_pubkey, offer_id) key is already
+// resting. Callers refreshing a still-resting DURABLE offer (a reconnecting cross /
+// lightning settlement agent re-posts a re-signed copy) should Edit instead of erroring.
+var ErrExists = errors.New("offer already resting")
+
 // Submit verifies the offer's signature and inserts it as a new OPEN order.
-// It is an error to Submit a key that already exists (use Edit to re-sign).
+// It is an error (ErrExists) to Submit a key that already exists (use Edit to re-sign).
 func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 	if err := offer.VerifyOffer(o); err != nil {
 		return Key{}, fmt.Errorf("offer signature: %w", err)
@@ -110,7 +404,7 @@ func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 	s.mu.Lock()
 	if _, ok := s.entries[k]; ok {
 		s.mu.Unlock()
-		return Key{}, fmt.Errorf("offer %s/%s already exists", k.MakerPubkey, k.OfferID)
+		return Key{}, fmt.Errorf("offer %s/%s: %w", k.MakerPubkey, k.OfferID, ErrExists)
 	}
 	e := &Entry{
 		Offer:        o,
@@ -119,8 +413,17 @@ func (s *Store) Submit(o *seqobv1.Offer) (Key, error) {
 		CreatedAt:    s.now(),
 	}
 	s.put(k, e)
+	// P3.10 soft oversell: for an INTERACTIVE offer, once the maker's cumulative
+	// committed capital in this offer_asset (now including this offer) exceeds the soft
+	// cap, flag this marginal offer as demoted (likely phantom depth). Computed after
+	// put() so committedInteractiveLocked includes this offer. Covenant offers exempt.
+	if s.interactiveCap > 0 && o.GetCovenant() == nil {
+		if s.committedInteractiveLocked(k.MakerPubkey, o.GetOfferAsset()) > s.interactiveCap {
+			e.demoted = true
+		}
+	}
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return k, nil
 }
 
@@ -152,9 +455,11 @@ func (s *Store) Edit(o *seqobv1.Offer) error {
 	}
 	s.put(k, e)
 	s.mu.Unlock()
-	// Emit a removed+created pair so subscribers converge regardless of pair change.
-	s.broadcast(Event{Type: EventRemoved, Pair: old.Offer.GetPair(), Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	// Emit a removed+created pair so subscribers converge regardless of pair change. Each
+	// delta carries its OWN offer's namespace: a namespace change (re-signed transparent<->
+	// confidential) must remove from the old book and create in the new one.
+	s.broadcast(Event{Type: EventRemoved, Pair: old.Offer.GetPair(), Confidential: old.Offer.GetConfidential(), Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return nil
 }
 
@@ -178,9 +483,10 @@ func (s *Store) Cancel(c *seqobv1.OfferCancel) error {
 		return fmt.Errorf("offer %s/%s not found", k.MakerPubkey, k.OfferID)
 	}
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	s.remove(k)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil
 }
 
@@ -221,19 +527,50 @@ func (s *Store) OrderStatusOf(k Key) (*seqobv1.OrderStatus, bool) {
 	return e.orderStatus(k), true
 }
 
-// SnapshotPair returns all live offers for a pair.
-func (s *Store) SnapshotPair(p *seqobv1.AssetPair) []*seqobv1.Offer {
+// SnapshotPair returns all live offers for a pair in the requested book
+// namespace: confidential=false is the transparent (unblinded) book, confidential=true
+// is the separate blinded book. The two namespaces are DISJOINT views over the pair
+// so a confidential offer never appears in the transparent book and vice-versa
+// (Confidential-book requirement 1); the matcher additionally guarantees they never
+// cross.
+func (s *Store) SnapshotPair(p *seqobv1.AssetPair, confidential bool) []*seqobv1.Offer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshotLocked(pairKey(p))
+	set := s.pairs[pairKey(p)]
+	out := make([]*seqobv1.Offer, 0, len(set))
+	for k := range set {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
+			out = append(out, e.Offer)
+		}
+	}
+	return out
 }
 
-func (s *Store) snapshotLocked(pk string) []*seqobv1.Offer {
+func (s *Store) snapshotLocked(pk string, confidential bool) []*seqobv1.Offer {
 	set := s.pairs[pk]
 	out := make([]*seqobv1.Offer, 0, len(set))
 	for k := range set {
-		if e, ok := s.entries[k]; ok {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
 			out = append(out, e.Offer)
+		}
+	}
+	return out
+}
+
+// SnapshotPairEntries returns value copies of every live entry for a pair in the
+// requested book namespace (confidential true/false), for the matcher's
+// price-time-priority walk. Copies (not the live *Entry) so the matcher reads a
+// consistent snapshot; the enclosed *Offer is immutable once signed, so sharing its
+// pointer is safe. Filtering by confidential here keeps the blinded and unblinded
+// books as disjoint order sets.
+func (s *Store) SnapshotPairEntries(p *seqobv1.AssetPair, confidential bool) []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	set := s.pairs[pairKey(p)]
+	out := make([]Entry, 0, len(set))
+	for k := range set {
+		if e, ok := s.entries[k]; ok && e.Offer.GetConfidential() == confidential {
+			out = append(out, *e)
 		}
 	}
 	return out
@@ -269,6 +606,9 @@ func (s *Store) Markets() []*seqobv1.Market {
 			if !ok {
 				continue
 			}
+			if e.ActiveAmount == 0 {
+				continue // B-7: a held/zeroed entry isn't fillable — don't count it or advertise its price
+			}
 			if pair == nil {
 				pair = e.Offer.GetPair()
 			}
@@ -287,12 +627,22 @@ func (s *Store) Markets() []*seqobv1.Market {
 				}
 			}
 		}
-		_ = pk
+		var last float64
+		if t := s.trades[pk]; len(t) > 0 {
+			last = t[len(t)-1].Price // newest recorded cross
+		}
+		if pair == nil || n == 0 {
+			// Every entry in this pair is held/zeroed (ActiveAmount==0): there is no fillable
+			// market to advertise. Skip rather than emit a Market with a nil Pair (blank ticker
+			// + stale last price) that a UI renders as garbage.
+			continue
+		}
 		out = append(out, &seqobv1.Market{
-			Pair:    pair,
-			BestBid: bestBid,
-			BestAsk: bestAsk,
-			NOrders: n,
+			Pair:      pair,
+			BestBid:   bestBid,
+			BestAsk:   bestAsk,
+			LastPrice: last,
+			NOrders:   n,
 		})
 	}
 	return out
@@ -346,6 +696,7 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 	e.SettleTxid = settleTxid
 	e.AnchorConfs = anchorConfs
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	if e.ActiveAmount == 0 && anchorConfs >= e.Offer.GetMinAnchorDepth() {
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_FILLED
 	} else {
@@ -358,17 +709,75 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 	}
 	s.mu.Unlock()
 
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
 	if filled {
-		s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	}
 	return nil
+}
+
+// RecordSettledFill records a settled CROSS-CHAIN / LIGHTNING fill reported by the
+// offer's maker (the SettledTrade wire message; the caller has already verified the
+// maker signature and that maker_pubkey == k.MakerPubkey). It is the durable-settlement
+// analogue of the interactive SettleAck path — record the trade at the RESTING order's
+// price, then decrement/finalize the order (advancing anchorConfs so a min_anchor_depth>0
+// offer can reach FILLED) — but keyed to the offer instead of a live session, because a
+// cross/LN swap can finish after the courier session was swept or the maker reconnected.
+//
+// The nonce must strictly exceed the highest settled-fill nonce seen for this key: -requote
+// re-posts the SAME offer_id, so a stale settled-trade must not decrement the fresh quote.
+// If the offer already left the book (a prior fill removed it), this is a no-op returning nil
+// (there is nothing to price or decrement); the nonce is still advanced so the stale copy
+// cannot later apply. Reorg retraction of the recorded trade is handled separately.
+func (s *Store) RecordSettledFill(k Key, fillBase uint64, settleTxid string, anchorConfs uint32, nonce uint64) error {
+	s.mu.Lock()
+	if nonce != 0 && nonce <= s.settledNonce[k] {
+		s.mu.Unlock()
+		return fmt.Errorf("stale settled-trade nonce")
+	}
+	if nonce != 0 {
+		s.settledNonce[k] = nonce
+	}
+	e, ok := s.entries[k]
+	if !ok {
+		s.mu.Unlock()
+		return nil // offer already gone (a prior fill removed it): nothing to price or decrement
+	}
+	fill := fillBase
+	if fill > e.ActiveAmount {
+		fill = e.ActiveAmount // never decrement below the resting size (it shrank via another fill)
+	}
+	restingOffer := e.Offer // capture under the lock: ApplyPartialFill may remove the entry at full fill
+	s.mu.Unlock()
+	if fill == 0 {
+		return nil
+	}
+	// Record BEFORE ApplyPartialFill (which may remove the entry, after which the pair/price is
+	// no longer fetchable). Both re-lock internally; this mirrors wsSettleAck's ordering.
+	s.RecordTrade(restingOffer, fill)
+	return s.ApplyPartialFill(k, fill, settleTxid, anchorConfs)
 }
 
 // MarkInvalidated drops an offer because the maker could not co-sign (coins
 // moved). Maps to SideSwap HistStatus UTXO_INVALIDATED; no on-chain cost.
 func (s *Store) MarkInvalidated(k Key) error {
 	return s.dropWithStatus(k, seqobv1.OfferStatus_OFFER_STATUS_UTXO_INVALIDATED)
+}
+
+// RetireIncoming removes an order the RELAY itself retires immediately after
+// accepting it, per the order's time-in-force (an IOC remainder, or a FOK /
+// POST_ONLY that must not rest). Unlike Cancel it needs no maker-signed nonce (the
+// relay is enforcing the maker's own stated option on its own just-accepted order),
+// and unlike MarkInvalidated it carries the caller's terminal status (CANCELLED).
+// No-op (nil) if the entry is already gone (e.g. a concurrent fill removed it).
+func (s *Store) RetireIncoming(k Key, status seqobv1.OfferStatus) error {
+	s.mu.Lock()
+	if _, ok := s.entries[k]; !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	return s.dropWithStatus(k, status)
 }
 
 func (s *Store) dropWithStatus(k Key, status seqobv1.OfferStatus) error {
@@ -380,11 +789,12 @@ func (s *Store) dropWithStatus(k Key, status seqobv1.OfferStatus) error {
 	}
 	e.Status = status
 	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
 	st := e.orderStatus(k)
 	s.remove(k)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventStatus, Pair: pair, Status: st})
-	s.broadcast(Event{Type: EventRemoved, Pair: pair, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 	return nil
 }
 
@@ -408,7 +818,7 @@ func (s *Store) Reopen(o *seqobv1.Offer, restoreActive uint64) error {
 	e := &Entry{Offer: o, Status: status, ActiveAmount: restoreActive, CreatedAt: s.now()}
 	s.put(k, e)
 	s.mu.Unlock()
-	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Offer: o})
+	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return nil
 }
 
@@ -426,6 +836,7 @@ func (s *Store) SweepExpired() int {
 	}
 	type ev struct {
 		pair *seqobv1.AssetPair
+		conf bool
 		st   *seqobv1.OrderStatus
 		ref  *seqobv1.OfferRef
 	}
@@ -433,45 +844,337 @@ func (s *Store) SweepExpired() int {
 	for _, k := range expired {
 		e := s.entries[k]
 		e.Status = seqobv1.OfferStatus_OFFER_STATUS_EXPIRED
-		evs = append(evs, ev{pair: e.Offer.GetPair(), st: e.orderStatus(k), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), st: e.orderStatus(k), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 		s.remove(k)
 	}
 	s.mu.Unlock()
 	for _, e := range evs {
-		s.broadcast(Event{Type: EventStatus, Pair: e.pair, Status: e.st})
-		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
+		s.broadcast(Event{Type: EventStatus, Pair: e.pair, Confidential: e.conf, Status: e.st})
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
 	}
 	return len(expired)
 }
 
-// RemoveByMaker drops every resting offer for makerPubkey, emitting a removal event per
-// offer. Called when a maker's websocket disconnects: in this interactive book the maker
-// must be online to co-sign a lift, so once it is gone its offers are unliftable and must
-// not linger in the book until their TTL (they otherwise show as un-fillable "ghost"
-// duplicates after a maker restart/crash). Returns the number removed.
-func (s *Store) RemoveByMaker(makerPubkey string) int {
+// RemoveByMaker drops every resting INTERACTIVE SAME-CHAIN offer for makerPubkey,
+// emitting a removal event per offer. Called when a maker's websocket disconnects:
+// an interactive same-chain co-sign offer needs the maker ONLINE to co-sign a lift,
+// so once its connection drops the offer is unliftable and must not linger as an
+// un-fillable "ghost".
+//
+// DURABLE settlement types are the deliberate exception and are NOT evicted, because a
+// lift does not need this maker's live co-sign at disconnect time:
+//   - COVENANT offers: funded on-chain, fillable permissionlessly with the maker OFFLINE
+//     (the whole point of the passive CLOB).
+//   - CROSS-CHAIN (BTC<->asset) and LIGHTNING/sub-asset offers: serviced by the maker's
+//     always-online settlement agent (seqob-maker), which reconnects and re-registers.
+//     A transient WS blip must NOT evict these — that emptied the cross book (BTC vanished
+//     from the DEX). Ghost-safety holds regardless: a taker's pre-lock terms handshake
+//     fails fast and spends nothing if no agent answers, and the TTL sweep removes truly
+//     abandoned offers. See durable-cross-offer design.
+//
+// Returns the number removed.
+// RemoveInteractiveByMaker evicts EVERY offer of a maker that needs the maker online to
+// be lifted — that is all of them except a covenant, which the taker settles itself.
+//
+// RemoveByMaker deliberately spares cross-chain and Lightning offers, because they are
+// durable across a maker RECONNECT and evicting on every transient WS blip emptied the
+// cross book (TestCrossSurvivesMakerDisconnect). But durable-across-a-reconnect is not
+// the same as liftable-while-the-maker-is-GONE: those offers keep resting, keep being
+// served at top of book, and answer every taker with silence or a refusal until they
+// expire. A fleet that restarts its makers leaves the book full of them.
+//
+// The caller applies this only after a grace period in which the maker did not come
+// back, so a blip still costs nothing.
+func (s *Store) RemoveInteractiveByMaker(makerPubkey string) int {
 	s.mu.Lock()
 	victims := make([]Key, 0)
-	for k := range s.entries {
-		if k.MakerPubkey == makerPubkey {
+	for k, e := range s.entries {
+		if k.MakerPubkey == makerPubkey && e.Offer.GetCovenant() == nil {
 			victims = append(victims, k)
 		}
 	}
 	type ev struct {
 		pair *seqobv1.AssetPair
+		conf bool
 		ref  *seqobv1.OfferRef
 	}
 	evs := make([]ev, 0, len(victims))
 	for _, k := range victims {
 		e := s.entries[k]
-		evs = append(evs, ev{pair: e.Offer.GetPair(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
 		s.remove(k)
 	}
 	s.mu.Unlock()
 	for _, e := range evs {
-		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Ref: e.ref})
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
 	}
 	return len(victims)
+}
+
+// RemoveInteractiveByKeys removes exactly the named non-covenant offers. It is the
+// per-CONNECTION eviction primitive: pubkey-scoped eviction cannot tell two maker
+// processes sharing one identity key apart, so a dead sibling's offers ghosted while
+// any live sibling pinned the pubkey — and won price-time ties with prices no live
+// process would honor. The caller names the keys the departed connection itself
+// posted; a key re-posted since (and so owned by a live connection) is not passed in.
+func (s *Store) RemoveInteractiveByKeys(keys []Key) int {
+	s.mu.Lock()
+	type ev struct {
+		pair *seqobv1.AssetPair
+		conf bool
+		ref  *seqobv1.OfferRef
+	}
+	evs := make([]ev, 0, len(keys))
+	for _, k := range keys {
+		e, ok := s.entries[k]
+		if !ok || e.Offer.GetCovenant() != nil {
+			continue
+		}
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.remove(k)
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
+	}
+	return len(evs)
+}
+
+func (s *Store) RemoveByMaker(makerPubkey string) int {
+	s.mu.Lock()
+	victims := make([]Key, 0)
+	for k, e := range s.entries {
+		// Evict ONLY interactive same-chain co-sign offers (they need the maker online now). A same-chain
+		// COVENANT offer carries a covenant and is permissionless, so it is spared alongside cross/lightning.
+		if k.MakerPubkey == makerPubkey && e.Offer.GetSameChain() != nil && e.Offer.GetCovenant() == nil {
+			victims = append(victims, k)
+		}
+	}
+	type ev struct {
+		pair *seqobv1.AssetPair
+		conf bool
+		ref  *seqobv1.OfferRef
+	}
+	evs := make([]ev, 0, len(victims))
+	for _, k := range victims {
+		e := s.entries[k]
+		evs = append(evs, ev{pair: e.Offer.GetPair(), conf: e.Offer.GetConfidential(), ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+		s.remove(k)
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.broadcast(Event{Type: EventRemoved, Pair: e.pair, Confidential: e.conf, Ref: e.ref})
+	}
+	return len(victims)
+}
+
+// --- covenant chain-watcher reconciliation (internal/seqob/watcher) ----------
+//
+// These mutate a resting COVENANT order to match on-chain reality. They are the
+// only book operations the chain watcher needs, and they are DISTINCT from
+// RemoveByMaker (which deliberately never evicts a covenant on a maker
+// disconnect): the watcher removes or resizes a covenant strictly on CHAIN
+// evidence (spent / partially filled / funding gone at the tip). None of them
+// touch interactive offers.
+
+// CovenantEntry is a resting covenant offer's key + terms + active size, for the
+// watcher to reconcile. The returned *CovenantTerms is the live pointer; the
+// watcher only reads it.
+type CovenantEntry struct {
+	Key      Key
+	Terms    *seqobv1.CovenantTerms
+	Active   uint64
+	ReRested bool // F3: the current outpoint is a remainder from a prior partial fill, not the original funding
+}
+
+// SnapshotCovenants returns every resting offer that settles via a covenant.
+func (s *Store) SnapshotCovenants() []CovenantEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]CovenantEntry, 0)
+	for k, e := range s.entries {
+		if cov := e.Offer.GetCovenant(); cov != nil {
+			out = append(out, CovenantEntry{Key: k, Terms: cov, Active: e.ActiveAmount, ReRested: e.reRested})
+		}
+	}
+	return out
+}
+
+// HoldCovenantGhost hides a re-rested covenant order whose current (remainder) outpoint is GONE at the
+// tip with no spender — most likely a Bitcoin reorg undid the fill (anchoring supremacy). Unlike
+// RemoveGhost (permanent MarkInvalidated), this is REVERSIBLE: active drops to 0 (hidden from matching,
+// so no taker fills a vanished outpoint) but the entry is kept, so if the reorg heals and the fill
+// re-confirms, a later reconcile pass sees the remainder again and re-opens it (F3). No-op for a
+// non-covenant/missing entry.
+func (s *Store) HoldCovenantGhost(k Key, reason string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	changed := e.ActiveAmount != 0
+	if e.ActiveAmount > 0 {
+		e.heldFill = e.ActiveAmount
+	}
+	e.ActiveAmount = 0
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	}
+	return nil
+}
+
+// ReconcileCovenantActive sets a resting covenant order's active size to its
+// on-chain UTXO value. Idempotent. It also RE-OPENS an order the watcher had HELD
+// for an unconfirmed spend (HoldCovenantForSpend / HoldCovenantGhost) that then
+// dropped or was reorged away — the covenant still holds its value at the tip, so
+// the order becomes fillable again. (The matcher no longer decrements at match, so
+// there is no optimistic match-time decrement to correct.) No-op for a
+// non-covenant or missing entry.
+func (s *Store) ReconcileCovenantActive(k Key, active uint64) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	if active > e.Offer.GetBaseAmount() {
+		active = e.Offer.GetBaseAmount()
+	}
+	changed := e.ActiveAmount != active || e.SettleTxid != ""
+	e.ActiveAmount = active
+	e.SettleTxid = ""
+	e.heldFill = 0 // B-8: clear any stale held-fill size so a later RemoveCovenantFilled uses the live active, not a stale hold
+	if active >= e.Offer.GetBaseAmount() {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_OPEN
+	} else {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	}
+	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	}
+	return nil
+}
+
+// RerestCovenantRemainder points a covenant order at the remainder outpoint a
+// partial fill re-created (new txid:vout) and sets the reduced active size, so
+// the rest of the order stays fillable. The covenant PROGRAM is unchanged (same
+// scriptPubKey), so the maker's signed terms still describe it; only the
+// chain-observable outpoint moves. The stored Offer is cloned before mutation so
+// concurrent matcher reads of the old pointer stay consistent.
+func (s *Store) RerestCovenantRemainder(k Key, txid string, vout uint32, size uint64) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	// Clone + swap so the previously-shared *Offer pointer is never mutated.
+	no := proto.Clone(e.Offer).(*seqobv1.Offer)
+	no.GetCovenant().CovenantTxid = txid
+	no.GetCovenant().CovenantVout = vout
+	e.Offer = no
+	e.reRested = true // F3: mark that this order's funding is now a remainder, not its original outpoint
+	if size > no.GetBaseAmount() {
+		size = no.GetBaseAmount()
+	}
+	// B1: consumed portion = size before this re-rest (active now, or the size held aside when a mempool
+	// spend zeroed active) minus the re-rested remainder. That portion is a trade.
+	prevActive := e.ActiveAmount
+	if prevActive == 0 {
+		prevActive = e.heldFill
+	}
+	var filled uint64
+	if prevActive > size {
+		filled = prevActive - size
+	}
+	e.heldFill = 0
+	e.ActiveAmount = size
+	e.SettleTxid = ""
+	if size >= no.GetBaseAmount() {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_OPEN
+	} else {
+		e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	}
+	pair := no.GetPair()
+	conf := no.GetConfidential()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if filled > 0 {
+		s.RecordTrade(no, filled) // re-locks internally; safe after Unlock
+	}
+	// Emit created (subscribers re-learn the new outpoint) then status.
+	s.broadcast(Event{Type: EventCreated, Pair: pair, Confidential: conf, Offer: no})
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	return nil
+}
+
+// HoldCovenantForSpend hides a covenant order from matching while its spend is
+// unconfirmed (fill in the mempool): active drops to 0 (the matcher skips
+// zero-active entries) and the settling txid is recorded. A later reconcile
+// pass restores it (ReconcileCovenantActive) if the spend drops, or removes /
+// re-rests it once the spend confirms.
+func (s *Store) HoldCovenantForSpend(k Key, spenderTxid string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	changed := e.ActiveAmount != 0 || e.SettleTxid != spenderTxid
+	if e.ActiveAmount > 0 {
+		e.heldFill = e.ActiveAmount // B1: remember the size so the confirmed-fill trade isn't lost once active zeroes
+	}
+	e.ActiveAmount = 0
+	e.SettleTxid = spenderTxid
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
+	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
+	st := e.orderStatus(k)
+	s.mu.Unlock()
+	if changed {
+		s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	}
+	return nil
+}
+
+// RemoveCovenantFilled removes a fully-filled covenant order, recording the
+// settling txid and emitting FILLED. No-op for a non-covenant or missing entry.
+func (s *Store) RemoveCovenantFilled(k Key, settleTxid string) error {
+	s.mu.Lock()
+	e, ok := s.entries[k]
+	if !ok || e.Offer.GetCovenant() == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	e.Status = seqobv1.OfferStatus_OFFER_STATUS_FILLED
+	e.SettleTxid = settleTxid
+	// B1: how much this settlement filled — active now, or the size held aside when a mempool spend
+	// zeroed active earlier (HoldCovenantForSpend). A covenant lift IS a trade; record it below.
+	filled := e.ActiveAmount
+	if filled == 0 {
+		filled = e.heldFill
+	}
+	filledOffer := e.Offer
+	e.ActiveAmount = 0
+	pair := e.Offer.GetPair()
+	conf := e.Offer.GetConfidential()
+	st := e.orderStatus(k)
+	s.remove(k)
+	s.mu.Unlock()
+	s.RecordTrade(filledOffer, filled) // re-locks internally; safe after Unlock
+	s.broadcast(Event{Type: EventStatus, Pair: pair, Confidential: conf, Status: st})
+	s.broadcast(Event{Type: EventRemoved, Pair: pair, Confidential: conf, Ref: &seqobv1.OfferRef{OfferId: k.OfferID, MakerPubkey: k.MakerPubkey}})
+	return nil
 }
 
 // RunExpirySweeper sweeps every interval until ctx-like stop channel closes.
@@ -488,10 +1191,15 @@ func (s *Store) RunExpirySweeper(interval time.Duration, stop <-chan struct{}) {
 	}
 }
 
-// Subscribe registers a delta subscriber. If pairFilter is non-nil, only deltas
-// for that pair are delivered. It returns the current snapshot for the pair (or
-// all pairs if pairFilter is nil), a subscription id, and the delta channel.
-func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair) ([]*seqobv1.Offer, int, <-chan Event) {
+// Subscribe registers a delta subscriber bound to a book NAMESPACE: confidential=false is
+// the transparent book, confidential=true the separate blinded book. Both the returned
+// snapshot and every subsequent delta are filtered to that namespace, so a transparent
+// subscriber never sees a confidential offer and vice-versa — the same disjoint split
+// SnapshotPair serves over REST and the matcher enforces on crossing. If pairFilter is
+// non-nil, only deltas for that pair are delivered; a nil pairFilter subscribes to every
+// pair (still within the requested namespace). Returns the current snapshot, a subscription
+// id, and the delta channel.
+func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair, confidential bool) ([]*seqobv1.Offer, int, <-chan Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := s.nextSub
@@ -500,16 +1208,18 @@ func (s *Store) Subscribe(pairFilter *seqobv1.AssetPair) ([]*seqobv1.Offer, int,
 	if pairFilter != nil {
 		pk = pairKey(pairFilter)
 	}
-	sub := &subscriber{pair: pk, ch: make(chan Event, s.subBuf)}
+	sub := &subscriber{pair: pk, confidential: confidential, ch: make(chan Event, s.subBuf)}
 	s.subs[id] = sub
 
 	var snap []*seqobv1.Offer
 	if pk != "" {
-		snap = s.snapshotLocked(pk)
+		snap = s.snapshotLocked(pk, confidential)
 	} else {
 		snap = make([]*seqobv1.Offer, 0, len(s.entries))
 		for _, e := range s.entries {
-			snap = append(snap, e.Offer)
+			if e.Offer.GetConfidential() == confidential {
+				snap = append(snap, e.Offer)
+			}
 		}
 	}
 	return snap, id, sub.ch
@@ -564,6 +1274,7 @@ func (e *Entry) orderStatus(k Key) *seqobv1.OrderStatus {
 		ActiveAmount: e.ActiveAmount,
 		SettleTxid:   e.SettleTxid,
 		AnchorConfs:  e.AnchorConfs,
+		Demoted:      e.demoted,
 	}
 }
 
@@ -575,15 +1286,28 @@ func (s *Store) broadcast(ev Event) {
 	s.mu.RLock()
 	subs := make([]*subscriber, 0, len(s.subs))
 	for _, sub := range s.subs {
+		// Namespace filter: a delta only reaches subscribers bound to its OWN book
+		// (transparent vs confidential), so the two books stay disjoint over the delta
+		// stream exactly as they are over the snapshot (SnapshotPair) and the matcher.
+		if sub.confidential != ev.Confidential {
+			continue
+		}
 		if sub.pair == "" || sub.pair == pk {
 			subs = append(subs, sub)
 		}
 	}
 	s.mu.RUnlock()
 	for _, sub := range subs {
+		// Stamp a per-subscriber sequence number and increment for EVERY routed event
+		// (P3.8), so a dropped delta (buffer full -> default) leaves a hole the
+		// subscriber detects as a gap and re-snapshots. Copy the Event per subscriber
+		// since each gets its own Seq.
+		e := ev
+		e.Seq = sub.seq.Add(1)
 		select {
-		case sub.ch <- ev:
+		case sub.ch <- e:
 		default:
+			// Dropped: the seq is consumed, so the next delivered delta shows a gap.
 		}
 	}
 }
