@@ -45,6 +45,14 @@ type subAssetMakerConfig struct {
 	btcRPCURL    string // bitcoind RPC URL (verify + claim the on-chain BTC HTLC)
 	btcWallet    string // bitcoind wallet that receives the claimed BTC
 	btcChainName string
+	// Mixed same-chain (rails 7/8): when quoteAsset is a real Sequentia asset id,
+	// the "BTC leg" is an on-chain HTLC on THAT asset on the Sequentia chain
+	// (verified/claimed via seqRPCURL/seqWallet, Elements format; heights and
+	// btcDelta are SEQUENTIA heights) and bitcoind is not used at all. Empty =
+	// the legacy BTC-sentinel sub-asset shape.
+	quoteAsset   string
+	seqRPCURL    string
+	seqWallet    string
 	assetLnSock  string        // the maker's SeqLN-on-Sequentia lightning-rpc (asset leg)
 	btcDelta     uint32        // T_btc = parent tip + this (the taker's on-chain refund CLTV)
 	minBTCConf   int           // confirmations required on the taker's BTC leg before paying the asset
@@ -59,10 +67,17 @@ type subAssetMakerConfig struct {
 // maker_ln_node_pubkey advertises the maker's asset LN node (informational; the
 // maker PAYS the taker's invoice, so the taker never dials it).
 func buildSubAssetOffer(cfg subAssetMakerConfig, assetLnNodeID string) *seqobv1.Offer {
+	// Mixed same-chain (rails 7/8): advertise the TRUE quote asset; ln_direction
+	// stays LnAssetLNForBTC — the quote asset stands in BTC's structural place
+	// (base over Lightning, quote in an on-chain HTLC on the Sequentia chain).
+	quote := offer.BTCSentinel
+	if cfg.quoteAsset != "" {
+		quote = cfg.quoteAsset
+	}
 	o := &seqobv1.Offer{
 		OfferId:           orDefault(cfg.offerID, randstr.Hex(16)),
 		SchemaVersion:     1,
-		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: offer.BTCSentinel},
+		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: quote},
 		BaseAmount:        cfg.assetAmt,
 		AllowPartial:      true, // T8: a taker may take a slice; the serve loop re-rests the remainder
 		CreatedAtUnix:     uint64(time.Now().Unix()),
@@ -80,7 +95,7 @@ func buildSubAssetOffer(cfg subAssetMakerConfig, assetLnNodeID string) *seqobv1.
 		}},
 	}
 	o.OfferAsset, o.OfferAmount = cfg.asset, cfg.assetAmt
-	o.WantAsset, o.WantAmount = offer.BTCSentinel, cfg.btcSats
+	o.WantAsset, o.WantAmount = quote, cfg.btcSats
 	return o
 }
 
@@ -88,23 +103,54 @@ func buildSubAssetOffer(cfg subAssetMakerConfig, assetLnNodeID string) *seqobv1.
 // wallet and no Sequentia node: the asset leg is the maker's SeqLN-on-Sequentia
 // node, and the BTC it receives lands on-chain in the maker's bitcoind wallet.
 func runSubAssetMaker(cfg subAssetMakerConfig) {
-	if cfg.btcRPCURL == "" {
-		fatal("-mode subasset requires -btc-rpc (the bitcoind RPC that verifies + claims the on-chain BTC HTLC)")
-	}
 	if cfg.assetLnSock == "" {
 		fatal("-mode subasset requires -asset-ln-socket (the maker's SeqLN-on-Sequentia lightning-rpc)")
 	}
-	btcRPC, err := rpcFromURL(cfg.btcRPCURL)
-	if err != nil {
-		fatal("-btc-rpc: %v", err)
-	}
-	params, err := xchain.BitcoinChainParams(cfg.btcChainName)
-	if err != nil {
-		fatal("-btc-chain: %v", err)
-	}
-	btcChain := xchain.NewBitcoinChain(btcRPC, cfg.btcWallet, params)
-	if _, err := btcChain.BlockCount(); err != nil {
-		fatal("bitcoind unreachable: %v", err)
+	// Chain seams: where the on-chain leg lives. Legacy = bitcoind (real BTC);
+	// mixed same-chain (-quote-asset) = the Sequentia chain, HTLC on the quote
+	// asset, Elements format. The serve loop only ever sees these two closures.
+	var (
+		tip    func() (int64, error)
+		newOps func(hashH []byte) client.SubAssetMakerOps
+	)
+	if cfg.quoteAsset != "" {
+		if cfg.seqRPCURL == "" {
+			fatal("-mode subasset with -quote-asset requires -xseq-rpc (the Sequentia node that verifies + claims the on-chain quote-asset HTLC)")
+		}
+		seqRPC, err := rpcFromURL(cfg.seqRPCURL)
+		if err != nil {
+			fatal("-xseq-rpc: %v", err)
+		}
+		seqChain := xchain.NewChain(seqRPC, cfg.seqWallet)
+		if _, err := seqChain.BlockCount(); err != nil {
+			fatal("sequentia node unreachable: %v", err)
+		}
+		tip = seqChain.BlockCount
+		newOps = func(hashH []byte) client.SubAssetMakerOps {
+			return client.NewLiveSubAssetMakerOpsSeq(seqChain, cfg.quoteAsset,
+				xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset), hashH)
+		}
+	} else {
+		if cfg.btcRPCURL == "" {
+			fatal("-mode subasset requires -btc-rpc (the bitcoind RPC that verifies + claims the on-chain BTC HTLC)")
+		}
+		btcRPC, err := rpcFromURL(cfg.btcRPCURL)
+		if err != nil {
+			fatal("-btc-rpc: %v", err)
+		}
+		params, err := xchain.BitcoinChainParams(cfg.btcChainName)
+		if err != nil {
+			fatal("-btc-chain: %v", err)
+		}
+		btcChain := xchain.NewBitcoinChain(btcRPC, cfg.btcWallet, params)
+		if _, err := btcChain.BlockCount(); err != nil {
+			fatal("bitcoind unreachable: %v", err)
+		}
+		tip = btcChain.BlockCount
+		newOps = func(hashH []byte) client.SubAssetMakerOps {
+			return client.NewLiveSubAssetMakerOps(btcChain,
+				xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset), hashH)
+		}
 	}
 	// Validate the asset LN node up front and advertise its id in the offer.
 	assetID, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).NodeID()
@@ -122,19 +168,26 @@ func runSubAssetMaker(cfg subAssetMakerConfig) {
 	if err := ws.redial(wsURL, o); err != nil {
 		fatal("dial ws %s: %v", wsURL, err)
 	}
-	fmt.Printf("seqob-maker up (SUB-ASSET): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
-	fmt.Printf("  maker sells %d %s over Lightning for %d BTC sats on-chain (taker pays BTC on-chain, receives the asset over LN)  T_btc=+%d min-btc-conf=%d  asset-node=%s btc-chain=%s\n",
-		cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.btcDelta, cfg.minBTCConf, assetID, cfg.btcChainName)
+	if cfg.quoteAsset != "" {
+		fmt.Printf("seqob-maker up (MIXED SAME-CHAIN): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+		fmt.Printf("  maker sells %d %s over Lightning for %d %s atoms in an on-chain Sequentia HTLC (taker pays the quote asset on-chain, receives the base over LN)  T_seq=+%d min-conf=%d  asset-node=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.quoteAsset, cfg.btcDelta, cfg.minBTCConf, assetID)
+	} else {
+		fmt.Printf("seqob-maker up (SUB-ASSET): posted SELL offer %s by maker %s\n", o.GetOfferId(), cfg.makerPubHex)
+		fmt.Printf("  maker sells %d %s over Lightning for %d BTC sats on-chain (taker pays BTC on-chain, receives the asset over LN)  T_btc=+%d min-btc-conf=%d  asset-node=%s btc-chain=%s\n",
+			cfg.assetAmt, cfg.asset, cfg.btcSats, cfg.btcDelta, cfg.minBTCConf, assetID, cfg.btcChainName)
+	}
 	fmt.Printf("  taker lifts with: seqob-cli xsubas -asset %s -offer-id %s -maker-pubkey %s\n", cfg.asset, o.GetOfferId(), cfg.makerPubHex)
 
-	serveSubAsset(ws, wsURL, o, cfg, btcChain, assetID)
+	serveSubAsset(ws, wsURL, o, cfg, tip, newOps, assetID)
 }
 
 // serveSubAsset is the sub-asset event loop: each swap gets its own goroutine
 // running RunMakerSubAsset; the loop routes sealed courier frames to the session's
 // inbox. Same whole-swap discipline as serveSubmarine: ONE swap in flight, and the
 // offer is cancelled after its first settlement (unless -requote).
-func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMakerConfig, btcChain *xchain.BitcoinChain, assetLNID string) {
+func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMakerConfig,
+	tip func() (int64, error), newOps func(hashH []byte) client.SubAssetMakerOps, assetLNID string) {
 	var mu sync.Mutex
 	inboxes := make(map[string]chan []byte)
 	inFlight := 0
@@ -262,21 +315,20 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					requoteExitIfPending(idle)
 				}()
 
-				// The maker builds the BTC-leg swap with a hash-only lock (it learns P
-				// by paying the asset over LN) and its asset LN node. T_btc is minted
-				// per-swap from the current parent tip.
-				tip, err := btcChain.BlockCount()
+				// The maker builds the on-chain-leg swap with a hash-only lock (it
+				// learns P by paying the asset over LN). T_btc is minted per-swap
+				// from the current on-chain-leg tip (parent BTC tip for the legacy
+				// shape; SEQUENTIA tip for the mixed same-chain shape).
+				h, err := tip()
 				if err != nil {
-					fmt.Printf("session %s: btc tip: %v\n", sid, err)
+					fmt.Printf("session %s: on-chain-leg tip: %v\n", sid, err)
 					return
 				}
-				tBtc := uint32(tip) + cfg.btcDelta
+				tBtc := uint32(h) + cfg.btcDelta
 				p := client.MakerSubAssetParams{
-					// Bind the BTC-leg swap to the taker's H once it arrives (the hashlock
-					// must embed H for VerifyBTCLeg/ClaimBTCLeg); a fresh asset LN leg per swap.
-					NewMakerOps: func(hashH []byte) client.SubAssetMakerOps {
-						return client.NewLiveSubAssetMakerOps(btcChain, xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset), hashH)
-					},
+					// Bind the on-chain-leg swap to the taker's H once it arrives (the
+					// hashlock must embed H for VerifyBTCLeg/ClaimBTCLeg).
+					NewMakerOps: newOps,
 					AssetLNNodeID: assetLNID,
 					Crypter:       cr,
 					// Claim the taker's BTC HTLC with the maker's IDENTITY key, so its pubkey

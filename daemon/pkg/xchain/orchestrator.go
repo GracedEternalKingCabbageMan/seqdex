@@ -88,6 +88,22 @@ func NewSwapBitcoin(btc *BitcoinChain, seq *Chain, prim *HashLock) *Swap {
 	}
 }
 
+// NewSwapAsset wires an orchestrator whose "BTC-position" leg is a Sequentia
+// ISSUED asset on the SAME Sequentia chain — the mixed same-chain shape
+// (rails 7/8): one leg over Lightning, the other an on-chain HTLC on `assetID`,
+// standing exactly where BTC stands in the submarine/sub-asset constructions
+// (Principle 3: no structurally privileged unit). Both "sides" run against the
+// one Sequentia node; verify/claim/refund are Elements-format and check the
+// leg's output pays `assetID`.
+func NewSwapAsset(seq *Chain, assetID string, prim *HashLock) *Swap {
+	return &Swap{
+		btcBackend: newElementsBTCBackendAsset(seq, prim, assetID),
+		seq:        seq,
+		seqLeg:     NewElementsLeg(LegSEQ, prim),
+		hash:       prim,
+	}
+}
+
 // LegLock records a funded HTLC leg.
 type LegLock struct {
 	Script   []byte
