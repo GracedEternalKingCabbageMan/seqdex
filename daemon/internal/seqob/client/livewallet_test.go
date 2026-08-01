@@ -124,8 +124,8 @@ func TestExplicitSwapSettles(t *testing.T) {
 	takerMock := &mockBackend{}
 	makerMock := &mockBackend{}
 	takerLW := &LiveWallet{Backend: takerMock} // explicit inputs + explicit receive
-	makerLW := &LiveWallet{Backend: makerMock}  // explicit outputs
-	o := offerWithBlinding("")                   // no maker blinding key => explicit receive
+	makerLW := &LiveWallet{Backend: makerMock} // explicit outputs
+	o := offerWithBlinding("")                 // no maker blinding key => explicit receive
 
 	blind, txid := runLift(t, takerLW, makerLW, o, makerMock)
 	if blind {

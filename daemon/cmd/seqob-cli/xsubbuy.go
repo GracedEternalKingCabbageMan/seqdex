@@ -61,10 +61,24 @@ func cmdXSubBuy(args []string) {
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (pays the invoice) (required)")
 	minAnchor := fs.Int64("min-anchor-depth", 3, "Bitcoin-anchor depth required on the maker's asset HTLC before we pay (>=2; the taker's cross-leg gate)")
-	spendFee := fs.Uint64("spend-fee", 1000, "asset-claim fee target in atoms")
+	max0conf := fs.Uint64("max-0conf", 0, "0-conf LP-fronting cap (asset atoms): if the asset leg is <= this, pay WITHOUT waiting for the anchor bury (instant, accepting Bitcoin-reorg risk). 0 = use the maker offer's advertised cap; anything set overrides it.")
+	spendFee := fs.Uint64("spend-fee", 1000, "asset-claim fee target in native sats (sized per-asset via the fee market)")
 	anchorWait := fs.Duration("anchor-wait", 20*time.Minute, "max wait for the asset HTLC to bury before paying")
 	stateFile := fs.String("state-file", "xsubbuy-session.json", "session persistence (holds P after paying)")
 	_ = fs.Parse(args)
+
+	// The anchor gate must wait for the maker's asset-HTLC SEQ block to be buried by
+	// min-anchor-depth BITCOIN blocks. testnet4 blocks are irregular — up to ~20 min apart
+	// under the 20-minute difficulty-reset rule — so a fixed 20 min wait CANNOT cover the
+	// default depth of 3 (you can't bury 3 Bitcoin blocks in 20 min), which deadlocks the
+	// swap: the taker times out ("anchor not buried to depth N") before the gate can open.
+	// Scale the wait to the requested depth (~20 min/block budget), unless the caller asked
+	// for a larger one explicitly. min-anchor-depth 0 (the max-0conf instant path) is exempt.
+	if *minAnchor > 0 {
+		if want := time.Duration(*minAnchor) * 20 * time.Minute; *anchorWait < want {
+			*anchorWait = want
+		}
+	}
 
 	if *asset == "" {
 		fatal("xsubbuy requires -asset (the hex asset id; the pair is <asset>/BTC)")
@@ -101,8 +115,15 @@ func cmdXSubBuy(args []string) {
 	expectAsset := target.GetPair().GetBaseAsset()
 	expectSeq := target.GetBaseAmount()         // asset atoms (SELL: offer_amount == base_amount)
 	expectMsat := target.GetWantAmount() * 1000 // BTC sats the maker wants -> msat
-	fmt.Printf("lifting REVERSE lightning offer %s by %s: buy %d %s for %d msat over Lightning\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectMsat)
+	// Effective 0-conf cap: an explicit -max-0conf overrides; otherwise honor the cap
+	// the maker advertised in the offer's LightningTerms (single source of truth).
+	effMax0conf := *max0conf
+	if effMax0conf == 0 {
+		effMax0conf = target.GetLightning().GetMax_0ConfAmount()
+	}
+	instant := effMax0conf > 0 && expectSeq <= effMax0conf
+	fmt.Printf("lifting REVERSE lightning offer %s by %s: buy %d %s for %d msat over Lightning (0-conf cap=%d -> instant=%v)\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), expectSeq, expectAsset, expectMsat, effMax0conf, instant)
 
 	// 2. Settlement: the anchored Sequentia node (asset leg) + our LN node.
 	seqRPC, err := xliftRPCFromURL(*seqRPCURL)
@@ -183,13 +204,9 @@ func cmdXSubBuy(args []string) {
 		}
 		return conn.WriteMessage(websocket.TextMessage, b)
 	}
-	recv := func(timeout time.Duration) ([]byte, error) {
-		from, err := readWSUntilSwap(conn, timeout)
-		if err != nil {
-			return nil, err
-		}
-		return from.GetSwapMsg().GetCiphertext(), nil
-	}
+	// One background reader keeps gorilla auto-ponging the relay's keepalive through any
+	// on-chain confirmation wait, so the session survives to the announce (see startCourierReader).
+	recv := startCourierReader(conn)
 	res, err := client.RunTakerReverseSubmarine(client.TakerReverseSubmarineParams{
 		NewTakerOps: func(hashH []byte) client.SubReverseTakerOps {
 			return &client.LiveSubReverseTakerOps{Sub: xchain.NewSubmarineSwap(seqChain, xchain.NewCLNLNLeg(*lnSocket), xchain.NewHashLockFromHash(hashH))}
@@ -200,6 +217,7 @@ func cmdXSubBuy(args []string) {
 		ExpectSeqAmount:   expectSeq,
 		ExpectInvoiceMsat: expectMsat,
 		MinAnchorDepth:    *minAnchor,
+		Max0ConfAmount:    effMax0conf,
 		SpendFeeAtoms:     *spendFee,
 		Timing:            client.XcTiming{AnchorWait: *anchorWait},
 		Log:               func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },

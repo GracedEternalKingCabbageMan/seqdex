@@ -1,0 +1,134 @@
+package covenant
+
+import (
+	"bytes"
+	"fmt"
+)
+
+// Order captures everything a taker needs to (a) verify a resting covenant
+// UTXO trustlessly and (b) build the permissionless FILL spend. All asset ids
+// and keys are INTERNAL byte order (32 bytes), matching on-chain introspection.
+type Order struct {
+	AssetA    [32]byte
+	AssetB    [32]byte
+	RateNum   uint64
+	RateDen   uint64
+	MakerProg []byte // 32-byte v1 witness program credited on a fill
+	MakerVer  int
+	MinLot    uint64
+
+	ExpiryLocktime int64
+	MakerX         [32]byte // maker x-only key authorizing the REFUND leaf
+	InternalKey    [32]byte // taproot internal key (NUMS default => no key-path spend)
+}
+
+// Taptree is the derived taproot commitment for an Order.
+type Taptree struct {
+	FillLeaf       []byte
+	RefundLeaf     []byte
+	FillLeafHash   [32]byte
+	RefundLeafHash [32]byte
+	MerkleRoot     [32]byte
+	// FillMerkleBranch is the sibling hash proving the FILL leaf under the root
+	// (here: the REFUND leaf hash). It is the control-block merkle path.
+	FillMerkleBranch []byte
+	OutputKey        [32]byte // x-only taproot output key
+	Negflag          byte     // control-block parity bit (0/1)
+	ScriptPubKey     []byte   // OP_1 <32-byte output key>
+}
+
+// DefaultOrder fills in the conventional defaults (NUMS internal key, v1 maker
+// payout) and returns an Order ready for Derive.
+func DefaultOrder(assetA, assetB [32]byte, rateNum, rateDen, minLot uint64, makerProg []byte, expiry int64, makerX [32]byte) Order {
+	return Order{
+		AssetA: assetA, AssetB: assetB,
+		RateNum: rateNum, RateDen: rateDen,
+		MakerProg: makerProg, MakerVer: 1, MinLot: minLot,
+		ExpiryLocktime: expiry, MakerX: makerX, InternalKey: NUMS,
+	}
+}
+
+// Derive builds the {FILL, REFUND} taptree, its Merkle root, the tweaked output
+// key, and the scriptPubKey. It mirrors the Python order_taptree exactly:
+// leaf order [fill, refund], TapBranch over the two leaf hashes sorted
+// ascending, TapTweak/elements over (internal_key || root).
+func (o Order) Derive() (*Taptree, error) {
+	if o.InternalKey == ([32]byte{}) {
+		o.InternalKey = NUMS
+	}
+	fill, err := BuildFillLeaf(o.AssetA, o.AssetB, o.RateNum, o.RateDen, o.MinLot, o.MakerProg, o.MakerVer)
+	if err != nil {
+		return nil, err
+	}
+	refund, err := BuildRefundLeaf(o.ExpiryLocktime, o.MakerX)
+	if err != nil {
+		return nil, err
+	}
+	fillH := LeafHash(fill)
+	refundH := LeafHash(refund)
+
+	// TapBranch inputs are sorted ascending (BIP341); the FILL leaf's control
+	// merkle branch is simply the REFUND leaf hash (its only sibling).
+	lo, hi := fillH, refundH
+	if bytes.Compare(hi[:], lo[:]) < 0 {
+		lo, hi = hi, lo
+	}
+	root := taggedHash("TapBranch/elements", lo[:], hi[:])
+
+	outKey, neg, err := tweakOutputKey(o.InternalKey, root)
+	if err != nil {
+		return nil, err
+	}
+	spk := append([]byte{op1, 0x20}, outKey[:]...)
+	return &Taptree{
+		FillLeaf: fill, RefundLeaf: refund,
+		FillLeafHash: fillH, RefundLeafHash: refundH,
+		MerkleRoot:       root,
+		FillMerkleBranch: refundH[:],
+		OutputKey:        outKey,
+		Negflag:          neg,
+		ScriptPubKey:     spk,
+	}, nil
+}
+
+// ControlBlock returns the taproot control block for a FILL script-path spend:
+// (leaf_version | parity) || internal_key || merkle_branch. 65 bytes for the
+// two-leaf tree.
+func (t *Taptree) ControlBlock(internalKey [32]byte) []byte {
+	cb := make([]byte, 0, 1+32+len(t.FillMerkleBranch))
+	cb = append(cb, byte(leafVersion)+t.Negflag)
+	cb = append(cb, internalKey[:]...)
+	cb = append(cb, t.FillMerkleBranch...)
+	return cb
+}
+
+// FillWitness is the covenant input's witness stack for a FILL spend. FILL is
+// fully introspection-driven, so the stack is just [leaf, control_block].
+func (t *Taptree) FillWitness(internalKey [32]byte) [][]byte {
+	return [][]byte{t.FillLeaf, t.ControlBlock(internalKey)}
+}
+
+// VerifyAgainstSPK is the trustless-verify a taker MUST run before filling: it
+// reconstructs the output key from the advertised constants and confirms it
+// equals the on-chain scriptPubKey (OP_1 <32>). It also rejects a non-NUMS
+// internal key unless makerCancellableOK is set (a non-NUMS key is a hidden
+// maker key-path cancel/rug — see the design red-team, finding 1).
+func (o Order) VerifyAgainstSPK(onchainSPK []byte, makerCancellableOK bool) (*Taptree, error) {
+	if !makerCancellableOK && o.InternalKey != NUMS {
+		return nil, fmt.Errorf("non-NUMS internal key: order is maker-cancellable (key-path rug risk); reject unless explicitly allowed")
+	}
+	t, err := o.Derive()
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(t.ScriptPubKey, onchainSPK) {
+		return nil, fmt.Errorf("reconstructed spk %x != on-chain spk %x", t.ScriptPubKey, onchainSPK)
+	}
+	return t, nil
+}
+
+// CeilPrice is required_B = ceil(filled * rateNum / rateDen), rounding in the
+// maker's favour, matching the FILL leaf's on-chain arithmetic.
+func CeilPrice(filled, rateNum, rateDen uint64) uint64 {
+	return (filled*rateNum + rateDen - 1) / rateDen
+}

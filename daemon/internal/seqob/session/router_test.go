@@ -3,7 +3,14 @@ package session
 import (
 	"testing"
 	"time"
+
+	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 )
+
+// manualReorg is a ReorgWatcher whose orphan callback the test fires by hand.
+type manualReorg struct{ fire func() }
+
+func (m *manualReorg) WatchSettlement(_ string, _ string, onOrphaned func()) { m.fire = onOrphaned }
 
 func newTestRouter(reopen func(*Session), reorg ReorgWatcher, now func() time.Time) *Router {
 	return NewRouter(Options{
@@ -131,6 +138,40 @@ func TestReorgOrphanReopens(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected anchor orphan to re-open the order")
+	}
+}
+
+// TestArmReorgReopenAfterClose covers P3.9: a settlement caches the offer + fill and
+// Close()s the session, yet a reorg firing LATER must still re-open from the captured
+// session (the live-session map no longer holds it).
+func TestArmReorgReopenAfterClose(t *testing.T) {
+	rw := &manualReorg{}
+	reopened := make(chan *Session, 1)
+	r := NewRouter(Options{Deadline: time.Minute, Reorg: rw, OnReopen: func(s *Session) { reopened <- s }})
+	s, _ := r.StartLift(OpenReq{OfferID: "o1", MakerPubkey: "pk"})
+
+	o := &seqobv1.Offer{OfferId: "o1", BaseAmount: 100}
+	if err := r.ArmReorgReopen(s.ID, "txid1", o, 40); err != nil {
+		t.Fatalf("ArmReorgReopen: %v", err)
+	}
+	// Settlement closes the session (removed from the live map).
+	r.Close(s.ID)
+	if _, ok := r.Get(s.ID); ok {
+		t.Fatal("session should be closed/removed")
+	}
+	// The reorg fires later: onReopen must still run with the cached offer + fill.
+	if rw.fire == nil {
+		t.Fatal("reorg watch was not armed")
+	}
+	rw.fire()
+	select {
+	case got := <-reopened:
+		if got.SettledOffer() != o || got.SettledFill() != 40 || got.SettleTxid() != "txid1" {
+			t.Fatalf("cached settlement not carried: offer=%v fill=%d txid=%q",
+				got.SettledOffer(), got.SettledFill(), got.SettleTxid())
+		}
+	default:
+		t.Fatal("onReopen not called on a reorg after Close")
 	}
 }
 

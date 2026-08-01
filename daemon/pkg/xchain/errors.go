@@ -1,6 +1,9 @@
 package xchain
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// errNoSecret is returned when a redeem spend is requested but the
@@ -13,6 +16,25 @@ var (
 	// status is not "ok"). Proceeding would forfeit the reorg-safety that
 	// anchoring provides, so the orchestrator refuses.
 	ErrAnchorOrdering = errors.New("xchain: SEQ leg violates anchor-shortened ordering (anchorheight < BTC-leg height, or anchor not ok)")
+
+	// ErrAnchorOrderingTerminal is the subset of ErrAnchorOrdering that can NEVER
+	// clear by waiting: the SEQ leg's OWN confirming block commits an anchorheight
+	// BELOW the BTC-leg height. anchorheight is a committed CBlockHeader field
+	// (primitives/block.h m_anchor_height), so for a given block hash it is
+	// immutable — re-reading it every poll is futile by construction.
+	//
+	// The VERDICT is unchanged (still a refusal, and it still wraps
+	// ErrAnchorOrdering so every errors.Is(err, ErrAnchorOrdering) caller keeps
+	// working). The sentinel exists only so a caller stops burning its timelock
+	// window on a hopeless retry loop while the two conjuncts that DO vary
+	// (anchorstatus flap, not-yet-certified) keep being retried.
+	//
+	// It must NOT be "cleared" by re-reading the anchor of a LATER (burying) block
+	// or of the chain tip. InvalidateBlock disconnects the offending block and
+	// everything ABOVE it while lower blocks stay CONNECTED, so a burying block's
+	// anchor says nothing about whether the FUNDING output survives a Bitcoin
+	// reorg — only the funding block's own anchor does.
+	ErrAnchorOrderingTerminal = fmt.Errorf("%w [TERMINAL: the leg's own block anchors below the BTC leg; a committed header field that can never rise]", ErrAnchorOrdering)
 
 	// ErrBTCLegInvalid is returned by the maker when the taker's claimed BTC leg
 	// does not match the quote (wrong H, wrong redeemScript, wrong amount/asset,

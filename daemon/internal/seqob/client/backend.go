@@ -46,6 +46,11 @@ type ProposalReq struct {
 	PayAmount     uint64
 	RecvAsset     string
 	RecvAmount    uint64
+	// Confidential is set when lifting an offer from the BLINDED book. It forces the
+	// taker's receive output to be blinded and drives the fail-closed check that the
+	// FINAL co-signed tx has every non-fee output blinded (both legs CT), so a
+	// confidential-book swap can never be downgraded to explicit/mixed.
+	Confidential bool
 }
 
 // Backend is the chain-side settlement plumbing the LiveWallet drives. The real
@@ -99,4 +104,57 @@ func psetHasConfidentialOutput(psetB64 string) bool {
 		}
 	}
 	return false
+}
+
+// txidFromSignedPset returns the txid of a settled swap PSET (base64), so the maker can
+// tell the relay which on-chain tx a lift settled as. Best-effort: it finalizes a copy and
+// extracts the tx; on a non-PSET or not-yet-finalizable input (e.g. the test stub's
+// placeholder string) it returns "" and the caller acks without the txid — the relay's
+// trade record + decrement do not depend on it (it only enriches OrderStatus + reorg watch).
+func txidFromSignedPset(psetB64 string) (txid string) {
+	// F7: the input is the taker's SwapComplete.transaction — attacker-controlled bytes. A panic in
+	// psetv2 on malformed input must not crash the maker's single serve() goroutine; recover to "".
+	defer func() {
+		if recover() != nil {
+			txid = ""
+		}
+	}()
+	ptx, err := psetv2.NewPsetFromBase64(psetB64)
+	if err != nil {
+		return ""
+	}
+	if err := psetv2.FinalizeAll(ptx); err != nil {
+		return ""
+	}
+	tx, err := psetv2.Extract(ptx)
+	if err != nil {
+		return ""
+	}
+	return tx.TxHash().String()
+}
+
+// allOutputsBlinded is the fail-closed check for the CONFIDENTIAL book: every
+// spendable output must carry a blinding pubkey (so both swap legs are CT-blinded,
+// with rangeproofs + surjection proofs added by BlindPset). The network-fee output
+// is the sole exception — in Elements the fee is an explicit output with an EMPTY
+// script and no recipient, and it is never blinded. A confidential-book taker runs
+// this on the maker-returned tx BEFORE signing its inputs, so a tx that leaves any
+// recipient output explicit (which would leak the amount via the public ratio) is
+// rejected rather than settled. Returns false on a non-PSET/stub string.
+func allOutputsBlinded(psetB64 string) bool {
+	ptx, err := psetv2.NewPsetFromBase64(psetB64)
+	if err != nil {
+		return false
+	}
+	sawRecipient := false
+	for _, out := range ptx.Outputs {
+		if len(out.Script) == 0 {
+			continue // network-fee output: explicit by construction, never blinded
+		}
+		sawRecipient = true
+		if len(out.BlindingPubkey) == 0 {
+			return false
+		}
+	}
+	return sawRecipient
 }

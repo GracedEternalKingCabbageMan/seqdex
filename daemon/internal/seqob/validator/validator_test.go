@@ -293,3 +293,47 @@ func TestLivenessProbeWired(t *testing.T) {
 		t.Fatalf("expected liveness-probe rejection")
 	}
 }
+
+// TestConfidentialOfferRules locks in the blinded-book validator invariants: a
+// confidential offer must publish a valid maker_blinding_pub and a blinded
+// (blech32) receive address, must use the same-chain rail, and must not touch BTC.
+func TestConfidentialOfferRules(t *testing.T) {
+	k := key(t)
+	blindingPub := hex.EncodeToString(k.PubKey().SerializeCompressed())
+
+	// Accepted: confidential + blinding pub + blech32 (tsqb1) receive address.
+	good := signed(t, k, func(o *seqobv1.Offer) {
+		o.Confidential = true
+		o.GetSameChain().MakerRecvAddress = "tsqb1qexampleblindedaddressxxxxxxxxxxxxxxxxxxxxxxxxx"
+		o.GetSameChain().MakerBlindingPub = blindingPub
+	})
+	if err := New(cfg(), nil).ValidateOffer(context.Background(), good, ""); err != nil {
+		t.Fatalf("valid confidential offer rejected: %v", err)
+	}
+
+	// Rejected: confidential but transparent (tb1) receive address.
+	badAddr := signed(t, k, func(o *seqobv1.Offer) {
+		o.Confidential = true
+		o.GetSameChain().MakerRecvAddress = "tb1qexampletransparentaddressxxxxxxxxxxxxxxxxxxx"
+		o.GetSameChain().MakerBlindingPub = blindingPub
+	})
+	if err := New(cfg(), nil).ValidateOffer(context.Background(), badAddr, ""); err == nil {
+		t.Fatal("confidential offer with a transparent receive address must be rejected")
+	}
+
+	// Rejected: confidential but no maker_blinding_pub (only one leg could blind).
+	noBlind := signed(t, k, func(o *seqobv1.Offer) {
+		o.Confidential = true
+		o.GetSameChain().MakerRecvAddress = "tsqb1qexampleblindedaddressxxxxxxxxxxxxxxxxxxxxxxxxx"
+	})
+	if err := New(cfg(), nil).ValidateOffer(context.Background(), noBlind, ""); err == nil {
+		t.Fatal("confidential offer without maker_blinding_pub must be rejected")
+	}
+
+	// A transparent offer (confidential unset) with a plain address stays accepted:
+	// the unblinded book is untouched.
+	plain := signed(t, k, nil)
+	if err := New(cfg(), nil).ValidateOffer(context.Background(), plain, ""); err != nil {
+		t.Fatalf("transparent offer must still validate: %v", err)
+	}
+}

@@ -435,6 +435,22 @@ func (c *Chain) BlockAnchorHeight(blockHash string) (int64, error) {
 	return hdr.AnchorHeight, nil
 }
 
+// BlockOnActiveChain reports whether a block is part of the node's ACTIVE chain.
+// getblockheader answers for ORPHANED blocks too — it reads the header index, not
+// the chain — and returns confirmations = -1 for a block that is known but no
+// longer connected. A claimant that reads a stale block's anchorheight is reading
+// a header that no longer commits anything, so every anchor gate must establish
+// this FIRST, on the block it re-derived from the leg's txid.
+func (c *Chain) BlockOnActiveChain(blockHash string) (bool, error) {
+	var hdr struct {
+		Confirmations int64 `json:"confirmations"`
+	}
+	if err := c.rpc.Call(&hdr, "getblockheader", blockHash, true); err != nil {
+		return false, err
+	}
+	return hdr.Confirmations > 0, nil
+}
+
 // BlockCertification reports whether a Sequentia block is quorum-certified
 // (immediately final): its committee countersignatures reached the quorum. This
 // is stronger than anchoring — anchoring binds the leg to Bitcoin, quorum

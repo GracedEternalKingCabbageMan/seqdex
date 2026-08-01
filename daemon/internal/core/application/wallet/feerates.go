@@ -82,17 +82,50 @@ func (n *nodeFeeRates) FeeExchangeRate(assetHex string) (uint64, bool) {
 }
 
 // feeExchangeRate returns the open-fee-market rate for asset (atoms-of-asset per
-// exchange_rate_scale native atoms) and whether the asset is fee-eligible. The
-// native asset is always eligible at 1:1. When no node RPC is configured, only
-// the native asset is eligible (every other asset falls back to native).
+// exchange_rate_scale native atoms) and whether the asset is fee-eligible.
+//
+// ⚠ THE NATIVE ASSET IS NOT 1:1, and asserting that it is UNDER-PAYS FEES.
+//
+// This used to return exchange_rate_scale for the native asset unconditionally,
+// on the reasoning that the protocol accepted it natively. Two things make that
+// wrong now. The node no longer falls back to 1:1 for an UNLISTED policy asset —
+// no asset is the reference unit, so an unlisted one is simply not accepted. And
+// even when it IS listed, its published rate is its real value in the operator's
+// reference unit, which is not 1e8: on the live testnet it is about 3.76e7,
+// because one policy-asset unit is worth about 0.376 of a reference unit.
+//
+// So a caller sizing a fee through a hardcoded 1:1 believed each atom was worth
+// 2.66x what the node would credit it. The node's relay test is
+// fee_atoms * rate / 1e8 >= minRelayTxFee, so the fee it built cleared the floor
+// by only a hair — measured at 1.1x on the live fleet — and any further drift in
+// the policy asset's price would have pushed fixed-rate payers under it, giving
+// a fleet-wide "min relay fee not met" that looks like network slowness.
+//
+// The published rate is now the authority for every asset, the native one
+// included. The 1:1 assumption survives ONLY as the no-node-RPC fallback, where
+// there is no table to consult and the native asset is the sole option.
 func (s *Service) feeExchangeRate(asset string) (uint64, bool) {
-	if asset == s.staticInfo.GetNativeAsset() {
-		return exchangeRateScale, true
-	}
+	native := asset == s.staticInfo.GetNativeAsset()
 	if s.rates == nil {
+		// No fee-market view: the native asset at par is the only thing we can
+		// size against, and every other asset is ineligible.
+		if native {
+			return exchangeRateScale, true
+		}
 		return 0, false
 	}
-	return s.rates.FeeExchangeRate(asset)
+	if rate, ok := s.rates.FeeExchangeRate(asset); ok && rate > 0 {
+		return rate, true
+	}
+	// Unlisted. For the native asset this is a real state the node now enforces
+	// (an unlisted policy asset is refused like any other), but refusing to size
+	// a fee at all would strand a node whose sidecar is briefly down, so par is
+	// the last resort — and only for the native asset, never as a privilege
+	// extended to anything else.
+	if native {
+		return exchangeRateScale, true
+	}
+	return 0, false
 }
 
 // feeInAsset converts a native-denominated network fee (atoms) into feeAssetNet,

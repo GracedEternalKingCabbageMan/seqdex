@@ -6,10 +6,17 @@ import (
 	"fmt"
 )
 
-// This file adds the MAKER-role helpers used by the daemon's XchainService
-// (Phase 5, milestone 2). The orchestrator (orchestrator.go) drives BOTH swap
-// roles in one process for the mechanism proof; the daemon, by contrast, plays
-// only the counterparty/maker and talks to a remote taker over gRPC. The maker:
+// ⚠ THIS FILE IS LIVE. Its previous header said these helpers served "the
+// daemon's XchainService", the retired RFQ rail — that was already false when it
+// was written, and the rail itself is now deleted. The real consumers are the
+// order-book COURIER drivers: daemon/internal/seqob/client/xdriver*.go and the
+// seqob-cli/seqob-maker/seqob-settler commands, every one of which reaches
+// Swap.InjectSecret through here. Do not sweep this file as dead code, and judge
+// it by reachability from those entry points rather than by its name.
+//
+// This file adds the MAKER-role helpers. The orchestrator (orchestrator.go)
+// drives BOTH swap roles in one process for the mechanism proof; a maker
+// process, by contrast, plays only the counterparty/maker side. The maker:
 //
 //   - VERIFIES the taker's already-funded BTC leg (it does NOT fund it — the
 //     taker, as initiator, locks the BTC leg first).

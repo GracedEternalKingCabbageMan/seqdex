@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -49,6 +51,12 @@ type LNLeg interface {
 	// pays an invoice not tied to the swap secret).
 	Pay(bolt11 string, wantHash []byte, amountMsat uint64) (preimage []byte, err error)
 
+	// PayHash pays a BARE payment_hash (no BOLT11) to destNodeID and returns the
+	// preimage the payee reveals on settle. Used to pay a counterparty's hold leg
+	// in a pure-LN swap, where the payee has registered the hash with a hold
+	// plugin and there is no invoice. Routes in this leg's asset.
+	PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) (preimage []byte, err error)
+
 	// --- REVERSE direction: the maker holds an invoice and settles on P ---
 
 	// CreateHoldInvoice registers a hold invoice on paymentHash H for amountMsat
@@ -82,6 +90,12 @@ type LNLeg interface {
 	// WaitInvoicePaid blocks until the invoice with the given label is paid (or
 	// the deadline / invoice expiry), returning the received amount (msat).
 	WaitInvoicePaid(label string, timeout time.Duration) (paidMsat uint64, err error)
+
+	// WaitPaidByHash blocks until the invoice with the given payment_hash is paid,
+	// polling listinvoices (the invoice may have been created out-of-band, e.g. by
+	// a device with its OWN preimage, so the caller has only the hash, not a label
+	// and NOT the preimage). Returns the received amount (msat).
+	WaitPaidByHash(paymentHash []byte, timeout time.Duration) (paidMsat uint64, err error)
 }
 
 // --- CLN implementation over the lightning-rpc unix socket ------------------
@@ -91,15 +105,31 @@ type LNLeg interface {
 // --network=testnet4/bitcoin for real BTC.
 type clnLNLeg struct {
 	rpc *lnRPC
+	// assetID is the 32-byte hex Sequentia asset id this leg is denominated in
+	// (as displayed). "" means the policy asset (BTC / L-BTC). When set, Pay and
+	// PayHash route in this asset via SeqLN's Step-1 `asset=` param, so the same
+	// leg abstraction serves both the BTC leg and a Sequentia asset leg.
+	assetID string
 }
 
 // clnLNLeg must satisfy LNLeg.
 var _ LNLeg = (*clnLNLeg)(nil)
 
 // NewCLNLNLeg builds a Lightning leg backed by the CLN node whose lightning-rpc
-// socket is at socketPath (e.g. <lightning-dir>/<network>/lightning-rpc).
+// socket is at socketPath (e.g. <lightning-dir>/<network>/lightning-rpc). It is
+// denominated in the policy asset (BTC on a --network=bitcoin/testnet4 node).
 func NewCLNLNLeg(socketPath string) *clnLNLeg {
 	return &clnLNLeg{rpc: &lnRPC{socketPath: socketPath, timeout: 120 * time.Second}}
+}
+
+// NewCLNAssetLNLeg builds a Lightning leg denominated in a Sequentia issued
+// asset (assetIDHex = the 32-byte hex asset id). Pay/PayHash route only over
+// channels of that asset. This is the asset side of a pure-LN swap.
+func NewCLNAssetLNLeg(socketPath, assetIDHex string) *clnLNLeg {
+	return &clnLNLeg{
+		rpc:     &lnRPC{socketPath: socketPath, timeout: 120 * time.Second},
+		assetID: assetIDHex,
+	}
 }
 
 func (l *clnLNLeg) NodeID() (string, error) {
@@ -112,6 +142,43 @@ func (l *clnLNLeg) NodeID() (string, error) {
 	return res.ID, nil
 }
 
+// ReconnectPeers re-establishes the transport connection to any channel peer that
+// has dropped. CLN silently tears down a peer's TCP/Noise connection when it goes
+// idle (and a peer restart drops it too); a channel with a disconnected peer stays
+// open on-chain but cannot route an HTLC, so a maker that re-quotes after a fill
+// must reconnect first or the next leg fails to pay. It is best-effort: it lists
+// peers and, for each disconnected one, issues `connect id` (CLN redials a known
+// address from gossip / the peer's stored addr). Peers with no known address are
+// skipped and surfaced in the returned error, but the ones that could reconnect
+// still do. Returns the count reconnected. Idempotent — connecting an
+// already-connected peer is a no-op — so it is safe to call before every re-quote.
+func (l *clnLNLeg) ReconnectPeers() (int, error) {
+	var res struct {
+		Peers []struct {
+			ID        string `json:"id"`
+			Connected bool   `json:"connected"`
+		} `json:"peers"`
+	}
+	if err := l.rpc.call(&res, "listpeers", map[string]interface{}{}); err != nil {
+		return 0, fmt.Errorf("listpeers: %w", err)
+	}
+	reconnected := 0
+	var firstErr error
+	for _, p := range res.Peers {
+		if p.Connected {
+			continue
+		}
+		if err := l.rpc.call(nil, "connect", map[string]interface{}{"id": p.ID}); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("connect %s: %w", p.ID, err)
+			}
+			continue
+		}
+		reconnected++
+	}
+	return reconnected, firstErr
+}
+
 func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
 	// Decode first so we never pay an invoice whose hash is not the swap secret,
 	// and to sanity-check the amount. CLN's decoder command is `decode` (the older
@@ -121,6 +188,10 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		Valid       bool   `json:"valid"`
 		PaymentHash string `json:"payment_hash"`
 		AmountMsat  uint64 `json:"amount_msat"`
+		// Only for the unannounced-channel fallback below; absent fields simply disable it.
+		Payee         string `json:"payee"`
+		PaymentSecret string `json:"payment_secret"`
+		MinFinalCltv  uint32 `json:"min_final_cltv_expiry"`
 	}
 	if err := l.rpc.call(&dec, "decode", map[string]interface{}{"string": bolt11}); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
@@ -145,8 +216,34 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 	if amountMsat != 0 && dec.AmountMsat == 0 {
 		params["amount_msat"] = amountMsat // amountless invoice
 	}
+	if l.assetID != "" {
+		params["asset"] = l.assetID // route in this leg's Sequentia asset (Step 1)
+	}
 	if err := l.rpc.call(&res, "pay", params); err != nil {
-		return nil, fmt.Errorf("pay: %w", err)
+		// UNANNOUNCED PAYEE FALLBACK. `pay` plans from the gossip graph plus the invoice's
+		// routehints, so it cannot reach a payee whose only channels are PRIVATE -- it gives up with
+		// "not reachable directly and all routehints were unusable" even when that payee is our own
+		// direct peer. Every wallet-side node here is exactly that: JIT channels, unannounced.
+		//
+		// This broke the whole pure-LN rail. The maker registered its hold correctly, then failed to
+		// pay the taker's asset invoice and cancelled the hold, so the swap ended with the taker's
+		// payment refused and nothing said about why. Reproduced four times running against the same
+		// taker node before the maker log made it visible.
+		//
+		// PayHash already solves this for bare-hash payments: asset-aware getroute, falling back to a
+		// single hop over our own channel to a directly-connected payee. Paying a BOLT11 by its own
+		// hash + payment_secret to its payee is the same payment, so reuse it rather than growing a
+		// second router. The hash was already checked against the swap H above, and PayHash re-verifies
+		// that the revealed preimage hashes to it.
+		payee, secret, amt, ok := payFallbackPlan(dec.Payee, dec.PaymentSecret, dec.AmountMsat, amountMsat)
+		if !ok {
+			return nil, fmt.Errorf("pay: %w", err)
+		}
+		pre, perr := l.PayHash(payee, wantHash, amt, dec.MinFinalCltv, secret)
+		if perr != nil {
+			return nil, fmt.Errorf("pay: %w (direct-hop fallback: %v)", err, perr)
+		}
+		return pre, nil
 	}
 	if res.Status != "complete" {
 		return nil, fmt.Errorf("%w: pay status %q", ErrLNLegInvalid, res.Status)
@@ -158,6 +255,151 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 	// Defence in depth: the revealed preimage must actually hash to wantHash.
 	if !hashEqualsPreimage(wantHash, pre) {
 		return nil, fmt.Errorf("%w: revealed preimage does not hash to the swap H", ErrLNLegInvalid)
+	}
+	return pre, nil
+}
+
+// PayHash pays amountMsat to destNodeID for a BARE payment_hash, with NO BOLT11:
+// the payee holds the hash via a hold plugin (there is no invoice on the payee).
+// It routes in this leg's asset (getroute), sends the HTLC (sendpay), blocks
+// until the payee settles (waitsendpay), and returns the revealed preimage.
+//
+// This is the taker's primitive for paying the maker's incoming hold leg in a
+// pure-LN swap. paymentSecret is placed in the final-hop onion TLV; the payee's
+// hold plugin resolves regardless of it, so an agreed-or-arbitrary value works
+// (the maker may convey an expected secret over the courier). finalCltv is the
+// final-hop cltv delta (0 => a small default).
+// directHop builds a single-hop sendpay route over our OWN (possibly private/
+// unannounced) channel to a directly-connected payee — the payee is the final hop,
+// so it receives amountMsat with no routing fee. Used when getroute can't see the
+// channel (private + asset-aware routing uses only the gossip graph).
+func (l *clnLNLeg) directHop(destNodeID string, amountMsat uint64, finalCltv uint32) (json.RawMessage, error) {
+	var res struct {
+		Channels []struct {
+			PeerID         string `json:"peer_id"`
+			State          string `json:"state"`
+			ShortChannelID string `json:"short_channel_id"`
+			Direction      int    `json:"direction"`
+			SpendableMsat  uint64 `json:"spendable_msat"`
+		} `json:"channels"`
+	}
+	if err := l.rpc.call(&res, "listpeerchannels", map[string]interface{}{"id": destNodeID}); err != nil {
+		return nil, fmt.Errorf("listpeerchannels: %w", err)
+	}
+	delay := finalCltv
+	if delay == 0 {
+		delay = 18
+	}
+	for _, c := range res.Channels {
+		if c.PeerID == destNodeID && c.State == "CHANNELD_NORMAL" && c.ShortChannelID != "" && c.SpendableMsat >= amountMsat {
+			hop := map[string]interface{}{
+				"id": destNodeID, "channel": c.ShortChannelID, "direction": c.Direction,
+				"amount_msat": amountMsat, "delay": delay, "style": "tlv",
+			}
+			return json.Marshal(hop)
+		}
+	}
+	return nil, fmt.Errorf("no direct CHANNELD_NORMAL channel to %s with >= %d msat spendable", destNodeID, amountMsat)
+}
+
+func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error) {
+	phHex := hex.EncodeToString(paymentHash)
+
+	// 1. Route to the destination in this leg's asset.
+	rparams := map[string]interface{}{
+		"id":          destNodeID,
+		"amount_msat": amountMsat,
+		"riskfactor":  10,
+	}
+	if finalCltv != 0 {
+		rparams["cltv"] = finalCltv
+	}
+	if l.assetID != "" {
+		rparams["asset"] = l.assetID
+	}
+	var route struct {
+		Route []json.RawMessage `json:"route"`
+	}
+	rerr := l.rpc.call(&route, "getroute", rparams)
+	if rerr != nil || len(route.Route) == 0 {
+		// Asset-aware getroute uses only the gossip graph, so it misses an UNANNOUNCED
+		// (private) channel to a directly-connected payee. Fall back to a single-hop
+		// route over our own channel to the destination.
+		hop, derr := l.directHop(destNodeID, amountMsat, finalCltv)
+		if derr != nil {
+			if rerr != nil {
+				return nil, fmt.Errorf("getroute: %w (and no direct channel: %v)", rerr, derr)
+			}
+			return nil, fmt.Errorf("%w: no route to %s (asset %q): %v", ErrLNLegInvalid, destNodeID, l.assetID, derr)
+		}
+		route.Route = []json.RawMessage{hop}
+	}
+
+	// 2. Send the HTLC to the bare hash along that route.
+	sparams := map[string]interface{}{
+		"route":        route.Route,
+		"payment_hash": phHex,
+		"amount_msat":  amountMsat,
+	}
+	if len(paymentSecret) > 0 {
+		sparams["payment_secret"] = hex.EncodeToString(paymentSecret)
+	}
+	if err := l.rpc.call(nil, "sendpay", sparams); err != nil {
+		// "FIRST PEER NOT READY" IS A DROPPED TRANSPORT, NOT A DEAD ROUTE.
+		//
+		// CLN keeps the channel but tears down the peer's TCP/Noise connection when it goes idle (and a
+		// peer restart drops it too). The channel is fine, the balance is fine — the first hop simply has
+		// no live connection, and sendpay refuses with WIRE_TEMPORARY_CHANNEL_FAILURE.
+		//
+		// ReconnectPeers already existed for exactly this and was called from nowhere, so a wallet whose
+		// node had been idle failed its swap outright: "pure-LN swap ended: pay hold: sendpay: rpc error
+		// 204: failed: WIRE_TEMPORARY_CHANNEL_FAILURE (First peer not ready)". Reconnect and try once
+		// more; if it still refuses, report the ORIGINAL error, since that is the one that describes the
+		// payment rather than the recovery.
+		if isPeerNotReady(err) {
+			if _, rerr := l.ReconnectPeers(); rerr == nil {
+				if err2 := l.rpc.call(nil, "sendpay", sparams); err2 == nil {
+					goto sent
+				}
+			}
+		}
+		return nil, fmt.Errorf("sendpay: %w", err)
+	}
+sent:
+
+	// 3. Block until the payee resolves it (settle => complete, cancel => fail).
+	//    A HODL payee holds the HTLC until its device settles, which can far
+	//    outlast one socket read (seen live: the mixed same-chain maker died
+	//    here at the 120s read deadline while the payment sat legitimately
+	//    'pending', orphaning the swap). Ask waitsendpay itself to time-box
+	//    each wait (CLN code 200 = still pending) and LOOP on a fresh
+	//    connection until the payment RESOLVES: abandoning while pending is
+	//    never safe — if it settles later the node holds P (listsendpays) but
+	//    nothing would claim the on-chain leg with it.
+	var res struct {
+		Status     string `json:"status"`
+		PaymentPre string `json:"payment_preimage"`
+	}
+	for {
+		wrpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: l.rpc.timeout}
+		err := wrpc.call(&res, "waitsendpay", map[string]interface{}{"payment_hash": phHex, "timeout": 60})
+		if err == nil {
+			break
+		}
+		if waitsendpayStillPending(err) {
+			continue
+		}
+		return nil, fmt.Errorf("waitsendpay: %w", err)
+	}
+	if res.Status != "complete" {
+		return nil, fmt.Errorf("%w: sendpay status %q", ErrLNLegInvalid, res.Status)
+	}
+	pre, err := hex.DecodeString(res.PaymentPre)
+	if err != nil {
+		return nil, fmt.Errorf("bad preimage hex: %w", err)
+	}
+	if !hashEqualsPreimage(paymentHash, pre) {
+		return nil, fmt.Errorf("%w: revealed preimage does not hash to paymentHash", ErrLNLegInvalid)
 	}
 	return pre, nil
 }
@@ -207,13 +449,42 @@ func (l *clnLNLeg) SettleHold(paymentHash, preimage []byte) error {
 	if !hashEqualsPreimage(paymentHash, preimage) {
 		return fmt.Errorf("%w: preimage does not hash to the invoice payment_hash", ErrLNLegInvalid)
 	}
-	return l.rpc.call(nil, "holdinvoicesettle",
-		map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
+	// The hold plugin settles by revealing the preimage (the maker does not know
+	// P until it learns it from the outgoing leg), so pass it explicitly.
+	return l.rpc.call(nil, "holdinvoicesettle", map[string]interface{}{
+		"payment_hash": hex.EncodeToString(paymentHash),
+		"preimage":     hex.EncodeToString(preimage),
+	})
 }
 
 func (l *clnLNLeg) CancelHold(paymentHash []byte) error {
 	return l.rpc.call(nil, "holdinvoicecancel",
 		map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
+}
+
+// localScids lists the short_channel_ids of this node's LIVE channels, for
+// forcing into an invoice's routehints. On a slow-confirming chain (testnet4)
+// a PUBLIC channel can stay un-gossiped for hours (announcement needs depth 6),
+// during which a payer relying on gossip cannot route even to a DIRECT peer
+// ("Ran out of routes to try"). Exposing the channels explicitly makes every
+// invoice self-routing regardless of announcement state.
+func (l *clnLNLeg) localScids() []string {
+	var res struct {
+		Channels []struct {
+			State string `json:"state"`
+			Scid  string `json:"short_channel_id"`
+		} `json:"channels"`
+	}
+	if err := l.rpc.call(&res, "listpeerchannels", map[string]interface{}{}); err != nil {
+		return nil
+	}
+	var scids []string
+	for _, c := range res.Channels {
+		if c.State == "CHANNELD_NORMAL" && c.Scid != "" {
+			scids = append(scids, c.Scid)
+		}
+	}
+	return scids
 }
 
 func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry uint32, label, description string) (string, error) {
@@ -222,6 +493,9 @@ func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry 
 		"label":       label,
 		"description": description,
 		"preimage":    hex.EncodeToString(preimage),
+	}
+	if scids := l.localScids(); len(scids) > 0 {
+		params["exposeprivatechannels"] = scids
 	}
 	if cltvExpiry != 0 {
 		params["cltv"] = cltvExpiry
@@ -261,6 +535,41 @@ func (l *clnLNLeg) WaitInvoicePaid(label string, timeout time.Duration) (uint64,
 		return res.AmountReceivedMsat, nil
 	}
 	return res.AmountMsat, nil
+}
+
+// WaitPaidByHash polls listinvoices for an invoice with the given payment_hash
+// until it is "paid" (or the deadline). Unlike WaitInvoicePaid it needs no label
+// and never touches the preimage — used by the sub-asset external-invoice mode,
+// where a DEVICE created the invoice with its own preimage and the driver only
+// learns that the payment arrived (settlement is signaled by "paid", the preimage
+// stays device-held).
+func (l *clnLNLeg) WaitPaidByHash(paymentHash []byte, timeout time.Duration) (uint64, error) {
+	deadline := time.Now().Add(timeout)
+	hashHex := hex.EncodeToString(paymentHash)
+	for {
+		var res struct {
+			Invoices []struct {
+				Status             string `json:"status"`
+				AmountReceivedMsat uint64 `json:"amount_received_msat"`
+				AmountMsat         uint64 `json:"amount_msat"`
+			} `json:"invoices"`
+		}
+		err := l.rpc.call(&res, "listinvoices", map[string]interface{}{"payment_hash": hashHex})
+		if err == nil {
+			for _, inv := range res.Invoices {
+				if inv.Status == "paid" {
+					if inv.AmountReceivedMsat != 0 {
+						return inv.AmountReceivedMsat, nil
+					}
+					return inv.AmountMsat, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w: invoice %s not paid within %s (last err: %v)", ErrLNLegTimeout, hashHex[:12], timeout, err)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // --- minimal CLN lightning-rpc client (unix socket, JSON-RPC 2.0) -----------
@@ -323,4 +632,65 @@ func (c *lnRPC) call(out interface{}, method string, params interface{}) error {
 		}
 		return nil
 	}
+}
+
+// waitsendpayStillPending reports whether a waitsendpay error means the payment
+// is STILL PENDING (so the caller should keep waiting on a fresh connection):
+// CLN's own wait timeout (code 200), or a transport-level timeout/read error on
+// the blocking socket. Anything else is a real resolution (failure) and must
+// surface.
+func waitsendpayStillPending(err error) bool {
+	var re *rpcErr
+	if errors.As(err, &re) {
+		return re.Code == 200 // "Timed out while waiting"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	// The deadline can also surface as a wrapped plain read error.
+	return strings.Contains(err.Error(), "i/o timeout")
+}
+
+// payFallbackPlan decides whether a failed `pay` can be retried as a direct-hop PayHash, and
+// with what arguments. Split out from Pay so the decision is testable without a live node.
+//
+// It is deliberately CONSERVATIVE: without a payee and a payment_secret there is no well-formed
+// payment to send, so the original `pay` error is reported unchanged rather than replaced by a
+// second, more confusing one from a request that could never have worked.
+//
+// The amount follows the invoice: a quoted amount wins (it was already checked against the
+// invoice above), and an amountless invoice falls back to the invoice's own amount. Sending 0
+// would be silently wrong, so both being absent disables the fallback.
+func payFallbackPlan(payee, paymentSecretHex string, invoiceMsat, quotedMsat uint64) (string, []byte, uint64, bool) {
+	if payee == "" || paymentSecretHex == "" {
+		return "", nil, 0, false
+	}
+	secret, err := hex.DecodeString(paymentSecretHex)
+	if err != nil || len(secret) == 0 {
+		return "", nil, 0, false
+	}
+	amt := quotedMsat
+	if amt == 0 {
+		amt = invoiceMsat
+	}
+	if amt == 0 {
+		return "", nil, 0, false
+	}
+	return payee, secret, amt, true
+}
+
+// isPeerNotReady reports whether a CLN error is the "the first hop's transport is down" case rather
+// than a genuine routing/liquidity failure. CLN keeps the channel and the balance in this state; only
+// the peer's TCP/Noise connection is gone, which a reconnect fixes.
+//
+// Deliberately narrow: it only triggers a reconnect-and-retry, and retrying a payment for the wrong
+// reason is exactly the kind of thing that should not be loose.
+func isPeerNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "first peer not ready") ||
+		(strings.Contains(m, "temporary_channel_failure") && strings.Contains(m, "peer"))
 }

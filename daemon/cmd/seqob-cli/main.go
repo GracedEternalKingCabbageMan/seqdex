@@ -56,6 +56,32 @@ func main() {
 		cmdXSubLift(os.Args[2:])
 	case "xsubbuy":
 		cmdXSubBuy(os.Args[2:])
+	case "xpln":
+		cmdXPln(os.Args[2:])
+	case "xsubas":
+		cmdXSubAs(os.Args[2:])
+	case "xsubas-refund":
+		cmdXSubAsRefund(os.Args[2:])
+	case "xsubas-fund-btc":
+		cmdXSubAsFundBtc(os.Args[2:])
+	case "xsubas-sell":
+		cmdXSubAsSell(os.Args[2:])
+	case "xsubas-claim-btc":
+		cmdXSubAsClaimBTC(os.Args[2:])
+	case "xsubas-refund-btc":
+		cmdXSubAsRefundBTC(os.Args[2:])
+	case "xsubas-htlc-spend-status":
+		cmdXSubAsHtlcSpendStatus(os.Args[2:])
+	case "xsubas-node-caps":
+		cmdXSubAsNodeCaps(os.Args[2:])
+	case "xhtlc-observe":
+		cmdXHtlcObserve(os.Args[2:])
+	case "xfund-seq":
+		cmdXFundSeq(os.Args[2:])
+	case "xseq-refund":
+		cmdXSeqRefund(os.Args[2:])
+	case "keygen":
+		cmdKeygen(os.Args[2:])
 	default:
 		usage()
 	}
@@ -77,7 +103,22 @@ commands:
   xsublift  sell the asset for BTC over LIGHTNING (submarine swap): fund the asset HTLC, receive BTC-LN
           (flags: -relay -asset -offer-id -maker-pubkey -seq-rpc -seq-wallet -ln-socket -state-file)
   xsubbuy   buy the asset with BTC over LIGHTNING (reverse submarine): anchor-gate + pay the maker's invoice, claim the asset
-          (flags: -relay -asset -offer-id -maker-pubkey -seq-rpc -seq-wallet -ln-socket -min-anchor-depth -state-file)`)
+          (flags: -relay -asset -offer-id -maker-pubkey -seq-rpc -seq-wallet -ln-socket -min-anchor-depth -state-file)
+  xpln    trade the asset against BTC with BOTH legs over LIGHTNING (pure-LN, no on-chain leg / no anchor wait)
+          (flags: -relay -side buy|sell -asset -offer-id -maker-pubkey -asset-ln-socket -ln-socket -final-cltv -terms-wait -hold-wait)
+  xsubas  buy the asset by paying BTC ON-CHAIN and receiving the asset OVER LIGHTNING (submarine's mirror) [-taker-ln-node-id <hosted node id> for a non-custodial HODL buy: relay H + node id, maker pays the bare hash, the device settles]
+          (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -asset-ln-socket -min-btc-conf -state-file -refund-wait)
+  xsubas-refund  recover the BTC HTLC of an aborted xsubas after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)
+  xsubas-refund-btc  LSP recoup: spend the REFUND/ELSE (CLTV) branch of the payer-bridge BTC HTLC back to the LSP wallet after T_btc (mirror of xsubas-claim-btc)
+          (flags: -btc-rpc -btc-wallet -btc-chain -txid -vout -amount -redeem-script -t-btc -refund-priv -spend-fee)
+  xsubas-htlc-spend-status  LSP recoup-vs-refund ORACLE: read the AUTHORITATIVE on-chain fate of the payer-bridge BTC HTLC — UNSPENT | SPENT_VIA_CLAIM (returns P) | SPENT_VIA_REFUND — fail-closed on uncertainty (replaces the racy persisted intent flag; needs txindex + unpruned to read a non-wallet maker claim)
+          (flags: -btc-rpc -btc-wallet -btc-chain -txid -vout -redeem-script -require-node-caps)
+  xsubas-node-caps  LSP payer-bridge BRING-UP gate: assert the BTC node is UNPRUNED + has a SYNCED txindex (so the HTLC-spend classifier can read a non-wallet maker claim). Exit 0 = capable, 1 = refuse payer bridges
+          (flags: -btc-rpc -btc-wallet -btc-chain)
+  xfund-seq  fund an on-chain Sequentia asset HTLC (claim = the counterparty with P, refund = your own key after T_seq)
+          (flags: -seq-rpc -seq-wallet -asset -seq-amount -hash -maker-claim-pub -refund-priv -seq-locktime -no-wait)
+  xseq-refund  reclaim an asset HTLC by OUTPOINT after T_seq (the state-file-free mirror of xsubas-refund-btc; recovers an LSP FRONTED asset leg a taker never claimed)
+          (flags: -seq-rpc -seq-wallet -txid -vout -amount -asset -redeem-script -t-seq -refund-priv -spend-fee -wait)`)
 	os.Exit(2)
 }
 
@@ -357,6 +398,66 @@ func readWSUntilSwap(c *websocket.Conn, timeout time.Duration) (*seqobv1.From, e
 	}
 }
 
+// startCourierReader spawns the SINGLE background reader for a courier WS session and
+// returns a recv closure (the shape the RunTaker* drivers expect: ciphertext bytes for
+// the next swap_msg, or an error). The on-demand readWSUntilSwap pattern only calls
+// ReadMessage when the driver is actively waiting; during a multi-minute on-chain
+// confirmation wait the driver is in its own poll loop and NEVER reads, so gorilla never
+// auto-pongs the relay's keepalive pings and the relay reaps the idle socket at pongWait
+// (60s) — the later announce write then hits a closed socket (broken pipe) and the lift
+// aborts AFTER funding. A dedicated goroutine that stays in ReadMessage keeps gorilla
+// auto-ponging for the whole wait, so the session survives to the announce. gorilla
+// permits one concurrent reader + one concurrent writer, and this is the only reader
+// (the send closure is the only writer), so it is race-free. Must be started AFTER the
+// one-shot readWS(lift_accepted) handshake, so nothing else touches ReadMessage.
+func startCourierReader(c *websocket.Conn) func(timeout time.Duration) ([]byte, error) {
+	frames := make(chan *seqobv1.From, 16)
+	errc := make(chan error, 1)
+	go func() {
+		c.SetReadDeadline(time.Time{}) // no idle deadline: block in ReadMessage (auto-ponging) until a frame or a real close
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				errc <- err
+				close(frames)
+				return
+			}
+			var from seqobv1.From
+			if jsonUnmarshal.Unmarshal(data, &from) != nil {
+				continue
+			}
+			frames <- &from
+		}
+	}()
+	return func(timeout time.Duration) ([]byte, error) {
+		deadline := time.After(timeout)
+		for {
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					select {
+					case e := <-errc:
+						return nil, e
+					default:
+						return nil, fmt.Errorf("courier connection closed")
+					}
+				}
+				if f.GetSwapMsg() != nil {
+					return f.GetSwapMsg().GetCiphertext(), nil
+				}
+				if e := f.GetError(); e != nil {
+					return nil, fmt.Errorf("relay error %d: %s", e.GetCode(), e.GetMessage())
+				}
+				// a non-swap, non-error frame (out-of-band notice): keep waiting for the swap_msg
+			case <-deadline:
+				return nil, fmt.Errorf("courier recv timeout")
+			case e := <-errc:
+				return nil, e
+			}
+		}
+	}
+}
+
 // --- helpers ---
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -439,6 +540,15 @@ func short(s string) string {
 		return s
 	}
 	return s[:6] + ".." + s[len(s)-6:]
+}
+
+// partialNote annotates a cross lift log line when the taker takes a slice of a
+// larger resting offer (a partial fill), and is empty for a whole-offer lift.
+func partialNote(take, whole uint64) string {
+	if take < whole {
+		return fmt.Sprintf(" (PARTIAL of %d)", whole)
+	}
+	return ""
 }
 
 func shortDir(d seqobv1.TradeDir) string {

@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
-	log "github.com/sirupsen/logrus"
 	serviceinterface "github.com/aejkcs50/seqdex/daemon/cmd/migration/service"
 	"github.com/aejkcs50/seqdex/daemon/cmd/migration/v0-v1/mapper"
 	v0webhook "github.com/aejkcs50/seqdex/daemon/cmd/migration/v0-v1/v0-webhook"
@@ -30,6 +28,8 @@ import (
 	dbbadger "github.com/aejkcs50/seqdex/daemon/internal/infrastructure/storage/db/badger"
 	v0domain "github.com/aejkcs50/seqdex/daemon/old-v0"
 	boltsecurestore "github.com/aejkcs50/seqdex/daemon/pkg/securestore/bolt"
+	"github.com/btcsuite/btcd/btcutil"
+	log "github.com/sirupsen/logrus"
 	"github.com/vulpemventures/go-elements/network"
 	"go.uber.org/ratelimit"
 )

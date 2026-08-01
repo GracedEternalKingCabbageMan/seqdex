@@ -222,6 +222,11 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 			}
 		}
 	}
+	if o.GetConfidential() {
+		if err := v.checkConfidential(o); err != nil {
+			return err
+		}
+	}
 	if o.GetCrossChain() != nil {
 		return v.checkCrossChain(o)
 	}
@@ -229,6 +234,60 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 		return v.checkLightning(o)
 	}
 	return nil
+}
+
+// checkConfidential enforces the blinded-book invariants on an offer flagged
+// confidential (Confidential-book requirement 1). A confidential offer:
+//   - MUST settle via the interactive SameChainTerms co-sign rail. The covenant
+//     rail introspects EXPLICIT on-chain amounts (tapscript 0xc4) and is
+//     CT-incompatible; cross-chain / Lightning legs touch the parent chain, which
+//     has no CT. Any of those variants on a confidential offer is rejected.
+//   - MUST publish a maker blinding pubkey so the taker can blind the maker's
+//     output, and a blinded (blech32 tsqb/sqb HRP) receive address, so BOTH legs
+//     blind on-chain.
+//   - MUST NOT involve the BTC sentinel on either pair side (parent chain, no CT).
+//
+// This makes a confidential offer settle fully blinded by construction: without a
+// blinded maker output there is no second blinded leg, and the public swap ratio
+// would leak the amount.
+func (v *Validator) checkConfidential(o *seqobv1.Offer) error {
+	if o.GetCrossChain() != nil || o.GetLightning() != nil || o.GetCovenant() != nil {
+		return fmt.Errorf("confidential offer must use the same-chain co-sign rail (no covenant/cross-chain/lightning)")
+	}
+	sc := o.GetSameChain()
+	if sc == nil {
+		return fmt.Errorf("confidential offer must carry same_chain terms")
+	}
+	p := o.GetPair()
+	if offer.IsBTCSentinel(p.GetBaseAsset()) || offer.IsBTCSentinel(p.GetQuoteAsset()) ||
+		offer.IsBTCSentinel(o.GetOfferAsset()) || offer.IsBTCSentinel(o.GetWantAsset()) {
+		return fmt.Errorf("confidential book excludes BTC pairs (the parent chain has no confidential transactions)")
+	}
+	bp := sc.GetMakerBlindingPub()
+	if bp == "" {
+		return fmt.Errorf("confidential offer must publish maker_blinding_pub")
+	}
+	b, err := hex.DecodeString(bp)
+	if err != nil {
+		return fmt.Errorf("maker_blinding_pub not hex: %v", err)
+	}
+	if _, err := btcec.ParsePubKey(b); err != nil {
+		return fmt.Errorf("maker_blinding_pub invalid: %v", err)
+	}
+	addr := sc.GetMakerRecvAddress()
+	if !isBlindedAddress(addr) {
+		return fmt.Errorf("confidential offer maker_recv_address must be a blinded (blech32) address")
+	}
+	return nil
+}
+
+// isBlindedAddress reports whether addr is a Sequentia confidential (blinded)
+// address: the opt-in blech32 form uses the tsqb (testnet) / sqb (mainnet) HRP,
+// distinct from the transparent bech32 tb1/bc1 form (Principle 6). A confidential
+// offer must receive to a blinded address so the maker's leg blinds on-chain.
+func isBlindedAddress(addr string) bool {
+	a := strings.ToLower(strings.TrimSpace(addr))
+	return strings.HasPrefix(a, "tsqb1") || strings.HasPrefix(a, "sqb1")
 }
 
 // checkLightning validates a submarine-swap (asset on-chain <-> BTC-over-Lightning)
@@ -243,11 +302,26 @@ func (v *Validator) checkLightning(o *seqobv1.Offer) error {
 	}
 	p := o.GetPair()
 	baseBTC, quoteBTC := offer.IsBTCSentinel(p.GetBaseAsset()), offer.IsBTCSentinel(p.GetQuoteAsset())
-	if baseBTC == quoteBTC {
-		return fmt.Errorf("lightning pair must have exactly one BTC-sentinel side")
+	// EVERY Lightning direction is asset-agnostic on the quote side now:
+	//   - Pure-LN (2/3): two Lightning HTLCs bound by one preimage; quote = BTC
+	//     or a real asset (asset<->asset pure-LN markets, e.g. GOLD/EURX).
+	//   - Submarine (0/1) and sub-asset (4/5): one Lightning leg + one ON-CHAIN
+	//     HTLC. Quote = the BTC sentinel (the on-chain leg is real parent-chain
+	//     BTC) or a REAL asset id — the MIXED SAME-CHAIN shape (rails 7/8),
+	//     where the on-chain leg is a Sequentia HTLC on the quote asset,
+	//     standing exactly where BTC stands (no structurally privileged unit).
+	// The base is always a real Sequentia asset, and a pair never repeats an
+	// asset on both sides.
+	if baseBTC {
+		return fmt.Errorf("lightning pair base must be an asset (quote is %s or a real asset id)", offer.BTCSentinel)
 	}
 	if !quoteBTC {
-		return fmt.Errorf("lightning pair must be base=asset, quote=%s", offer.BTCSentinel)
+		if b, err := hex.DecodeString(p.GetQuoteAsset()); err != nil || len(b) != 32 {
+			return fmt.Errorf("lightning pair quote must be %s or a 64-hex asset id", offer.BTCSentinel)
+		}
+		if p.GetBaseAsset() == p.GetQuoteAsset() {
+			return fmt.Errorf("lightning pair cannot be the same asset on both sides")
+		}
 	}
 	// Advisory HTLC keys are raw compressed pubkey bytes (LightningTerms uses bytes,
 	// unlike CrossChainTerms' hex strings).
@@ -262,17 +336,19 @@ func (v *Validator) checkLightning(o *seqobv1.Offer) error {
 			return fmt.Errorf("lightning %s invalid: %v", pk.name, err)
 		}
 	}
-	if lt.GetLnDirection() > 1 {
-		return fmt.Errorf("lightning ln_direction must be 0 (asset->BTC-LN) or 1 (BTC-LN->asset)")
+	if lt.GetLnDirection() > 5 {
+		return fmt.Errorf("lightning ln_direction must be 0/1 (submarine: asset<->BTC-LN), 2/3 (pure-LN: asset-LN<->BTC-LN), or 4/5 (sub-asset: asset-LN<->BTC-on-chain)")
 	}
 	if !offer.LnDirectionConsistent(lt.GetLnDirection(), o.GetTradeDir() == seqobv1.TradeDir_TRADE_DIR_SELL) {
 		return fmt.Errorf("lightning ln_direction inconsistent with trade_dir")
 	}
-	// The maker's LN node id is required when the TAKER must pay the maker (the
-	// reverse direction); for the normal direction the maker pays the taker's
-	// invoice, so it is optional. Validate it whenever present.
-	if lt.GetLnDirection() == offer.LnBTCForAsset && o.GetMakerLnNodePubkey() == "" {
-		return fmt.Errorf("lightning reverse offer must advertise maker_ln_node_pubkey")
+	// The maker's LN node id is required when the TAKER must pay the maker: the
+	// reverse submarine direction, and BOTH pure-LN directions (the taker pays the
+	// maker's hold by bare hash, so it needs the maker's hold-leg node id). For the
+	// normal submarine direction the maker pays the taker's invoice, so it is
+	// optional there. Validate it whenever present.
+	if (lt.GetLnDirection() == offer.LnBTCForAsset || offer.IsPureLN(lt.GetLnDirection())) && o.GetMakerLnNodePubkey() == "" {
+		return fmt.Errorf("lightning reverse/pure-LN offer must advertise maker_ln_node_pubkey")
 	}
 	if npk := o.GetMakerLnNodePubkey(); npk != "" {
 		b, err := hex.DecodeString(npk)
