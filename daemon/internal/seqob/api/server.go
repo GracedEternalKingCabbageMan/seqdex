@@ -248,7 +248,7 @@ func (s *Server) handleOrderbook(w http.ResponseWriter, r *http.Request) {
 		// (absent/0) serves the existing transparent book unchanged, so the live
 		// unblinded DEX is byte-for-byte untouched.
 		confidential := isTruthy(r.URL.Query().Get("confidential"))
-		writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.store.SnapshotPair(pair, confidential)})
+		writeProto(w, &seqobv1.PublicBook{Pair: pair, Offers: s.liftableOffers(s.store.SnapshotPair(pair, confidential))})
 	case "trades":
 		s.handleTrades(w, r, pair)
 	case "candles":
@@ -502,4 +502,59 @@ func clientIP(r *http.Request) string {
 		return host[:i]
 	}
 	return host
+}
+
+// liftableOffers drops resting offers that NOTHING can currently fill: an interactive same-chain
+// offer whose maker has no live connection to co-sign the lift.
+//
+// A book must only advertise prices a taker can actually take. These were being served at the TOP of
+// book — better-priced than the real ones behind them — so every market order walked straight into
+// them and came back "maker is not connected; this offer cannot be lifted right now". On one live
+// pair that was 40 unfillable offers in front of 2 real ones: the DEX looked deep and could not trade.
+//
+// RemoveInteractiveByMaker already evicts these, but only when a maker DISCONNECTS. An offer posted
+// by something that never held a connection at all — a seeding script, a maker that died before its
+// socket registered — was never evicted by anything, because no disconnect ever happened. This closes
+// that hole on the read side, so it holds regardless of how the ghost got there.
+//
+// DURABLE settlement types are deliberately kept, exactly as the eviction path keeps them:
+//   - COVENANT offers are funded on-chain and fill permissionlessly with the maker offline — that is
+//     the entire point of the passive CLOB.
+//   - CROSS-CHAIN and LIGHTNING/sub-asset offers are serviced by an always-online agent that
+//     reconnects; hiding them on a transient blip emptied the cross book once already.
+func (s *Server) liftableOffers(offers []*seqobv1.Offer) []*seqobv1.Offer {
+	if s.makerConns == nil {
+		return offers
+	}
+	now := time.Now().Unix()
+	out := offers[:0:0]
+	for _, o := range offers {
+		if !needsLiveMaker(o) {
+			out = append(out, o)
+			continue
+		}
+		if _, ok := s.makerConns.get(o.GetMakerPubkey()); ok {
+			out = append(out, o)
+			continue
+		}
+		// GRACE. Posting an offer and then connecting to serve it is a legitimate order: a maker may
+		// REST-submit and open its socket a moment later. Only an offer that has sat unserved for
+		// longer than any such gap is a ghost, so young ones are still shown.
+		if created := o.GetCreatedAtUnix(); created > 0 && now-int64(created) < ghostGraceSecs {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// How long an interactive offer may rest with no connected maker before the book stops advertising
+// it. Long enough to cover submit-then-connect and a socket blip; short enough that a book full of
+// abandoned offers cannot keep quoting prices nobody can fill.
+const ghostGraceSecs = 90
+
+// needsLiveMaker reports whether filling this offer requires its maker to be connected right now.
+// Only a plain interactive same-chain offer does: everything else either settles without the maker
+// (covenant) or is served by an agent that reconnects (cross-chain, Lightning/sub-asset).
+func needsLiveMaker(o *seqobv1.Offer) bool {
+	return o.GetCovenant() == nil && o.GetLightning() == nil && o.GetCrossChain() == nil
 }
