@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -343,8 +344,27 @@ func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uin
 		sparams["payment_secret"] = hex.EncodeToString(paymentSecret)
 	}
 	if err := l.rpc.call(nil, "sendpay", sparams); err != nil {
+		// "FIRST PEER NOT READY" IS A DROPPED TRANSPORT, NOT A DEAD ROUTE.
+		//
+		// CLN keeps the channel but tears down the peer's TCP/Noise connection when it goes idle (and a
+		// peer restart drops it too). The channel is fine, the balance is fine — the first hop simply has
+		// no live connection, and sendpay refuses with WIRE_TEMPORARY_CHANNEL_FAILURE.
+		//
+		// ReconnectPeers already existed for exactly this and was called from nowhere, so a wallet whose
+		// node had been idle failed its swap outright: "pure-LN swap ended: pay hold: sendpay: rpc error
+		// 204: failed: WIRE_TEMPORARY_CHANNEL_FAILURE (First peer not ready)". Reconnect and try once
+		// more; if it still refuses, report the ORIGINAL error, since that is the one that describes the
+		// payment rather than the recovery.
+		if isPeerNotReady(err) {
+			if _, rerr := l.ReconnectPeers(); rerr == nil {
+				if err2 := l.rpc.call(nil, "sendpay", sparams); err2 == nil {
+					goto sent
+				}
+			}
+		}
 		return nil, fmt.Errorf("sendpay: %w", err)
 	}
+sent:
 
 	// 3. Block until the payee resolves it (settle => complete, cancel => fail).
 	//    Use a dedicated connection whose deadline is this leg's timeout, since
@@ -626,4 +646,19 @@ func payFallbackPlan(payee, paymentSecretHex string, invoiceMsat, quotedMsat uin
 		return "", nil, 0, false
 	}
 	return payee, secret, amt, true
+}
+
+// isPeerNotReady reports whether a CLN error is the "the first hop's transport is down" case rather
+// than a genuine routing/liquidity failure. CLN keeps the channel and the balance in this state; only
+// the peer's TCP/Noise connection is gone, which a reconnect fixes.
+//
+// Deliberately narrow: it only triggers a reconnect-and-retry, and retrying a payment for the wrong
+// reason is exactly the kind of thing that should not be loose.
+func isPeerNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "first peer not ready") ||
+		(strings.Contains(m, "temporary_channel_failure") && strings.Contains(m, "peer"))
 }
