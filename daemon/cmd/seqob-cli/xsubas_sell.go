@@ -184,8 +184,10 @@ func cmdXSubAsSell(args []string) {
 			fatal("-btc-claim-priv must be 32-byte hex")
 		}
 		claimKey = xchain.KeyFromBytes(kb)
-	} else if claimKey, err = xchain.NewKey(); err != nil {
-		fatal("mint claim key: %v", err)
+	} else if k, kerr := xchain.NewKey(); kerr != nil {
+		fatal("mint claim key: %v", kerr)
+	} else {
+		claimKey = k
 	}
 
 	// 3. Open the swap session; E2E key from the SIGNED offer. The taker's BTC-leg swap
