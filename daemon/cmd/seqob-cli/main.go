@@ -44,6 +44,8 @@ func main() {
 		cmdBook(os.Args[2:])
 	case "lift":
 		cmdLift(os.Args[2:])
+	case "covfill":
+		cmdCovFill(os.Args[2:])
 	case "xlift":
 		cmdXLift(os.Args[2:])
 	case "xrefund":
@@ -94,6 +96,8 @@ commands:
   post    post a signed offer        (flags: -relay -priv -base -quote -dir -base-amount -quote-amount -expiry -fee-asset -recv-addr -id)
   book    list a market's order book (flags: -relay -base -quote)
   lift    lift a resting offer       (flags: -relay -base -quote -offer-id -maker-pubkey -amount -priv -fee-asset)
+  covfill fill a resting passive-CLOB COVENANT order: one atomic wallet-funded FILL tx (no maker liveness, no refund state)
+          (flags: -relay -offer-id -maker-pubkey -amount(asset-A atoms, 0=whole) -seq-rpc -seq-wallet [-base -quote -fee-asset -spend-fee])
   xlift   lift a CROSS-CHAIN offer: buy the asset with real BTC over the HTLC courier
           (flags: -relay -asset -offer-id -maker-pubkey -btc-rpc -btc-wallet -btc-chain -seq-rpc -seq-wallet -state-file)
   xrefund recover the BTC leg of an aborted xlift after T_btc (flags: -state-file -btc-rpc -btc-wallet -btc-chain -wait)
