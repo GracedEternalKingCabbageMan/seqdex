@@ -19,16 +19,15 @@ package main
 //     Shelling keeps one canonical owner of refund state per family; the crosser
 //     journals WHICH state file each leg used and the exact resume command.
 //
-//   - COVENANT fills are NOT EXECUTABLE yet: this repo has no single-covenant
-//     taker driver anywhere — contrary to the build brief there is no covenant
-//     fill/lift command in cmd/seqob-cli; cmd/seqob-covenant `fill` only DERIVES
-//     the witness artifacts (no tx build/fund/broadcast), cmd/seqob-settler
-//     assembles JOINT covenant-covenant fills only (settler.Plan rejects a
-//     single covenant), and cmd/seqob-bridge `plan` emits a recipe without
-//     broadcasting (its regtest drives the broadcast from Python). Wiring a
-//     wallet-funded single-fill assembler is new settlement code outside this
-//     task's write boundary, so covenant offers are detected, planned and then
-//     SKIPPED with an explicit reason — never a wrong execution.
+//   - COVENANT fills SHELL to `seqob-cli covfill` (internal/seqob/covfill, the
+//     wallet-funded single-fill driver), consistent with the other on-chain
+//     families. Unlike the HTLC families a covenant fill is ONE atomic FILL tx:
+//     there is no counterparty leg, no refund branch and no session to resume,
+//     so it keeps NO state file and its "resume" is informational only — on any
+//     failure before broadcast nothing moved, and after broadcast the tx either
+//     confirms or drops whole. It needs only the Sequentia node wallet
+//     (-seq-rpc/-seq-wallet): the wallet pays asset B + the fee and receives
+//     asset A.
 
 import (
 	"bufio"
@@ -100,7 +99,7 @@ func (c *Caps) Executable(n *NormOrder) (bool, string) {
 		return need(c.Esplora != "" && c.TakerPriv != "" && c.TakerBlinding != "",
 			"-esplora/-taker-priv/-taker-blinding (same-chain lift seams)")
 	case FamCovenant:
-		return false, "no single-covenant taker driver exists (settler is joint-fill-only, seqob-bridge only plans) — skipped, never guessed"
+		return need(c.SeqRPC != "" && c.SeqWallet != "", "-seq-rpc/-seq-wallet (covenant fill)")
 	default:
 		return false, "unknown family"
 	}
@@ -220,6 +219,25 @@ func (e *Executor) legCommand(n *NormOrder, take uint64) (args []string, stateFi
 			"-state-file", stateFile}, common...)
 		args = e.appendSubAssetChain(args, n)
 		resume = fmt.Sprintf("claim material persists in %s (seqob-cli xsubas-claim-btc)", stateFile)
+
+	case n.Family == FamCovenant:
+		// covfill's -amount is in the covenant's SOLD-asset (asset A) atoms. A
+		// non-flipped covenant offer advertises asset A as its own base, so an ASK
+		// takes the canonical-base amount directly; on a BID (the covenant locks
+		// our quote) the crosser receives asset A as the quote leg, so the take
+		// converts at the offer's own price, floored — exactly RevenueFor, i.e.
+		// what the plan already books as this leg's proceeds.
+		covAmt := takeArg(n, take)
+		if n.Side == SideBid && covAmt != 0 {
+			covAmt = floorMulDiv(take, n.QuoteNum, n.BaseDen)
+		}
+		args = append([]string{"covfill",
+			"-base", n.Offer.GetPair().GetBaseAsset(), "-quote", n.Offer.GetPair().GetQuoteAsset(),
+			"-seq-rpc", c.SeqRPC, "-seq-wallet", c.SeqWallet,
+			"-spend-fee", fmt.Sprint(c.SpendFee),
+			"-amount", fmt.Sprint(covAmt)}, common...)
+		// Single-tx atomic: no refund state, nothing to resume.
+		resume = "covenant fill is one atomic FILL tx: nothing to refund on failure"
 
 	case n.Family == FamSameChain:
 		// seqob-cli lift is direction-agnostic (the taker pays want_asset), so one

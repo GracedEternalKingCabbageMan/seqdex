@@ -20,8 +20,8 @@ func TestScriptedBookDetectToPlan(t *testing.T) {
 
 	// The union view a poll would fetch: three relays, mixed families/orientations.
 	crossAsk := signOffer(mkOffer(FamCross, SideAsk, base, quote, 100, 4800))  // ask 48.00
-	plnAsk := signOffer(mkOffer(FamPureLN, SideAsk, base, quote, 80, 3760))    // ask 47.00  <- best ask
-	covAsk := signOffer(mkOffer(FamCovenant, SideAsk, base, quote, 100, 4000)) // ask 40.00 but INEXECUTABLE
+	plnAsk := signOffer(mkOffer(FamPureLN, SideAsk, base, quote, 80, 3760))    // ask 47.00
+	covAsk := signOffer(mkOffer(FamCovenant, SideAsk, base, quote, 100, 4000)) // ask 40.00 <- best ask (covfill-executable)
 	subBid := signOffer(mkOffer(FamSubAsset, SideBid, base, quote, 50, 2450))  // bid 49.00  <- best bid
 	crossBid := signOffer(mkOffer(FamCross, SideBid, base, quote, 100, 4600))  // bid 46.00 (does not cross)
 	expiring := signOffer(mkOffer(FamPureLN, SideBid, base, quote, 100, 5200, withExpiry(soon)))
@@ -51,8 +51,8 @@ func TestScriptedBookDetectToPlan(t *testing.T) {
 		}
 	}
 
-	// Executability as configured for LN + on-chain but NOT covenant/samechain —
-	// the real Caps check with a realistic box config.
+	// Executability as configured for LN + on-chain but NOT samechain — the real
+	// Caps check with a realistic box config. The seq node also unlocks covfill.
 	caps := Caps{
 		SeqRPC: "http://u:p@h:1", SeqWallet: "w",
 		BtcRPC: "http://u:p@h:2", BtcWallet: "b", BtcChain: "testnet4",
@@ -64,30 +64,31 @@ func TestScriptedBookDetectToPlan(t *testing.T) {
 	}
 	p := d.Plan
 
-	// The covenant ask (40.00, best-priced) must have been SKIPPED as
-	// inexecutable, never chosen: the executable best ask is the pure-LN 47.00.
-	if p.Ask.Offer != plnAsk {
-		t.Fatalf("chose ask %s (%s), want the pure-LN ask", p.Ask.ID(), p.Ask.Family)
+	// The covenant ask (40.00) is the best-priced ask AND executable now that
+	// the single-fill driver exists: -seq-rpc/-seq-wallet unlock covfill. The
+	// pure-LN 47.00 must lose on price.
+	if p.Ask.Offer != covAsk {
+		t.Fatalf("chose ask %s (%s), want the covenant ask", p.Ask.ID(), p.Ask.Family)
 	}
 	if p.Bid.Offer != subBid {
 		t.Fatalf("chose bid %s (%s), want the sub-asset bid", p.Bid.ID(), p.Bid.Family)
 	}
 
-	// Overlap: min(80, 50) = 50; both legs sliceable, no min_fill floors.
+	// Overlap: min(100, 50) = 50; both legs sliceable (covenant min_lot 1: the
+	// remainder 50 re-rests legally).
 	if p.Take != 50 {
 		t.Fatalf("take=%d want 50", p.Take)
 	}
-	// Economics: cost = ceil(50*3760/80) = 2350; revenue = floor(50*2450/50) = 2450.
-	if p.Cost != 2350 || p.Revenue != 2450 || p.Gross != 100 {
+	// Economics: cost = ceil(50*4000/100) = 2000; revenue = floor(50*2450/50) = 2450.
+	if p.Cost != 2000 || p.Revenue != 2450 || p.Gross != 450 {
 		t.Fatalf("economics: cost=%d revenue=%d gross=%d", p.Cost, p.Revenue, p.Gross)
 	}
-	// Gate held: est costs = (subasset 2 + pureln 0) * 10 = 20 < 100; net 80 on
-	// 2350 = ~340bps > 10bps.
-	if p.EstCost != 20 {
-		t.Fatalf("est cost=%d want 20", p.EstCost)
+	// Gate held: est costs = (subasset 2 + covenant 1) * 10 = 30 < 450.
+	if p.EstCost != 30 {
+		t.Fatalf("est cost=%d want 30", p.EstCost)
 	}
 
-	// Leg ordering: sub-asset (score 2) is slower than pure-LN (4): bid first.
+	// Leg ordering: sub-asset (score 2) is slower than covenant (5): bid first.
 	if p.First != p.Bid || p.Second != p.Ask {
 		t.Fatalf("ordering wrong: first=%s", p.First.Family)
 	}
@@ -103,25 +104,39 @@ func TestScriptedBookDetectToPlan(t *testing.T) {
 	}
 }
 
-// TestScriptedBookCovenantOnlySkips pins the honest covenant behavior: a book
-// whose ONLY crossable pair involves a covenant leg produces a skip with the
-// no-driver reason — never a wrong execution.
-func TestScriptedBookCovenantOnlySkips(t *testing.T) {
+// TestScriptedBookCovenantGating pins the covenant executability gate: without
+// the Sequentia node wallet a covenant leg is skipped with the missing-flags
+// reason (never a wrong execution); WITH -seq-rpc/-seq-wallet the same book
+// produces a plan through covfill.
+func TestScriptedBookCovenantGating(t *testing.T) {
 	base, quote := tBase, tQuote
 	union := []*NormOrder{
 		norm(mkOffer(FamCovenant, SideAsk, base, quote, 100, 40), base, quote),
 		norm(mkOffer(FamPureLN, SideBid, base, quote, 100, 50), base, quote),
 	}
+	// No seq node: the covenant ask is inexecutable, so no plan.
 	caps := Caps{AssetLNSocket: "/tmp/a.rpc", BtcLNSocket: "/tmp/b.rpc"}
 	d := Detect(union, caps.Executable, gateOff())
 	if d.Plan != nil {
-		t.Fatalf("covenant leg executed: %+v", d.Plan)
+		t.Fatalf("covenant leg executed without a seq node: %+v", d.Plan)
 	}
 	if !strings.Contains(d.Skip, "no executable ask") {
 		t.Fatalf("skip=%q", d.Skip)
 	}
-	if ok, why := caps.Executable(union[0]); ok || !strings.Contains(why, "no single-covenant taker driver") {
+	if ok, why := caps.Executable(union[0]); ok || !strings.Contains(why, "-seq-rpc/-seq-wallet") {
 		t.Fatalf("covenant executability: ok=%v why=%q", ok, why)
+	}
+	// With the seq node the covenant leg executes and the cross plans.
+	caps.SeqRPC, caps.SeqWallet = "http://u:p@h:1", "w"
+	if ok, why := caps.Executable(union[0]); !ok {
+		t.Fatalf("covenant still inexecutable with a seq node: %s", why)
+	}
+	d = Detect(union, caps.Executable, gateOff())
+	if d.Plan == nil {
+		t.Fatalf("no plan with the seq node configured: %s", d.Skip)
+	}
+	if d.Plan.Ask.Family != FamCovenant {
+		t.Fatalf("ask family = %s, want covenant", d.Plan.Ask.Family)
 	}
 }
 
@@ -147,7 +162,9 @@ func TestCapsExecutabilityMatrix(t *testing.T) {
 		{FamSubAsset, Caps{AssetLNSocket: "a"}, false}, // missing btc side
 		{FamSameChain, full, true},
 		{FamSameChain, Caps{Esplora: "e"}, false},
-		{FamCovenant, full, false}, // never, until a single-fill driver exists
+		{FamCovenant, full, true},                  // covfill: needs only the seq node wallet
+		{FamCovenant, Caps{SeqRPC: "r"}, false},    // missing -seq-wallet
+		{FamCovenant, Caps{SeqWallet: "w"}, false}, // missing -seq-rpc
 	} {
 		n := norm(mkOffer(c.fam, SideAsk, base, quote, 100, 45), base, quote)
 		if ok, why := c.caps.Executable(n); ok != c.ok {
