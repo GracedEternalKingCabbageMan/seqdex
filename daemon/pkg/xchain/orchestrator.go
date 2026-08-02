@@ -59,6 +59,12 @@ type Swap struct {
 	seqLeg *ElementsLeg
 
 	hash *HashLock // the shared hashlock (hash known to both; secret to Alice)
+
+	// verifyNotSeenWait bounds how long VerifyBTCLeg polls out a funding tx this
+	// node cannot see AT ALL yet (ErrBTCLegNotSeen, propagation lag on a fresh
+	// 0-conf leg) before declaring the leg invalid. 0 = DefaultVerifyNotSeenWait.
+	// Settable via SetVerifyNotSeenWait.
+	verifyNotSeenWait time.Duration
 }
 
 // NewSwap wires an orchestrator to an ELEMENTS-mode parent (BTC leg) and the
