@@ -196,6 +196,99 @@ func TestCanonicalBytesStable(t *testing.T) {
 	}
 }
 
+func sampleCovenantOffer() *seqobv1.Offer {
+	o := sampleOffer()
+	o.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
+		CovenantTxid:   "ab12cd34",
+		CovenantVout:   1,
+		AssetA:         "gold",
+		AssetB:         "usdx",
+		RateNum:        3,
+		RateDen:        7,
+		MakerProg:      []byte{0x11, 0x11},
+		MakerProgVer:   1,
+		MinLot:         5,
+		ExpiryLocktime: 400,
+		MakerX:         []byte{0x22, 0x22},
+		InternalKey:    []byte{0x50, 0x92},
+		MerklePath:     [][]byte{{0xaa, 0xbb}},
+	}}
+	return o
+}
+
+// TestCovenantOutpointRewriteKeepsSignatureValid is the partial-fill re-rest
+// regression: the watcher rewrites covenant_txid/covenant_vout while the maker
+// is offline, so the signature must survive an outpoint rewrite (the outpoint
+// is excluded from the canonical bytes; funding is authenticated by spk
+// re-derivation + gettxout, not by the signature).
+func TestCovenantOutpointRewriteKeepsSignatureValid(t *testing.T) {
+	k := newKey(t)
+	o := sampleCovenantOffer()
+	if err := SignOffer(o, k); err != nil {
+		t.Fatalf("SignOffer: %v", err)
+	}
+	if err := VerifyOffer(o); err != nil {
+		t.Fatalf("VerifyOffer on freshly-signed covenant offer: %v", err)
+	}
+
+	// Simulate the watcher's re-rest rewrite: new outpoint, same signature.
+	rerested := cloneOffer(o)
+	rerested.GetCovenant().CovenantTxid = "ffee9988"
+	rerested.GetCovenant().CovenantVout = 3
+	if err := VerifyOffer(rerested); err != nil {
+		t.Fatalf("signature must survive a watcher outpoint rewrite: %v", err)
+	}
+
+	// The canonical bytes are outpoint-independent by construction.
+	b1, err := CanonicalOfferBytes(o)
+	if err != nil {
+		t.Fatalf("CanonicalOfferBytes: %v", err)
+	}
+	b2, err := CanonicalOfferBytes(rerested)
+	if err != nil {
+		t.Fatalf("CanonicalOfferBytes: %v", err)
+	}
+	if string(b1) != string(b2) {
+		t.Fatalf("canonical bytes changed when only the covenant outpoint changed")
+	}
+
+	// Every OTHER covenant field stays load-bearing in the signature.
+	for name, mut := range map[string]func(*seqobv1.CovenantTerms){
+		"rate_num":        func(c *seqobv1.CovenantTerms) { c.RateNum = 5 },
+		"asset_b":         func(c *seqobv1.CovenantTerms) { c.AssetB = "eurx" },
+		"maker_prog":      func(c *seqobv1.CovenantTerms) { c.MakerProg = []byte{0xde, 0xad} },
+		"expiry_locktime": func(c *seqobv1.CovenantTerms) { c.ExpiryLocktime = 999 },
+		"merkle_path":     func(c *seqobv1.CovenantTerms) { c.MerklePath = [][]byte{{0xcc}} },
+	} {
+		tampered := cloneOffer(o)
+		mut(tampered.GetCovenant())
+		if err := VerifyOffer(tampered); err == nil {
+			t.Fatalf("expected verification failure after mutating covenant %s", name)
+		}
+	}
+}
+
+// TestNonCovenantCanonicalBytesUnchanged pins that for a non-covenant offer the
+// canonical bytes are still exactly "deterministic marshal with only maker_sig
+// cleared" — i.e. the covenant-outpoint exclusion touches nothing else.
+func TestNonCovenantCanonicalBytesUnchanged(t *testing.T) {
+	o := sampleOffer()
+	o.MakerSig = []byte{0x01, 0x02}
+	got, err := CanonicalOfferBytes(o)
+	if err != nil {
+		t.Fatalf("CanonicalOfferBytes: %v", err)
+	}
+	pre := cloneOffer(o)
+	pre.MakerSig = nil
+	want, err := deterministic(pre)
+	if err != nil {
+		t.Fatalf("deterministic: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("non-covenant canonical bytes drifted from the pre-change form (maker_sig-cleared deterministic marshal)")
+	}
+}
+
 func cloneOffer(o *seqobv1.Offer) *seqobv1.Offer {
 	return proto.Clone(o).(*seqobv1.Offer)
 }
