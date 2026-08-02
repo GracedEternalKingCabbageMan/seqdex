@@ -67,7 +67,7 @@ func buildSubAssetSellOffer(cfg subAssetSellMakerConfig, assetLnNodeID string) *
 		SchemaVersion:     1,
 		Pair:              &seqobv1.AssetPair{BaseAsset: cfg.asset, QuoteAsset: quote},
 		BaseAmount:        cfg.assetAmt,
-		AllowPartial:      false,
+		AllowPartial:      true, // T8: a taker may take a slice; the serve loop re-rests the remainder
 		CreatedAtUnix:     uint64(time.Now().Unix()),
 		ExpiresAtUnix:     uint64(time.Now().Add(cfg.expiry).Unix()),
 		FeeAssetHint:      cfg.feeAsset,
@@ -160,6 +160,20 @@ func runSubAssetSellMaker(cfg subAssetSellMakerConfig) {
 	serveSubAssetSell(ws, wsURL, o, cfg, tip, newOps, assetID)
 }
 
+// rerestSubAssetSellRemainder prices the unfilled remainder of a partially-filled
+// sub-asset SELL offer for its T8 re-rest. The asset side (base = want) is the
+// exact remainder; the BTC side (the maker's OFFER — it GIVES the BTC) is re-priced
+// at the offer's OWN rate with ProportionalBtc (ceil) rather than by subtracting
+// the rounded filled sats — that subtraction drifts, and ceil keeps the BTC side
+// >= 1 sat for any remainder > 0, so a live remainder never re-rests with a zero
+// (unpriceable) BTC side. The <= 1-sat ceil surplus is the same direction both
+// sides already agreed on for the slice itself (the taker-receives-BTC ceil).
+func rerestSubAssetSellRemainder(offerBtc, baseAsset, filledAsset uint64) (remainAsset, remainBtc uint64) {
+	remainAsset = baseAsset - filledAsset
+	remainBtc = client.ProportionalBtc(offerBtc, remainAsset, baseAsset)
+	return remainAsset, remainBtc
+}
+
 func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetSellMakerConfig,
 	tip func() (int64, error), newOps func(preimage []byte) client.SubAssetSellMakerOps, assetLNID string) {
 	var mu sync.Mutex
@@ -242,31 +256,51 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 
 			go func(sid string, in chan []byte) {
 				settled := false
+				var filledAsset, filledBtc uint64
 				defer func() {
-					// Record the executed fill FIRST, before requote/cancel touch the still-resting
-					// offer: the relay records the trade (last_price + chart for the asset/BTC pair)
-					// and decrements/finalizes the order. The maker received the asset over LN and the
-					// taker claims the BTC on-chain, so there is no maker-held settling txid.
+					// Record the executed fill FIRST, before the partial-remainder re-rest or the
+					// requote/cancel mutate/remove the still-resting offer: the relay records the
+					// trade (last_price + chart for the asset/BTC pair) at the original price and
+					// decrements by exactly filledAsset (the base atoms actually taken; a lift may
+					// be partial). The maker received the asset over LN and the taker claims the
+					// BTC on-chain, so there is no maker-held settling txid.
 					if settled {
-						reportSettledTrade(ws, o, cfg.makerKey, o.GetBaseAmount(), "")
+						reportSettledTrade(ws, o, cfg.makerKey, filledAsset, "")
 					}
-					if settled && cfg.requote {
-						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, func() {
-							if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {
-								fmt.Printf("requote: asset-LN peer reconnect err: %v\n", err)
-							} else if n > 0 {
-								fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
-							}
-						})
+					reconnect := func() {
+						if n, err := xchain.NewCLNAssetLNLeg(cfg.assetLnSock, cfg.asset).ReconnectPeers(); err != nil {
+							fmt.Printf("requote: asset-LN peer reconnect err: %v\n", err)
+						} else if n > 0 {
+							fmt.Printf("requote: reconnected %d asset-LN peer(s)\n", n)
+						}
+					}
+					// T8 partial fill: the taker took only part of the offer, so reduce it to the
+					// remainder and re-quote (there is more to buy, regardless of -requote);
+					// requoteAfterFill re-signs + re-posts the shrunk offer. The BTC side is
+					// re-priced at the offer's own rate (ceil, never zero) — see
+					// rerestSubAssetSellRemainder. A whole fill keeps the old behavior.
+					partial := settled && filledAsset > 0 && filledAsset < o.GetBaseAmount()
+					if partial {
+						remainAsset, remainBtc := rerestSubAssetSellRemainder(o.GetOfferAmount(), o.GetBaseAmount(), filledAsset)
+						mu.Lock()
+						o.OfferAmount = remainBtc // the BTC the maker still gives (offer side)
+						o.BaseAmount = remainAsset
+						o.WantAmount = remainAsset // the asset the maker still wants (want side)
+						mu.Unlock()
+						fmt.Printf("session %s: PARTIAL fill (%d asset over LN, %d sats on-chain); re-resting the remainder %d %s for %d sats\n",
+							sid, filledAsset, filledBtc, remainAsset, o.GetWantAsset(), remainBtc)
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
+					} else if settled && cfg.requote {
+						requoteAfterFill(ws, wsURL, o, cfg.relay, cfg.makerKey, cfg.expiry, reconnect)
 					}
 					mu.Lock()
 					inFlight--
 					delete(inboxes, sid)
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						filled = true
 					}
 					mu.Unlock()
-					if settled && !cfg.requote {
+					if settled && !partial && !cfg.requote {
 						cancelOffer(cfg.relay, o, cfg.makerKey)
 					}
 					requoteExitIfPending(idle)
@@ -281,8 +315,8 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 				p := client.MakerSubAssetSellParams{
 					NewMakerOps: newOps,
 					Crypter:      cr,
-					BtcAmount:    o.GetOfferAmount(), // BTC sats the maker locks (the taker claims)
-					AssetAmount:  o.GetWantAmount(),  // asset atoms the maker receives over LN
+					BtcAmount:    o.GetOfferAmount(), // BTC sats a WHOLE fill locks (a partial locks the priced slice)
+					AssetAmount:  o.GetWantAmount(),  // asset atoms a WHOLE fill receives over LN (the taker may take a slice)
 					BtcLocktime:  tBtc,
 					MinBTCConf:   cfg.minBTCConf,
 					SpendFeeSats: cfg.spendFee,
@@ -298,7 +332,9 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 					return
 				}
 				settled = res.Settled
-				fmt.Printf("session %s: SUB-ASSET SELL SWAP SETTLED: took the asset over LN; the taker claims the BTC on-chain\n", sid)
+				filledAsset, filledBtc = res.FilledAsset, res.FilledBtc
+				fmt.Printf("session %s: SUB-ASSET SELL SWAP SETTLED: took %d asset over LN; the taker claims %d sats BTC on-chain\n",
+					sid, res.FilledAsset, res.FilledBtc)
 			}(sid, in)
 
 		case from.GetSwapMsg() != nil:

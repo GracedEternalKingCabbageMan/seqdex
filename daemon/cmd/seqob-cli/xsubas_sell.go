@@ -85,6 +85,7 @@ func cmdXSubAsSell(args []string) {
 	quoteAsset := fs.String("quote-asset", "", "MIXED SAME-CHAIN (rails 7/8): the QUOTE asset id (hex). The maker's on-chain HTLC is on THIS Sequentia asset (verified + claimed via -xseq-rpc) instead of BTC; the pair is <asset>/<quote-asset>.")
 	xseqRPCURL := fs.String("xseq-rpc", "", "mixed same-chain: Sequentia node RPC URL (verifies + claims the on-chain quote-asset HTLC)")
 	xseqWallet := fs.String("xseq-wallet", "", "mixed same-chain: Sequentia node wallet that receives the claimed quote asset")
+	takeAmount := fs.Uint64("amount", 0, "PARTIAL FILL: asset atoms to pay over LN (<= the offer). 0 = the whole offer. The BTC you receive on-chain is the proportional price at the offer's rate, rounded UP (you receive the on-chain leg); the maker locks exactly that and re-rests the remainder.")
 	minBTCConf := fs.Int("min-btc-conf", 1, "confirmations required on the maker's BTC HTLC before paying the asset")
 	spendFee := fs.Uint64("spend-fee", 1000, "BTC HTLC claim fee target (sats)")
 	claimPrivHex := fs.String("btc-claim-priv", "", "device BTC claim privkey (32-byte hex); generated if empty (the key that claims the BTC — never given to the LSP)")
@@ -130,10 +131,27 @@ func cmdXSubAsSell(args []string) {
 	if target == nil {
 		fatal("no verified sub-asset-SELL offer found to sell %s for on-chain %s", *asset, quote)
 	}
-	assetAtoms := target.GetWantAmount() // the asset the taker pays over LN
-	btcSats := target.GetOfferAmount()   // the BTC sats the taker receives on-chain
-	fmt.Printf("taking sub-asset-SELL offer %s by %s: pay %d %s OVER LIGHTNING, receive %d BTC sats ON-CHAIN\n",
-		target.GetOfferId(), short(target.GetMakerPubkey()), assetAtoms, *asset, btcSats)
+	wholeAsset := target.GetWantAmount() // the asset a WHOLE fill pays over LN
+	wholeBtc := target.GetOfferAmount()  // the BTC sats a WHOLE fill receives on-chain
+	assetAtoms := wholeAsset             // default: take the whole offer
+	btcSats := wholeBtc
+	// Partial fill: pay a slice and receive the PROPORTIONAL BTC (rounded up — the
+	// taker RECEIVES the on-chain leg, so the ceil is in its favour; the maker locks
+	// the same ceil-priced slice and re-rests the remainder).
+	if *takeAmount > 0 && *takeAmount < wholeAsset {
+		assetAtoms = *takeAmount
+		btcSats = client.ProportionalBtc(wholeBtc, assetAtoms, wholeAsset)
+	} else if *takeAmount > wholeAsset {
+		fatal("-amount %d exceeds the offer's %d %s", *takeAmount, wholeAsset, *asset)
+	}
+	fmt.Printf("taking sub-asset-SELL offer %s by %s: pay %d %s OVER LIGHTNING, receive %d BTC sats ON-CHAIN%s\n",
+		target.GetOfferId(), short(target.GetMakerPubkey()), assetAtoms, *asset, btcSats,
+		func() string {
+			if assetAtoms < wholeAsset {
+				return fmt.Sprintf(" (PARTIAL: %d of %d)", assetAtoms, wholeAsset)
+			}
+			return ""
+		}())
 
 	// 2. Wire the on-chain claim leg (bitcoind, or the Sequentia chain for the
 	// mixed same-chain shape) + the taker's asset LN node (pays). Validate.
@@ -202,7 +220,7 @@ func cmdXSubAsSell(args []string) {
 	writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_StartLift{StartLift: &seqobv1.StartLift{
 		OfferId:            target.GetOfferId(),
 		MakerPubkey:        target.GetMakerPubkey(),
-		TakeAmount:         target.GetBaseAmount(),
+		TakeAmount:         assetAtoms, // T8: the slice we're taking (== base_amount for a whole lift)
 		TakerSessionPubkey: takerKey.PubKey().SerializeCompressed(),
 	}}})
 	la := readWS(conn)
@@ -250,9 +268,12 @@ func cmdXSubAsSell(args []string) {
 				BTC:     btcChain,
 			}
 		},
-		Crypter:          crypter,
-		BtcAmount:        btcSats,
-		AssetAmount:      assetAtoms,
+		Crypter: crypter,
+		// The WHOLE signed offer's two sides; the driver derives the priced slice
+		// from them + TakeAssetAmount so the maker cannot re-price it.
+		BtcAmount:        wholeBtc,
+		AssetAmount:      wholeAsset,
+		TakeAssetAmount:  assetAtoms,
 		MinBTCConf:       *minBTCConf,
 		SpendFeeSats:     *spendFee,
 		BtcClaimKey:      claimKey,

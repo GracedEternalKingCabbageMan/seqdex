@@ -85,3 +85,27 @@ func TestBuildCrossOfferMinFill(t *testing.T) {
 		t.Fatalf("BUY BTC leg at min_fill = %d, below floor %d", leg, client.MinSafeBtcLegSats(1000))
 	}
 }
+
+// TestSubAssetSellReRestRemainder: the sub-asset SELL maker re-rests a partial
+// fill's remainder priced at the offer's OWN rate with ceil — the BTC (offer)
+// side of a live remainder is NEVER zero, so real asset is never re-rested as
+// unpriceable/free, and the asset side is the exact remainder.
+func TestSubAssetSellReRestRemainder(t *testing.T) {
+	// Non-divisible amounts: ceil(1_000_001 * 2_000_000 / 3_000_000) = 666_668.
+	if ra, rb := rerestSubAssetSellRemainder(1_000_001, 3_000_000, 1_000_000); ra != 2_000_000 || rb != 666_668 {
+		t.Fatalf("remainder priced %d asset / %d sats, want 2000000 / 666668 (ceil at the offer's rate)", ra, rb)
+	}
+	// A low-priced offer's last sliver still prices to >= 1 sat: never a zero
+	// (unpriceable) BTC side for a non-empty remainder.
+	if ra, rb := rerestSubAssetSellRemainder(2, 5_000_000, 4_999_999); ra != 1 || rb == 0 {
+		t.Fatalf("sliver remainder priced %d asset / %d sats; the BTC side must never be zero", ra, rb)
+	}
+	// Even a 1-sat whole offer keeps a 1-sat remainder price.
+	if _, rb := rerestSubAssetSellRemainder(1, 1_000_000, 999_999); rb == 0 {
+		t.Fatalf("1-sat offer re-rested its remainder for 0 sats")
+	}
+	// Half of an evenly divisible offer re-rests at exactly half the BTC.
+	if ra, rb := rerestSubAssetSellRemainder(10_000, 1_000_000, 500_000); ra != 500_000 || rb != 5_000 {
+		t.Fatalf("even split priced %d / %d, want 500000 / 5000", ra, rb)
+	}
+}
