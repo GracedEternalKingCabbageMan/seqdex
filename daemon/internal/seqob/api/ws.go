@@ -370,8 +370,12 @@ func (s *Server) wsSubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 	}
 	c.mu.Unlock()
 
-	// Snapshot first, then stream deltas.
-	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_PublicBook{PublicBook: &seqobv1.PublicBook{Pair: pair, Offers: snap}}})
+	// Snapshot first, then stream deltas. The snapshot passes the SAME liftability filter
+	// the REST orderbook applies: serving the raw store here while REST hides unliftable
+	// ghosts made the two sources disagree about the same market, and a wallet's ladder
+	// showed whichever painted last (seen live: ~40 dead seeded offers "deep" over the WS,
+	// 2 fillable ones over REST). One market, one book.
+	_ = c.send(&seqobv1.From{Msg: &seqobv1.From_PublicBook{PublicBook: &seqobv1.PublicBook{Pair: pair, Offers: s.liftableOffers(snap)}}})
 	go s.forwardDeltas(c, ch, stop)
 }
 
