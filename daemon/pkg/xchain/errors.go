@@ -3,6 +3,7 @@ package xchain
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var (
@@ -47,6 +48,16 @@ var (
 	// maker will lock the SEQ leg (the BTC-leg-first ordering rule).
 	ErrBTCLegUnconfirmed = errors.New("xchain: taker BTC leg not confirmed to required depth")
 
+	// ErrBTCLegNotSeen means the BTC-leg funding tx cannot be found on THIS node
+	// at all yet (getrawtransaction -5 "No such mempool or blockchain
+	// transaction"). A taker funds and announces within seconds, so a fresh
+	// 0-conf leg can legitimately reach us before its tx has propagated to our
+	// own node — that is NOT evidence the leg is invalid, only that we have not
+	// seen it. It is deliberately DISTINCT from ErrBTCLegInvalid: Swap.VerifyBTCLeg
+	// polls this class out (bounded) before declaring the leg invalid, and the
+	// courier drivers' verify loops treat it as retryable, not terminal.
+	ErrBTCLegNotSeen = errors.New("xchain: BTC leg funding tx not seen on this node yet")
+
 	// ErrSEQLegInvalid is the reverse (asset->BTC) mirror of ErrBTCLegInvalid:
 	// returned when the taker's funded SEQ asset leg does not match the quote
 	// (wrong H, wrong redeemScript, wrong amount/asset, or it does not pay the
@@ -67,3 +78,22 @@ var (
 	// reaching "accepted") exceeded its deadline; fall back to the refund path.
 	ErrLNLegTimeout = errors.New("xchain: submarine LN leg timed out")
 )
+
+// isTxNotFoundRPC reports whether err is the node's "transaction not found"
+// class from a tx lookup (JSON-RPC code -5, e.g. getrawtransaction's "No such
+// mempool or blockchain transaction"). ONLY this class is the propagation-lag
+// retry case: the txid we asked about is well-formed (it came off a funded
+// leg announcement), so -5 here can only mean the node has not seen the tx.
+// Any other failure — including a tx that IS found but mismatches — is not.
+func isTxNotFoundRPC(err error) bool {
+	if err == nil {
+		return false
+	}
+	var re *rpcErr
+	if errors.As(err, &re) {
+		return re.Code == -5
+	}
+	// A chain flattened upstream (a %v wrap) loses the *rpcErr but keeps the
+	// canonical message text.
+	return strings.Contains(err.Error(), "No such mempool")
+}

@@ -3,7 +3,9 @@ package xchain
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"time"
 )
 
 // ⚠ THIS FILE IS LIVE. Its previous header said these helpers served "the
@@ -77,11 +79,65 @@ func (s *Swap) VerifyBTCLeg(
 	// backend: it recomputes the canonical Design-A script, locates the funded
 	// HTLC P2SH output, and checks value/asset/confirmations in its own tx
 	// format. The hashlock-vs-quote check above is format-agnostic.
-	return s.btcBackend.VerifyBTCLeg(
-		hashH, makerClaimPub, takerRefundPub, providedScript,
-		btcLocktime, txid, vout, amount, assetID, minConf,
-	)
+	//
+	// PROPAGATION-LAG POLL: a taker funds its leg and announces within seconds,
+	// so a fresh 0-conf leg can reach us BEFORE the funding tx has propagated to
+	// our own node — the backend's lookup then answers the not-found class
+	// (ErrBTCLegNotSeen, rpc -5 "No such mempool or blockchain transaction").
+	// That is not evidence the leg is invalid, so ONLY that class is polled out,
+	// with a short backoff, bounded by verifyNotSeenWait. A tx that IS found but
+	// mismatches the quote (wrong script/amount/asset) still fails immediately —
+	// that is the fund-safety check and it must never be retried into passing.
+	wait := s.verifyNotSeenWait
+	if wait <= 0 {
+		wait = DefaultVerifyNotSeenWait
+	}
+	deadline := time.Now().Add(wait)
+	backoff := verifyNotSeenBackoffStart
+	for {
+		leg, err := s.btcBackend.VerifyBTCLeg(
+			hashH, makerClaimPub, takerRefundPub, providedScript,
+			btcLocktime, txid, vout, amount, assetID, minConf,
+		)
+		if err == nil || !errors.Is(err, ErrBTCLegNotSeen) {
+			return leg, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// The poll exhausted without the node ever seeing the tx. Wrap
+			// ErrBTCLegInvalid so every caller treats it as terminal, with an
+			// honest message: the tx was never SEEN here, not proven mismatched.
+			return nil, fmt.Errorf("%w: funding tx %s not seen on this node within %s: %v",
+				ErrBTCLegInvalid, txid, wait, err)
+		}
+		if backoff > remaining {
+			backoff = remaining
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > verifyNotSeenBackoffCap {
+			backoff = verifyNotSeenBackoffCap
+		}
+	}
 }
+
+// DefaultVerifyNotSeenWait is how long VerifyBTCLeg tolerates the not-found
+// class (the node has not seen the funding tx at all) before declaring the leg
+// invalid. Long enough to absorb normal p2p propagation of a just-broadcast
+// 0-conf funding; short enough that a tx that was never relayed still fails the
+// session promptly.
+const DefaultVerifyNotSeenWait = 30 * time.Second
+
+// The not-seen poll's backoff: start short (the common case is a tx arriving
+// within a few seconds), double up to a cap.
+const (
+	verifyNotSeenBackoffStart = 500 * time.Millisecond
+	verifyNotSeenBackoffCap   = 4 * time.Second
+)
+
+// SetVerifyNotSeenWait overrides DefaultVerifyNotSeenWait for this swap
+// (d <= 0 restores the default).
+func (s *Swap) SetVerifyNotSeenWait(d time.Duration) { s.verifyNotSeenWait = d }
 
 // WatchSEQClaim polls the SEQ chain for a spend of the SEQ-leg outpoint and,
 // when found, extracts the preimage from its scriptSig. It returns the claim
