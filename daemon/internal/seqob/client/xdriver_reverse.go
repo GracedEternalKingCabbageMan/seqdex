@@ -304,38 +304,51 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	// (T_seq for the maker's claim, T_btc for ours), or the user cancels. Never a
 	// flat number of minutes (owner ruling 2026-07-25). Aborting here is clean: no
 	// asset has moved and the maker refunds at T_btc.
-	btcLegH := claimantBtcLegHeight(verifiedBtc.Height, locked.Leg.Height)
 	window := fundWindow{
 		SeqLocktime:       tSeq,
 		MinSeqClaimWindow: p.MinSeqFundWindow,
 		BtcLocktime:       tBtc,
 		MinBtcClaimWindow: p.BtcClaimMargin,
 	}
-	if err := waitSeqAnchorReachesBTCLeg(p.Ctx, ops, btcLegH+1, window, p.Timing, p.logf); err != nil {
-		sendXcFail(p.Crypter, send, "anchor_not_caught_up", "our anchor has not reached your BTC leg; asset leg not funded")
-		return res, fmt.Errorf("%w (BTC-leg height %d; nothing of ours was spent)", err, btcLegH)
-	}
-
-	// 3c. RE-VERIFY THE MAKER'S BTC LEG. The wait above is bounded by the timelock,
-	// not by a clock, so it can be long — and a BTC HTLC that was confirmed when we
-	// checked can be GONE by the time it ends: a one-block parent reorg lets the
-	// maker double-spend the input it funded with. Funding our asset against a dead
-	// BTC leg is exactly the one-sided loss this gate exists to prevent, so the full
-	// verification runs again — same txid, vout, amount, script, locktime,
-	// confirmations — immediately before LockSEQLeg. A changed height also
-	// invalidates the anchor precondition we just satisfied, so that is a refusal
-	// too (fail closed; nothing of ours has moved).
-	recheckBtc, rerr := ops.VerifyBTCLeg(hashH, p.BtcClaimKey.PubKey(), makerBtcRefundPub, script,
-		tBtc, locked.Leg.Txid, locked.Leg.Vout, locked.Leg.Amount, p.MinBTCConf)
-	if rerr != nil {
-		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg no longer verifies; asset leg not funded")
-		return res, fmt.Errorf("%w: re-verifying %s after the anchor wait: %v (nothing of ours was spent)",
-			ErrBtcLegChanged, locked.Leg.Txid, rerr)
-	}
-	if recheckBtc.Height != verifiedBtc.Height {
-		sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg moved to a different block; asset leg not funded")
-		return res, fmt.Errorf("%w: %s was at height %d, now %d (nothing of ours was spent)",
-			ErrBtcLegChanged, locked.Leg.Txid, verifiedBtc.Height, recheckBtc.Height)
+	// 3c (with 3b): ANCHOR WAIT + FULL RE-VERIFY, repeated while the leg RE-MINES.
+	// The wait is bounded by the timelock, not by a clock, so it can be long — and a
+	// BTC HTLC that was confirmed when we checked can be GONE by the time it ends: a
+	// one-block parent reorg lets the maker double-spend the input it funded with.
+	// Funding our asset against a dead BTC leg is exactly the one-sided loss this
+	// gate exists to prevent, so the full verification runs again — same txid, vout,
+	// amount, script, locktime, confirmations — immediately before LockSEQLeg, and a
+	// leg that no longer verifies is a refusal (fail closed; nothing of ours moved).
+	//
+	// A leg that merely MOVED to a different block is NOT a dead leg: the re-verify
+	// just proved the same outpoint/script/amount at its new height (a bursty parent
+	// chain re-mines the last block or two on every fork resolution). What the move
+	// invalidates is the anchor precondition, so re-run the anchor wait against the
+	// new height and verify again — see xdriver.go's twin loop for the full account.
+	btcLegH := claimantBtcLegHeight(verifiedBtc.Height, locked.Leg.Height)
+	for remines := 0; ; remines++ {
+		btcLegH = claimantBtcLegHeight(verifiedBtc.Height, locked.Leg.Height)
+		if err := waitSeqAnchorReachesBTCLeg(p.Ctx, ops, btcLegH+1, window, p.Timing, p.logf); err != nil {
+			sendXcFail(p.Crypter, send, "anchor_not_caught_up", "our anchor has not reached your BTC leg; asset leg not funded")
+			return res, fmt.Errorf("%w (BTC-leg height %d; nothing of ours was spent)", err, btcLegH)
+		}
+		recheckBtc, rerr := ops.VerifyBTCLeg(hashH, p.BtcClaimKey.PubKey(), makerBtcRefundPub, script,
+			tBtc, locked.Leg.Txid, locked.Leg.Vout, locked.Leg.Amount, p.MinBTCConf)
+		if rerr != nil {
+			sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg no longer verifies; asset leg not funded")
+			return res, fmt.Errorf("%w: re-verifying %s after the anchor wait: %v (nothing of ours was spent)",
+				ErrBtcLegChanged, locked.Leg.Txid, rerr)
+		}
+		if recheckBtc.Height == verifiedBtc.Height {
+			break
+		}
+		if remines >= 10 {
+			sendXcFail(p.Crypter, send, "btc_leg_gone", "your BTC leg keeps moving between blocks; asset leg not funded")
+			return res, fmt.Errorf("%w: %s re-mined %d times during the anchor wait, last %d -> %d (nothing of ours was spent)",
+				ErrBtcLegChanged, locked.Leg.Txid, remines+1, verifiedBtc.Height, recheckBtc.Height)
+		}
+		p.logf("maker BTC leg re-mined during the anchor wait: %s height %d -> %d (still verifies); re-running the anchor gate against the new height",
+			locked.Leg.Txid, verifiedBtc.Height, recheckBtc.Height)
+		verifiedBtc = recheckBtc
 	}
 	// 3d. The timelock re-check at the last possible moment.
 	if werr := window.check(ops); werr != nil {
