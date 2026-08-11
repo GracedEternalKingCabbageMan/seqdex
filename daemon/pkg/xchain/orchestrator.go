@@ -110,6 +110,16 @@ func NewSwapAsset(seq *Chain, assetID string, prim *HashLock) *Swap {
 	}
 }
 
+// SEQHTLCScript rebuilds the SEQ-leg HTLC redeem script for (claimPub, refundPub,
+// locktime) under this swap's hashlock. The resume path uses it to DISCOVER a
+// counterparty's funded leg on-chain when the courier announce never arrived: the
+// script is fully determined by material both sides already hold at terms time,
+// so a maker that gave up on a detached taker can still find - and claim - the
+// leg the taker actually funded.
+func (s *Swap) SEQHTLCScript(claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
+	return s.seqLeg.HTLCScript(claimPub, refundPub, locktime)
+}
+
 // LegLock records a funded HTLC leg.
 type LegLock struct {
 	Script   []byte
@@ -289,7 +299,7 @@ func (s *Swap) sizeSeqSpendFee(assetHex string, legAmount, targetNativeFee uint6
 	fee := targetNativeFee
 	if s.seq != nil {
 		if rate, ok := s.seq.FeeExchangeRate(assetHex); ok && rate > 0 {
-			const scale = 100_000_000 // 1e8; matches price_server.py / exchangerates.cpp
+			const scale = 100_000_000                       // 1e8; matches price_server.py / exchangerates.cpp
 			fee = (targetNativeFee*scale + rate - 1) / rate // ceil
 			if fee == 0 {
 				fee = 1

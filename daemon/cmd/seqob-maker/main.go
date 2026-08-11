@@ -48,7 +48,6 @@ import (
 var jsonMarshal = protojson.MarshalOptions{UseProtoNames: true}
 var jsonUnmarshal = protojson.UnmarshalOptions{DiscardUnknown: true}
 
-
 // ══ GRACEFUL SHUTDOWN: NEVER DIE MID-SWAP ════════════════════════════════════
 //
 // The maker fleet is repriced by killing the process and starting a fresh one.
@@ -245,8 +244,9 @@ func main() {
 			seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet, lnSocket: *lnSocket,
 			seqDelta: uint32(*seqDelta), subAnchor: *subAnchor, onchainCltv: uint32(*onchainCltv),
 			spendFee: *spendFee, max0conf: *max0conf,
-			reverse: strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
-			requote: *requote,
+			reverse:  strings.ToLower(*side) == "sell", // sell = maker-secret REVERSE; buy = NORMAL
+			requote:  *requote,
+			stateDir: *xstateDir,
 		})
 		return
 	}
@@ -884,6 +884,34 @@ func resumeParamsFromStateReverse(st *xmakerSessionState, btcChain *xchain.Bitco
 			Script:   seqScript,
 			Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
 			Locktime: st.SeqLocktime,
+		}
+	}
+	// ON-CHAIN DISCOVERY of an announced-never leg. The taker's SeqLegFunded announce
+	// rides the courier only, and a maker that gave up on a detached taker ("no seq
+	// leg from the taker") used to be the END of the settle path even though the
+	// taker HAD funded — its asset sat waiting for a claim that never came while the
+	// maker's BTC refunded (both sides watched two live legs die of a lost message;
+	// two such sessions were repaired by hand on 2026-08-11). The script is fully
+	// determined by material the maker persisted at terms time (H via the secret,
+	// its claim key, the taker's refund pub, T_seq), so when no leg was recorded,
+	// rebuild the script and scan the UTXO set for it.
+	if rp.SeqLeg == nil && st.TakerSeqRefundPub != "" && st.SeqLocktime > 0 && rp.SeqClaimKey != nil {
+		if refundPub, rerr := hex.DecodeString(st.TakerSeqRefundPub); rerr == nil && len(refundPub) == 33 {
+			if script, serr := rp.Ops.(*client.LiveXcOps).Swap.SEQHTLCScript(rp.SeqClaimKey.PubKey(), refundPub, st.SeqLocktime); serr == nil {
+				if utxo, ferr := seqChain.FindHTLCUTXO(script); ferr == nil && utxo != nil {
+					bh, _ := seqChain.BlockHashOfTx(utxo.TxID)
+					fmt.Printf("session %s: reverse resume: DISCOVERED the taker's asset leg on-chain (%s:%d, %d atoms) — the courier announce never arrived; claiming from the persisted terms\n",
+						sid, utxo.TxID, utxo.Vout, utxo.Amount)
+					rp.SeqLeg = &xchain.LegLock{Script: script, Funded: utxo, Locktime: st.SeqLocktime}
+					rp.SeqBlockHash = bh
+					if rp.AssetHex == "" {
+						rp.AssetHex = utxo.AssetID
+					}
+					if rp.SeqAmount == 0 {
+						rp.SeqAmount = utxo.Amount
+					}
+				}
+			}
 		}
 	}
 	return rp, nil
@@ -1553,6 +1581,7 @@ type xmakerSessionState struct {
 	SeqLegAsset        string `json:"seq_leg_asset,omitempty"`
 	SeqLegScriptHex    string `json:"seq_leg_script_hex,omitempty"`
 	SeqBlockHash       string `json:"seq_block_hash,omitempty"`
+	TakerSeqRefundPub  string `json:"taker_seq_refund_pub,omitempty"` // reverse: rebuilds the taker's asset-leg script for on-chain discovery
 	SecretHex          string `json:"secret_hex,omitempty"`
 	BtcClaimTxid       string `json:"btc_claim_txid,omitempty"` // forward: maker claimed the taker's BTC
 	SeqRefundTx        string `json:"seq_refund_tx,omitempty"`  // forward: maker refunded its SEQ leg
@@ -1625,11 +1654,65 @@ func persistXSessionReverse(dir, sid, offerID string, r *client.MakerReverseResu
 	}
 	if r.BtcRefundKey != nil {
 		st.BtcRefundPrivHex = hex.EncodeToString(r.BtcRefundKey.Bytes())
+		if len(r.TakerSeqRefundPub) == 33 {
+			// Received in the very first TermsRequest. With it persisted, the taker's
+			// asset-leg script is reconstructable and the resume can DISCOVER a funded
+			// leg whose courier announce never arrived (see resumeParamsFromStateReverse).
+			st.TakerSeqRefundPub = hex.EncodeToString(r.TakerSeqRefundPub)
+		}
 	}
 	if r.BtcLeg != nil && r.BtcLeg.Funded != nil {
 		st.BtcLegTxid, st.BtcLegVout, st.BtcLegAmount = r.BtcLeg.Funded.TxID, r.BtcLeg.Funded.Vout, r.BtcLeg.Funded.Amount
 		st.BtcLegScriptHex = hex.EncodeToString(r.BtcLeg.Script)
 	}
+	if r.SeqLeg != nil && r.SeqLeg.Funded != nil {
+		st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = r.SeqLeg.Funded.TxID, r.SeqLeg.Funded.Vout, r.SeqLeg.Funded.Amount
+		st.SeqLegAsset = r.SeqLeg.Funded.AssetID
+		st.SeqLegScriptHex = hex.EncodeToString(r.SeqLeg.Script)
+	}
+	b, err := json.MarshalIndent(&st, "", "  ")
+	if err != nil {
+		fmt.Printf("session %s: persist marshal: %v\n", sid, err)
+		return
+	}
+	if err := ioutil.WriteFile(filepath.Join(dir, sid+".json"), b, 0o600); err != nil {
+		fmt.Printf("session %s: persist write: %v\n", sid, err)
+	}
+}
+
+// persistXSessionSubmarine writes a NORMAL submarine maker lift's recovery material.
+// The submarine rail ran with NO session persistence at all: a killed maker lost its
+// per-lift claim key, so a taker HTLC funded against it became unspendable by anyone
+// (the 2026-08-11 burn). The state mirrors the cross rails' files (same directory,
+// direction "submarine"); the resume loop skips unknown directions, so these files
+// are recovery material first and an automated-resume input second.
+func persistXSessionSubmarine(dir, sid, offerID string, r *client.MakerSubmarineResult) {
+	if dir == "" {
+		dir = "xmaker-sessions"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Printf("session %s: persist mkdir: %v\n", sid, err)
+		return
+	}
+	st := xmakerSessionState{
+		SessionID: sid, OfferID: offerID, Direction: "submarine",
+		SeqLocktime: r.SeqLocktime,
+		Settled:     r.Settled,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(r.HashH) > 0 {
+		st.HashHex = hex.EncodeToString(r.HashH)
+	}
+	if r.SeqClaimKey != nil {
+		st.SeqClaimPrivHex = hex.EncodeToString(r.SeqClaimKey.Bytes())
+	}
+	if len(r.TakerSeqRefundPub) == 33 {
+		st.TakerSeqRefundPub = hex.EncodeToString(r.TakerSeqRefundPub)
+	}
+	if len(r.Preimage) > 0 {
+		st.SecretHex = hex.EncodeToString(r.Preimage)
+	}
+	st.SeqClaimTxid = r.SeqClaimTxid
 	if r.SeqLeg != nil && r.SeqLeg.Funded != nil {
 		st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = r.SeqLeg.Funded.TxID, r.SeqLeg.Funded.Vout, r.SeqLeg.Funded.Amount
 		st.SeqLegAsset = r.SeqLeg.Funded.AssetID

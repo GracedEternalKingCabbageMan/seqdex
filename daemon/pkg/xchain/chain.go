@@ -86,6 +86,39 @@ type FundedHTLC struct {
 	AssetID string
 }
 
+// FindHTLCUTXO scans the confirmed UTXO set for an unspent output paying the
+// P2SH of `redeemScript` (scantxoutset: no wallet import, no address watching).
+// The resume uses it to DISCOVER a counterparty leg that was funded on-chain but
+// never announced over the courier (taker detached; maker already gave up).
+// Returns (nil, nil) when the scan completes and finds nothing.
+func (c *Chain) FindHTLCUTXO(redeemScript []byte) (*FundedHTLC, error) {
+	p2sh, err := c.P2SHAddress(redeemScript)
+	if err != nil {
+		return nil, err
+	}
+	var scan struct {
+		Success  bool `json:"success"`
+		Unspents []struct {
+			TxID   string  `json:"txid"`
+			Vout   uint32  `json:"vout"`
+			Amount float64 `json:"amount"`
+			Asset  string  `json:"asset"`
+		} `json:"unspents"`
+	}
+	if err := c.rpc.Call(&scan, "scantxoutset", "start", []interface{}{"addr(" + p2sh + ")"}); err != nil {
+		return nil, err
+	}
+	if !scan.Success {
+		return nil, fmt.Errorf("scantxoutset did not complete")
+	}
+	if len(scan.Unspents) == 0 {
+		return nil, nil
+	}
+	u := scan.Unspents[0]
+	return &FundedHTLC{TxID: u.TxID, Vout: u.Vout,
+		Amount: uint64(math.Round(u.Amount * 1e8)), AssetID: u.Asset}, nil
+}
+
 // LockHTLC pays `amountCoins` (a decimal string, e.g. "10") of the given asset
 // to the HTLC's P2SH address and returns the funded outpoint. assetLabel may be
 // "" to pay the chain's default (pegged "bitcoin") asset — that is how the BTC

@@ -573,15 +573,22 @@ type MakerReverseResult struct {
 	HashH        []byte
 	SeqClaimKey  *xchain.Key // claims the taker's asset leg (reveals the secret)
 	BtcRefundKey *xchain.Key // refunds our BTC leg after T_btc
-	BtcLocktime  uint32
-	SeqLocktime  uint32
-	BtcLeg       *xchain.LegLock // our funded BTC leg
-	BtcLegHeight int64
-	SeqLeg       *xchain.LegLock // the taker's verified asset leg
-	SeqBlockHash string
-	SeqClaimTxid string
-	BtcRefundTx  string
-	Settled      bool
+	// TakerSeqRefundPub is the taker's asset-refund pubkey, received in the very
+	// first TermsRequest. Persisting it makes the taker's asset-leg redeem script
+	// reconstructable WITHOUT the (courier-only) SeqLegFunded announce - which is
+	// what lets the resume DISCOVER an announced-never leg on-chain and claim it,
+	// instead of the maker's BTC refunding while the taker's funded asset sits
+	// waiting for a message that will never arrive.
+	TakerSeqRefundPub []byte
+	BtcLocktime       uint32
+	SeqLocktime       uint32
+	BtcLeg            *xchain.LegLock // our funded BTC leg
+	BtcLegHeight      int64
+	SeqLeg            *xchain.LegLock // the taker's verified asset leg
+	SeqBlockHash      string
+	SeqClaimTxid      string
+	BtcRefundTx       string
+	Settled           bool
 	// FilledSeq / FilledBtc are the asset atoms the maker BUYS and the BTC sats it
 	// PAYS for this lift (== the offer for a whole lift; a smaller slice + its
 	// proportional BTC for a partial). The serve loop re-rests the remainder.
@@ -665,6 +672,7 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		sendXcFail(p.Crypter, send, "bad_pubkey", "taker_seq_refund_pub required for a reverse lift")
 		return res, errors.New("bad taker_seq_refund_pub")
 	}
+	res.TakerSeqRefundPub = takerSeqRefundPub
 	takerBtcClaimPub, err := hex.DecodeString(req.TakerBtcClaimPub)
 	if err != nil || len(takerBtcClaimPub) != 33 {
 		sendXcFail(p.Crypter, send, "bad_pubkey", "taker_btc_claim_pub required for a reverse lift")
