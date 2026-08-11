@@ -50,6 +50,7 @@ type submarineMakerConfig struct {
 	max0conf    uint64 // 0-conf LP-fronting cap (asset atoms): trades <= it settle instantly
 	reverse     bool   // true = SELL the asset for BTC-LN (maker-secret REVERSE); false = BUY (NORMAL)
 	requote     bool   // true = re-post a fresh offer after each settled fill instead of exiting
+	stateDir    string // per-lift session persistence (keys/legs; the recovery material)
 }
 
 // buildSubmarineOffer builds a Lightning offer (base=asset, quote=the BTC
@@ -354,6 +355,12 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					Max0ConfAmount:   cfg.max0conf,
 					SpendFeeAtoms:    cfg.spendFee,
 					Log:              logf,
+					// Persist at every value transition. Without this a requote-killed
+					// submarine maker took its per-lift claim key to the grave and a
+					// funded taker leg became permanently unspendable (2026-08-11).
+					OnUpdate: func(r *client.MakerSubmarineResult) {
+						persistXSessionSubmarine(cfg.stateDir, sid, cfg.offerID, r)
+					},
 				}
 				res, err := client.RunMakerSubmarineNormal(p, in, send)
 				if err != nil {
