@@ -164,7 +164,7 @@ func main() {
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
 	// from persisted per-session keys. Handle it before the key/offer setup.
 	if strings.ToLower(*mode) == "cross" && *resume {
-		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee, *btcFeeRate)
+		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee, *btcFeeRate, *lnSocket)
 		return
 	}
 
@@ -646,7 +646,7 @@ func crossReRestRemainder(base, filledSeq, minFill uint64) (remainder uint64, re
 // after the CLTV). This is the 2f recovery path — a mid-swap crash or courier
 // timeout no longer strands the maker's asset leg. FORWARD sessions only for
 // now (the direction served today); reverse resume lands with reverse serving.
-func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64, btcFeeRate float64) {
+func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64, btcFeeRate float64, lnSocket string) {
 	if btcRPCURL == "" || seqRPCURL == "" {
 		fatal("-resume requires -btc-rpc and -xseq-rpc")
 	}
@@ -665,7 +665,7 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 	btcChain := xchain.NewBitcoinChain(btcRPC, btcWallet, params)
 	btcChain.SetFeeRate(btcFeeRate)
 	seqChain := xchain.NewChain(seqRPC, seqWallet)
-	drivePendingCrossSessions(dir, btcChain, seqChain, spendFee)
+	drivePendingCrossSessions(dir, btcChain, seqChain, spendFee, lnSocket)
 }
 
 // drivePendingCrossSessions scans dir for non-terminal cross sessions and re-drives each to settlement
@@ -674,7 +674,7 @@ func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seq
 // supervised restart no longer strands a pending session (whose asset HTLC otherwise never gets claimed and
 // the counterparty never learns P). Non-fatal: an unreadable dir/record is logged and skipped, never killing
 // the caller — the live serving maker depends on that.
-func drivePendingCrossSessions(dir string, btcChain *xchain.BitcoinChain, seqChain *xchain.Chain, spendFee uint64) {
+func drivePendingCrossSessions(dir string, btcChain *xchain.BitcoinChain, seqChain *xchain.Chain, spendFee uint64, lnSocket string) {
 	entries, err := ioutil.ReadDir(dir)
 	if err != nil {
 		fmt.Printf("resume: read -xstate-dir %s: %v (nothing to resume)\n", dir, err)
@@ -707,6 +707,21 @@ func drivePendingCrossSessions(dir string, btcChain *xchain.BitcoinChain, seqCha
 		}
 		if st.Settled || st.SeqRefundTx != "" || st.BtcRefundTx != "" {
 			fmt.Printf("%s: already terminal (settled=%v seqrefund=%s btcrefund=%s); skipping\n", name, st.Settled, st.SeqRefundTx, st.BtcRefundTx)
+			continue
+		}
+		if st.Direction == "submarine" {
+			// A submarine maker's lift, persisted at terms/leg/pay time. Everything here is
+			// recovery: claim with the persisted P if the pay landed but the claim did not;
+			// re-run the full verify->anchor-gate->pay->claim when the leg is known, the
+			// invoice is persisted and an LN socket was provided (CLN pay is idempotent by
+			// payment_hash, so a re-pay of an already-paid invoice just returns P); and
+			// DISCOVER an announced leg the maker process never recorded, script-first,
+			// exactly like the reverse discovery above it in this file.
+			wg.Add(1)
+			go func(name string, st xmakerSessionState) {
+				defer wg.Done()
+				resumeSubmarineSession(&st, seqChain, lnSocket, spendFee, dir, name)
+			}(name, st)
 			continue
 		}
 		if st.Direction == "reverse" {
@@ -1582,6 +1597,8 @@ type xmakerSessionState struct {
 	SeqLegScriptHex    string `json:"seq_leg_script_hex,omitempty"`
 	SeqBlockHash       string `json:"seq_block_hash,omitempty"`
 	TakerSeqRefundPub  string `json:"taker_seq_refund_pub,omitempty"` // reverse: rebuilds the taker's asset-leg script for on-chain discovery
+	Bolt11             string `json:"bolt11,omitempty"`               // submarine: the taker's invoice (pay -> learn P) for a full resume
+	InvoiceMsat        uint64 `json:"invoice_msat,omitempty"`         // submarine: the agreed invoice amount
 	SecretHex          string `json:"secret_hex,omitempty"`
 	BtcClaimTxid       string `json:"btc_claim_txid,omitempty"` // forward: maker claimed the taker's BTC
 	SeqRefundTx        string `json:"seq_refund_tx,omitempty"`  // forward: maker refunded its SEQ leg
@@ -1712,6 +1729,8 @@ func persistXSessionSubmarine(dir, sid, offerID string, r *client.MakerSubmarine
 	if len(r.Preimage) > 0 {
 		st.SecretHex = hex.EncodeToString(r.Preimage)
 	}
+	st.Bolt11 = r.Bolt11
+	st.InvoiceMsat = r.InvoiceMsat
 	st.SeqClaimTxid = r.SeqClaimTxid
 	if r.SeqLeg != nil && r.SeqLeg.Funded != nil {
 		st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = r.SeqLeg.Funded.TxID, r.SeqLeg.Funded.Vout, r.SeqLeg.Funded.Amount
@@ -1726,6 +1745,143 @@ func persistXSessionSubmarine(dir, sid, offerID string, r *client.MakerSubmarine
 	if err := ioutil.WriteFile(filepath.Join(dir, sid+".json"), b, 0o600); err != nil {
 		fmt.Printf("session %s: persist write: %v\n", sid, err)
 	}
+}
+
+// resumeSubmarineSession recovers a persisted NORMAL submarine maker lift.
+// Tiers, safest first:
+//   - P persisted (paid, crashed before the claim): verify the leg, inject P, CLAIM.
+//     Chain-only; no Lightning needed.
+//   - leg + bolt11 persisted, no P, an -ln-socket given: re-run the full settle
+//     (verify -> anchor gate -> pay -> claim). CLN pay is idempotent by payment_hash,
+//     so re-paying an already-paid invoice returns the existing P.
+//   - leg absent but the taker refund pub persisted: rebuild the script and DISCOVER
+//     the funded leg in the UTXO set (the courier announce died before the maker
+//     recorded it), then fall into one of the tiers above on the next pass.
+//
+// A session with none of that is left alone: the taker's asset refunds itself to the
+// taker at T_seq and nothing of the maker's is at risk.
+func resumeSubmarineSession(st *xmakerSessionState, seqChain *xchain.Chain, lnSocket string, spendFee uint64, dir, name string) {
+	hashH, err := hex.DecodeString(st.HashHex)
+	if err != nil || len(hashH) != 32 {
+		fmt.Printf("%s: submarine session with no usable hash; skipping\n", name)
+		return
+	}
+	claimBytes, err := hex.DecodeString(st.SeqClaimPrivHex)
+	if err != nil {
+		fmt.Printf("%s: submarine session with no claim key; skipping\n", name)
+		return
+	}
+	claimKey := xchain.KeyFromBytes(claimBytes)
+	if claimKey == nil {
+		fmt.Printf("%s: submarine session claim key invalid; skipping\n", name)
+		return
+	}
+	var ln xchain.LNLeg
+	if lnSocket != "" {
+		ln = xchain.NewCLNLNLeg(lnSocket)
+	}
+	sub := xchain.NewSubmarineSwap(seqChain, ln, xchain.NewHashLockFromHash(hashH))
+
+	// Discovery: the leg was funded but never recorded (announce lost). The script is
+	// fully determined by persisted material once the taker refund pub is known.
+	if st.SeqLegTxid == "" && st.TakerSeqRefundPub != "" && st.SeqLocktime > 0 {
+		if refundPub, rerr := hex.DecodeString(st.TakerSeqRefundPub); rerr == nil && len(refundPub) == 33 {
+			if script, serr := sub.SEQHTLCScript(claimKey.PubKey(), refundPub, st.SeqLocktime); serr == nil {
+				if utxo, ferr := seqChain.FindHTLCUTXO(script); ferr == nil && utxo != nil {
+					fmt.Printf("%s: submarine resume: DISCOVERED the taker's asset leg on-chain (%s:%d, %d atoms)\n",
+						name, utxo.TxID, utxo.Vout, utxo.Amount)
+					st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = utxo.TxID, utxo.Vout, utxo.Amount
+					st.SeqLegAsset = utxo.AssetID
+					st.SeqLegScriptHex = hex.EncodeToString(script)
+				}
+			}
+		}
+	}
+	if st.SeqLegTxid == "" || st.SeqLegScriptHex == "" {
+		fmt.Printf("%s: submarine resume: no funded taker leg known (pre-announce session); the taker refunds itself at T_seq %d\n", name, st.SeqLocktime)
+		return
+	}
+	script, err := hex.DecodeString(st.SeqLegScriptHex)
+	if err != nil {
+		fmt.Printf("%s: submarine resume: bad seq_leg_script_hex; skipping\n", name)
+		return
+	}
+	refundPub, err := hex.DecodeString(st.TakerSeqRefundPub)
+	if err != nil || len(refundPub) != 33 {
+		fmt.Printf("%s: submarine resume: no taker refund pub to verify the script against; skipping\n", name)
+		return
+	}
+	persist := func(preimage []byte, claimTx string, settled bool) {
+		r := &client.MakerSubmarineResult{HashH: hashH, SeqClaimKey: claimKey, SeqLocktime: st.SeqLocktime,
+			Preimage: preimage, SeqClaimTxid: claimTx, Settled: settled,
+			TakerSeqRefundPub: refundPub, Bolt11: st.Bolt11, InvoiceMsat: st.InvoiceMsat, AssetHex: st.SeqLegAsset,
+			SeqLeg: &xchain.LegLock{Script: script,
+				Funded:   &xchain.FundedHTLC{TxID: st.SeqLegTxid, Vout: st.SeqLegVout, Amount: st.SeqLegAmount, AssetID: st.SeqLegAsset},
+				Locktime: st.SeqLocktime}}
+		persistXSessionSubmarine(dir, st.SessionID, st.OfferID, r)
+	}
+	// Persist any discovery immediately, even if the claim below fails.
+	persist(mustHexOrNil(st.SecretHex), st.SeqClaimTxid, false)
+
+	if st.SecretHex != "" {
+		// Tier 1: paid, crashed before the claim - chain-only recovery.
+		preimage, perr := hex.DecodeString(st.SecretHex)
+		if perr != nil || len(preimage) != 32 {
+			fmt.Printf("%s: submarine resume: bad persisted preimage; skipping\n", name)
+			return
+		}
+		vseq, verr := sub.VerifySEQLeg(hashH, claimKey.PubKey(), refundPub, script,
+			st.SeqLocktime, st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount, st.SeqLegAsset, 1)
+		if verr != nil {
+			fmt.Printf("%s: submarine resume: leg no longer verifies (likely already claimed): %v\n", name, verr)
+			return
+		}
+		if ierr := sub.InjectSecret(preimage); ierr != nil {
+			fmt.Printf("%s: submarine resume: inject secret: %v\n", name, ierr)
+			return
+		}
+		claimTx, cerr := sub.ClaimSEQLeg(vseq.Leg, claimKey, spendFee)
+		if cerr != nil {
+			fmt.Printf("%s: submarine resume: claim (RETRYABLE, we hold P): %v\n", name, cerr)
+			return
+		}
+		fmt.Printf("%s: SUBMARINE RESUMED + SETTLED: claimed the asset in %s\n", name, claimTx)
+		persist(preimage, claimTx, true)
+		return
+	}
+	if st.Bolt11 != "" && ln != nil {
+		// Tier 2: leg funded, invoice persisted, never paid - re-run the full settle.
+		fmt.Printf("%s: submarine resume: re-running verify -> anchor gate -> pay -> claim\n", name)
+		nr, rerr := sub.RunNormal(xchain.NormalParams{
+			HashH: hashH, MakerSeqClaimPub: claimKey.PubKey(), TakerSeqRefundPub: refundPub,
+			SeqRedeemScript: script, SeqLocktime: st.SeqLocktime,
+			SeqTxID: st.SeqLegTxid, SeqVout: st.SeqLegVout, SeqAmountAtoms: st.SeqLegAmount, SeqAssetID: st.SeqLegAsset,
+			SeqMinConf: 1, Bolt11: st.Bolt11, InvoiceMsat: st.InvoiceMsat,
+			MinAnchorDepth: 3, AnchorTimeout: 20 * time.Minute,
+		}, claimKey, spendFee)
+		if nr != nil && len(nr.Preimage) > 0 {
+			persist(nr.Preimage, nr.SeqClaimTxID, rerr == nil)
+		}
+		if rerr != nil {
+			fmt.Printf("%s: submarine resume: settle: %v\n", name, rerr)
+			return
+		}
+		fmt.Printf("%s: SUBMARINE RESUMED + SETTLED: paid the invoice, claimed the asset in %s\n", name, nr.SeqClaimTxID)
+		return
+	}
+	fmt.Printf("%s: submarine resume: leg known but no preimage and no -ln-socket to pay with; the taker refunds itself at T_seq %d\n", name, st.SeqLocktime)
+}
+
+// mustHexOrNil decodes hex or returns nil - persistence-path convenience only.
+func mustHexOrNil(h string) []byte {
+	if h == "" {
+		return nil
+	}
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // reportSettledTrade tells the relay a CROSS-CHAIN / LIGHTNING lift SETTLED, so the relay
