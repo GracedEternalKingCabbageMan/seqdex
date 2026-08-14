@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -47,9 +48,23 @@ func (s *PureLNSwap) AssetLegNodeID() (string, error) { return s.assetLeg.NodeID
 func takerPrepare(incoming LNLeg, p []byte, inAmtMsat uint64) (invoice string, h []byte, err error) {
 	sum := sha256.Sum256(p)
 	label := "pureln-" + hex.EncodeToString(sum[:6])
-	inv, err := incoming.CreateInvoice(p, inAmtMsat, 0, label, "pure-ln swap: taker incoming")
-	if err != nil {
-		return "", nil, fmt.Errorf("taker create invoice: %w", err)
+	// A just-booted node answers RPC before its channels finish re-establishing,
+	// and an invoice with route hints fails until they do (CLN error 902, "None
+	// of those hints were suitable local channels" — seen live 91 seconds after
+	// a boot, killing the swap before any HTLC existed). The race is transient
+	// by construction, so wait it out instead of aborting.
+	var inv string
+	var err2 error
+	for deadline := time.Now().Add(2 * time.Minute); ; {
+		inv, err2 = incoming.CreateInvoice(p, inAmtMsat, 0, label, "pure-ln swap: taker incoming")
+		if err2 == nil {
+			break
+		}
+		msg := err2.Error()
+		if !(strings.Contains(msg, "hints were suitable") || strings.Contains(msg, "902")) || time.Now().After(deadline) {
+			return "", nil, fmt.Errorf("taker create invoice: %w", err2)
+		}
+		time.Sleep(5 * time.Second)
 	}
 	return inv, sum[:], nil
 }
