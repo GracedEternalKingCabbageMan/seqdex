@@ -441,7 +441,11 @@ func (l *clnLNLeg) WaitHeld(paymentHash []byte, timeout time.Duration) (uint64, 
 		if time.Now().After(deadline) {
 			return 0, fmt.Errorf("%w: hold invoice not accepted within %s (last err: %v)", ErrLNLegTimeout, timeout, err)
 		}
-		time.Sleep(2 * time.Second)
+		// Hot path: the taker's HTLC lands within ~a commitment round trip of
+		// the terms exchange, and this poll sat between the two legs of every
+		// swap — a 2s interval alone put seconds on the clock. The lookup is a
+		// local unix-socket RPC; poll tight.
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
