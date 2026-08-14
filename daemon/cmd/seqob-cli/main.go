@@ -474,8 +474,10 @@ func loadOrGenKey(hexKey string) *btcec.PrivateKey {
 		if err != nil {
 			fatal("gen key: %v", err)
 		}
-		fmt.Printf("generated key: priv=%s pub=%s\n",
-			hex.EncodeToString(k.Serialize()), hex.EncodeToString(k.PubKey().SerializeCompressed()))
+		// The pub identifies the session in logs; the priv is announced to NOBODY —
+		// this line's tail used to ride a failed swap's error text all the way to
+		// the user's wallet.
+		fmt.Printf("generated key: pub=%s\n", hex.EncodeToString(k.PubKey().SerializeCompressed()))
 		return k
 	}
 	b, err := hex.DecodeString(hexKey)
