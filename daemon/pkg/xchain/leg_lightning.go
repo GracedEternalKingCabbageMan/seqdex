@@ -505,7 +505,21 @@ func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry 
 		PaymentHash string `json:"payment_hash"`
 	}
 	if err := l.rpc.call(&res, "invoice", params); err != nil {
-		return "", fmt.Errorf("invoice: %w", err)
+		// The explicit exposeprivatechannels list gets STRICTER validation than
+		// CLN's own hint selection: on a leaf node whose only channels are
+		// private, CLN rejects the whole list ("None of those hints were
+		// suitable local channels", error 902) even when a NORMAL, connected,
+		// sufficient-capacity channel is on it — seen live on a hosted per-user
+		// node, killing the swap before any HTLC existed. CLN's default
+		// selection only WARNS when it cannot hint, so retry without the list.
+		_, had := params["exposeprivatechannels"]
+		if !had || !strings.Contains(err.Error(), "hints were suitable") {
+			return "", fmt.Errorf("invoice: %w", err)
+		}
+		delete(params, "exposeprivatechannels")
+		if err2 := l.rpc.call(&res, "invoice", params); err2 != nil {
+			return "", fmt.Errorf("invoice: %w", err2)
+		}
 	}
 	// The created invoice's hash MUST equal SHA256(P) — otherwise the SEQ leg
 	// (gated on the same H) and the LN leg would not be bound by one secret.
