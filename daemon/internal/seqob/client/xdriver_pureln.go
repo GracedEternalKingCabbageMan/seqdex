@@ -279,6 +279,14 @@ type TakerPlnResult struct {
 // an invoice on a fresh P for its incoming leg, hand the maker H + the invoice,
 // then pay the maker's hold by bare hash (blocks until the maker settles).
 func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult, error) {
+	// Stage stopwatch: every latency hunt so far has been blind guessing over a
+	// single opaque duration; these lines make the swap's time attributable.
+	start := time.Now()
+	stage := func(name string) {
+		if p.Log != nil {
+			p.Log("STAGE %s +%dms", name, time.Since(start).Milliseconds())
+		}
+	}
 	p.Timing.setDefaults()
 	if p.Ops == nil || p.Crypter == nil {
 		return nil, fmt.Errorf("pureln taker: Ops and Crypter are required")
@@ -318,10 +326,12 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 	if err := sendXc(&XcMsg{Type: XcPlnTermsRequest, SeqAmount: takeSeq}, p.Crypter, send); err != nil {
 		return nil, err
 	}
+	stage("terms-requested")
 	terms, err := recvXcType(recv, p.Crypter, XcPlnTerms, p.Timing.TermsWait)
 	if err != nil {
 		return nil, err
 	}
+	stage("terms")
 	if terms.MakerLNNodeID == "" {
 		return nil, fmt.Errorf("pureln taker: maker advertised no hold-leg node id")
 	}
@@ -349,12 +359,14 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 		sendXcFail(p.Crypter, send, "invoice", err.Error())
 		return nil, fmt.Errorf("prepare invoice: %w", err)
 	}
+	stage("invoice-prepared")
 	if err := sendXc(&XcMsg{Type: XcPlnAssetInvoice, HashH: hex.EncodeToString(hashH), Bolt11: invoice}, p.Crypter, send); err != nil {
 		return nil, err
 	}
 	if _, err := recvXcType(recv, p.Crypter, XcPlnHoldReady, p.Timing.SeqLockWait); err != nil {
 		return nil, err
 	}
+	stage("hold-ready")
 
 	// Pay the maker's hold by bare hash; blocks until the maker settles.
 	// Emit H at the moment we commit funds so a caller that is killed mid-pay (e.g. an LSP whose
@@ -368,6 +380,7 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 		sendXcFail(p.Crypter, send, "pay_hold", err.Error())
 		return nil, fmt.Errorf("pay hold: %w", err)
 	}
+	stage("hold-settled")
 	// The maker settled with our own P; sanity-check the reveal.
 	want := sha256.Sum256(pre)
 	if hex.EncodeToString(revealed) != hex.EncodeToString(pre) || hex.EncodeToString(hashH) != hex.EncodeToString(want[:]) {
