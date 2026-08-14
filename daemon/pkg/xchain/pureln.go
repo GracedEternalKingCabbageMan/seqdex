@@ -84,18 +84,25 @@ func makerRegisterHold(incoming LNLeg, h []byte, inAmtMsat uint64) error {
 // P. On any failure before the settle it cancels the hold (the taker's incoming
 // is refunded and neither leg completes). Returns the preimage.
 func makerFulfill(incoming, outgoing LNLeg, h []byte, outInvoice string, outAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
+	// Maker-side stage stopwatch (stdout): splits the taker's opaque PayHold
+	// wait into held / paid / settled so the latency is attributable.
+	start := time.Now()
+	mstage := func(name string) { fmt.Printf("MSTAGE %s +%dms\n", name, time.Since(start).Milliseconds()) }
 	if _, err = incoming.WaitHeld(h, holdTimeout); err != nil {
 		_ = incoming.CancelHold(h)
 		return nil, fmt.Errorf("wait held: %w", err)
 	}
+	mstage("held")
 	p, err := outgoing.Pay(outInvoice, h, outAmtMsat)
 	if err != nil {
 		_ = incoming.CancelHold(h) // refund: nothing was delivered
 		return nil, fmt.Errorf("pay outgoing leg: %w", err)
 	}
+	mstage("paid")
 	if err := incoming.SettleHold(h, p); err != nil {
 		return nil, fmt.Errorf("settle hold (outgoing already paid!): %w", err)
 	}
+	mstage("settled")
 	return p, nil
 }
 
