@@ -64,7 +64,7 @@ func takerPrepare(incoming LNLeg, p []byte, inAmtMsat uint64) (invoice string, h
 		if !(strings.Contains(msg, "hints were suitable") || strings.Contains(msg, "902")) || time.Now().After(deadline) {
 			return "", nil, fmt.Errorf("taker create invoice: %w", err2)
 		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(time.Second)
 	}
 	return inv, sum[:], nil
 }
