@@ -1,5 +1,5 @@
 // Package covenant is the Go port of the proven SeqOB FILL/REFUND covenant
-// primitive (test/functional/seqob_covenant.py in the SequentiaByClaude tree,
+// primitive (test/functional/seqob_covenant.py in the Sequentia tree,
 // proven byte-for-byte by feature_seqob_covenant_fill.py's 11 scenarios).
 //
 // A maker locks N units of explicit asset A in ONE taproot UTXO ("the order is

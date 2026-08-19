@@ -6,7 +6,7 @@ import (
 )
 
 // Golden vector generated from the PROVEN Python builders
-// (test/functional/seqob_covenant.py in the SequentiaByClaude tree), on the
+// (test/functional/seqob_covenant.py in the Sequentia tree), on the
 // fixed inputs below. This pins the Go production covenant module byte-for-byte
 // to the audited artifact that feature_seqob_covenant_fill.py exercises with 11
 // consensus scenarios: if this test passes, the FILL/REFUND leaf bytes, the
