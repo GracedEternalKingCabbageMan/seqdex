@@ -227,7 +227,12 @@ wallet/                Sequentia wallet daemon (thin fork of Ocean); tdexd and
 proto/                 Standalone phase-1 copy of the seqdex.v1 + ocean.v1
                        contracts with local buf codegen (predates the seqob.v1
                        and xchain additions; daemon/api-spec is current).
-docs/                  ARCHITECTURE.md (design as built) and DEV.md (local runs).
+docs/                  Design and handover notes: ARCHITECTURE.md (design as
+                       built), DEV.md (local runs), the order-book and terminal
+                       specs, the covenant-offer design, the rail-crossing and
+                       Lightning-latency notes.
+test/regtest/          Consensus-level proofs of the covenant order book, run
+                       against a real Sequentia node (see its README).
 ```
 
 Component docs: [daemon/README.md](daemon/README.md),
