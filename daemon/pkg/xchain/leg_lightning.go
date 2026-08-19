@@ -13,7 +13,7 @@ import (
 )
 
 // This file adds the LIGHTNING leg used by SeqLN Phase 2 submarine swaps
-// (SequentiaByClaude/doc/sequentia/seqln-phase2-submarine-swaps.md). In a
+// (Sequentia/doc/sequentia/seqln-phase2-submarine-swaps.md). In a
 // submarine swap the BTC leg is not an on-chain HTLC (btcBackend) but a Bitcoin
 // Lightning payment bound to the SEQ on-chain HTLC by the SAME SHA256 preimage.
 // The SEQ leg and the anchor-depth gate (VerifySeqLegSafe) are unchanged.

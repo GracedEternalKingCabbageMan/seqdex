@@ -8,7 +8,7 @@ import (
 // SubmarineSwap orchestrates a SeqLN Phase 2 submarine swap: a Sequentia asset
 // ON-CHAIN leg <-> BTC over VANILLA Lightning, bound by one shared SHA256
 // preimage (Case A; design in
-// SequentiaByClaude/doc/sequentia/seqln-phase2-submarine-swaps.md).
+// Sequentia/doc/sequentia/seqln-phase2-submarine-swaps.md).
 //
 // It REUSES the on-chain SEQ leg unchanged: it embeds *Swap purely for its
 // SEQ-leg operations (VerifySEQLeg / LockSEQLeg / ClaimSEQLeg / RefundSEQLeg /
