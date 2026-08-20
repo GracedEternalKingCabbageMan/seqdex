@@ -93,7 +93,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `seqob-cli <command> [flags]
 
 commands:
-  post    post a signed offer        (flags: -relay -priv -base -quote -dir -base-amount -quote-amount -expiry -fee-asset -recv-addr -id)
+  post    post a signed offer        (flags: -relay -priv -base -quote -dir -base-amount -quote-amount -expiry -fee-asset -recv-addr -id
+          -confidential -blinding-pub          blinded-book offer: blech32 -recv-addr + maker blinding pubkey, same-chain co-sign rail
+          -ln-direction -ln-node -ln-cltv      Lightning offer: ln_direction 0-5 (2/3 = pure-LN), maker LN node pubkey)
   book    list a market's order book (flags: -relay -base -quote)
   lift    lift a resting offer       (flags: -relay -base -quote -offer-id -maker-pubkey -amount -priv -fee-asset)
   covfill fill a resting passive-CLOB COVENANT order: one atomic wallet-funded FILL tx (no maker liveness, no refund state)
@@ -141,19 +143,42 @@ func cmdPost(args []string) {
 	feeAsset := fs.String("fee-asset", "", "preferred fee asset hint (any-asset fee market)")
 	recvAddr := fs.String("recv-addr", "el1qq-demo-recv-addr", "maker confidential receive address")
 	id := fs.String("id", "", "offer id (random 16-byte hex if empty)")
+	confidential := fs.Bool("confidential", false, "post to the blinded book: requires a blech32 -recv-addr and -blinding-pub")
+	blindingPub := fs.String("blinding-pub", "", "maker blinding pubkey (33-byte compressed hex; required with -confidential)")
+	lnDirection := fs.Int("ln-direction", -1, "post a Lightning offer with this ln_direction (0-5); -1 = same-chain settlement")
+	lnNode := fs.String("ln-node", "", "maker LN node pubkey (33-byte compressed hex; required for pure-LN and reverse-submarine directions)")
+	lnCltv := fs.Uint("ln-cltv", 240, "advisory CLTV delta for the Lightning offer's on-chain leg")
 	_ = fs.Parse(args)
 
 	k := loadOrGenKey(*priv)
 	o := &seqobv1.Offer{
-		OfferId:       orDefault(*id, randstr.Hex(16)),
-		SchemaVersion: 1,
-		Pair:          &seqobv1.AssetPair{BaseAsset: *base, QuoteAsset: *quote},
-		BaseAmount:    *baseAmt,
-		AllowPartial:  true,
-		CreatedAtUnix: uint64(time.Now().Unix()),
-		ExpiresAtUnix: uint64(time.Now().Add(*expiry).Unix()),
-		FeeAssetHint:  *feeAsset,
-		Settlement:    &seqobv1.Offer_SameChain{SameChain: &seqobv1.SameChainTerms{MakerRecvAddress: *recvAddr}},
+		OfferId:           orDefault(*id, randstr.Hex(16)),
+		SchemaVersion:     1,
+		Pair:              &seqobv1.AssetPair{BaseAsset: *base, QuoteAsset: *quote},
+		BaseAmount:        *baseAmt,
+		AllowPartial:      true,
+		CreatedAtUnix:     uint64(time.Now().Unix()),
+		ExpiresAtUnix:     uint64(time.Now().Add(*expiry).Unix()),
+		FeeAssetHint:      *feeAsset,
+		Confidential:      *confidential,
+		MakerLnNodePubkey: *lnNode,
+	}
+	if *lnDirection >= 0 {
+		// The resting claim/refund keys are advisory (the validator checks
+		// well-formedness only; the load-bearing keys are minted per-lift), so
+		// the maker key doubles as both, exactly like the resting pure-LN makers.
+		mk := k.PubKey().SerializeCompressed()
+		o.Settlement = &seqobv1.Offer_Lightning{Lightning: &seqobv1.LightningTerms{
+			LnDirection:    uint32(*lnDirection),
+			MakerClaimPub:  mk,
+			MakerRefundPub: mk,
+			OnchainCltv:    uint32(*lnCltv),
+		}}
+	} else {
+		o.Settlement = &seqobv1.Offer_SameChain{SameChain: &seqobv1.SameChainTerms{
+			MakerRecvAddress: *recvAddr,
+			MakerBlindingPub: *blindingPub,
+		}}
 	}
 	switch strings.ToLower(*dir) {
 	case "sell":
