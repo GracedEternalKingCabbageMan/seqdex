@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -132,6 +133,9 @@ func main() {
 	confidential := flag.Bool("confidential", true, "post a confidential offer (blinded settlement); false = explicit")
 	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
+	levels := flag.Int("levels", 1, "samechain: ladder depth — quote this many price levels on this side from ONE process/account (level 0 = the configured price/size; each deeper level rests further from the touch and larger). Every level is a real co-signable offer of this maker")
+	levelBps := flag.Int("level-bps", 40, "samechain ladder: extra distance from the touch per level, in basis points of the quote amount")
+	levelGrowth := flag.Float64("level-growth", 1.12, "samechain ladder: size multiplier per level (deeper levels rest larger)")
 	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning | pureln | subasset (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap; pureln = BOTH legs over Lightning; subasset = the submarine's MIRROR: asset over Lightning + BTC on-chain HTLC, taker pays BTC on-chain and receives the asset over LN; base is the asset, quote is the BTC sentinel)")
 	// Cross-mode settlement wiring (pkg/xchain, no Ocean needed): the SEQ leg is
 	// funded from the Sequentia NODE wallet and the BTC leg is claimed into the
@@ -294,15 +298,41 @@ func main() {
 		blindingPub = hex.EncodeToString(info.BlindingKey)
 	}
 
-	o := buildOffer(*base, *quote, *side, *baseAmt, *quoteAmt, *feeAsset,
-		*expiry, uint32(*minAnchor), recvAddr, blindingPub, *offerID)
-	// Post into the SEPARATE blinded book when confidential: the signed namespace tag
-	// segregates this offer so it only crosses another confidential offer (both legs
-	// blind on-chain). recvAddr is already the blech32 confidential form here (its
-	// blinding pubkey was just parsed), satisfying the relay's confidential-offer rules.
-	o.Confidential = *confidential
-	if err := offer.SignOffer(o, makerKey); err != nil {
-		fatal("sign offer: %v", err)
+	// The ladder: level 0 is exactly the classic single offer; each deeper level
+	// rests further from the touch (SELL asks more quote, BUY bids less) and
+	// larger. Every level is a REAL offer of this maker — the co-sign path serves
+	// whichever level a taker lifts, funded from the same account — so ladder
+	// depth is never ghost depth (the relay hides interactive offers whose maker
+	// cannot co-sign; these all can).
+	if *levels < 1 {
+		fatal("-levels must be >= 1")
+	}
+	ladder := make([]*seqobv1.Offer, 0, *levels)
+	for i := 0; i < *levels; i++ {
+		grow := math.Pow(*levelGrowth, float64(i))
+		lb := uint64(math.Round(float64(*baseAmt) * grow))
+		lq := float64(*quoteAmt) * grow
+		adj := float64(i*(*levelBps)) / 10000.0
+		if strings.ToLower(*side) == "sell" {
+			lq *= 1 + adj
+		} else {
+			lq *= 1 - adj
+		}
+		id := *offerID
+		if id != "" && i > 0 {
+			id = fmt.Sprintf("%s-l%d", id, i)
+		}
+		lo := buildOffer(*base, *quote, *side, lb, uint64(math.Round(lq)), *feeAsset,
+			*expiry, uint32(*minAnchor), recvAddr, blindingPub, id)
+		// Post into the SEPARATE blinded book when confidential: the signed namespace tag
+		// segregates this offer so it only crosses another confidential offer (both legs
+		// blind on-chain). recvAddr is already the blech32 confidential form here (its
+		// blinding pubkey was just parsed), satisfying the relay's confidential-offer rules.
+		lo.Confidential = *confidential
+		if err := offer.SignOffer(lo, makerKey); err != nil {
+			fatal("sign offer: %v", err)
+		}
+		ladder = append(ladder, lo)
 	}
 
 	// Maker-only backend: the LiveWallet only calls ResponderComplete, which uses
@@ -316,14 +346,16 @@ func main() {
 		}
 		return signedPSET, utxosToSwapUnblinded(utxos), nil
 	}
-	maker := &client.Maker{
-		Wallet: &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential, RequireConfidential: *confidential},
-		// Bind every co-sign to this signed offer (asset legs, price floor,
-		// remaining size) so a malicious taker cannot drain the maker.
-		Offer: o,
+	wallet := &client.LiveWallet{Backend: rb, MakerOutputsConfidential: *confidential, RequireConfidential: *confidential}
+	// One Maker binding per ladder level: HandleRequest binds every co-sign to the
+	// LIFTED offer (asset legs, price floor, remaining size) so a malicious taker
+	// cannot drain the maker at another level's price.
+	makers := make(map[string]*client.Maker, len(ladder))
+	for _, lo := range ladder {
+		makers[lo.GetOfferId()] = &client.Maker{Wallet: wallet, Offer: lo}
 	}
 
-	// Connect, submit the offer (this registers the conn for live lifts), then
+	// Connect, submit the offers (this registers the conn for live lifts), then
 	// serve lifts until killed.
 	wsURL := "ws" + strings.TrimPrefix(*relay, "http") + "/v1/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
@@ -332,22 +364,28 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); err != nil {
-		fatal("post offer: %v", err)
+	for i, lo := range ladder {
+		if err := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: lo}}); err != nil {
+			fatal("post offer: %v", err)
+		}
+		if i > 0 && i%4 == 0 {
+			time.Sleep(500 * time.Millisecond) // pace a deep ladder under the relay's submit throttle
+		}
 	}
-	fmt.Printf("seqob-maker up: posted %s offer %s by maker %s\n", *side, o.GetOfferId(), makerPubHex)
+	o := ladder[0]
+	fmt.Printf("seqob-maker up: posted %s offer %s (+%d ladder levels) by maker %s\n", *side, o.GetOfferId(), len(ladder)-1, makerPubHex)
 	fmt.Printf("  pair %s/%s  give %d %s  want %d %s  confidential=%v  fee-rate=%d msat/vB\n",
 		o.GetPair().GetBaseAsset(), o.GetPair().GetQuoteAsset(), o.GetOfferAmount(), o.GetOfferAsset(), o.GetWantAmount(), o.GetWantAsset(), *confidential, *msats)
 	fmt.Printf("  taker lifts with: -offer-id %s -maker-pubkey %s\n", o.GetOfferId(), makerPubHex)
 
-	serve(conn, maker, makerKey, wsURL, *expiry)
+	serve(conn, makers, ladder, makerKey, wsURL, *expiry)
 }
 
 // serve is the maker's single-goroutine event loop: derive a per-lift E2E key on
 // lift_requested, then on the taker's couriered SwapRequest run the responder and
 // courier back the SwapAccept. A later swap_msg for the same session is the
 // taker's SwapComplete (the swap settled).
-func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey, wsURL string, expiry time.Duration) {
+func serve(conn *websocket.Conn, makers map[string]*client.Maker, ladder []*seqobv1.Offer, makerKey *btcec.PrivateKey, wsURL string, expiry time.Duration) {
 	crypters := make(map[string]*client.Crypter)
 	accepted := make(map[string]bool)
 	// What "busy" means for this loop: a lift we have accepted and not yet settled.
@@ -355,8 +393,9 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 	// waiting on its counterparty is silent precisely when it must NOT be killed.
 	var serveMu sync.Mutex
 	setBusyFn(func() int { serveMu.Lock(); defer serveMu.Unlock(); return len(accepted) })
-	takes := make(map[string]uint64) // session -> take_amount, for the settle-ack fill_base (B-1)
-	o := maker.Offer
+	takes := make(map[string]uint64)                    // session -> take_amount, for the settle-ack fill_base (B-1)
+	sessionMaker := make(map[string]*client.Maker)      // session -> the ladder level it lifted
+	o := ladder[0]                                      // every level shares one expiry window; level 0 represents it
 	// Exit-for-requote (see requote_exit.go). A co-sign session quiet for 10
 	// minutes is treated as abandoned (taker vanished after SwapAccept) so a
 	// stuck session can never pin a stale quote on the book forever.
@@ -379,15 +418,20 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 		if time.Since(lastPost) < minRepostGap {
 			return false
 		}
-		if e := refreshOfferForRequote(o, expiry, makerKey); e != nil {
-			fmt.Printf("re-post (%s): re-sign failed: %v\n", reason, e)
-			return false
-		}
-		if we := writeWS(c, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: o}}); we != nil {
-			return false
+		for i, lo := range ladder {
+			if e := refreshOfferForRequote(lo, expiry, makerKey); e != nil {
+				fmt.Printf("re-post (%s): re-sign failed: %v\n", reason, e)
+				return false
+			}
+			if we := writeWS(c, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: lo}}); we != nil {
+				return false
+			}
+			if i > 0 && i%4 == 0 {
+				time.Sleep(500 * time.Millisecond) // pace a deep ladder under the relay's submit throttle
+			}
 		}
 		lastPost = time.Now()
-		fmt.Printf("re-posted offer %s (%s)\n", o.GetOfferId(), reason)
+		fmt.Printf("re-posted offer %s (+%d ladder levels) (%s)\n", o.GetOfferId(), len(ladder)-1, reason)
 		return true
 	}
 	backoff := time.Second
@@ -464,11 +508,13 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 			// be negotiated with OUR offer's terms. Same-chain lifts commit nothing before the
 			// co-sign, so skipping registration is a safe refusal — the taker's request finds no
 			// session and times out on its own short deadline.
-			if lr.GetOfferId() != o.GetOfferId() {
-				fmt.Printf("lift %s: for offer %s, but this process serves %s; ignoring (sibling maker owns it)\n",
-					lr.GetSessionId(), lr.GetOfferId(), o.GetOfferId())
+			lm := makers[lr.GetOfferId()]
+			if lm == nil {
+				fmt.Printf("lift %s: for offer %s, but this process serves %s (+%d ladder levels); ignoring (sibling maker owns it)\n",
+					lr.GetSessionId(), lr.GetOfferId(), o.GetOfferId(), len(ladder)-1)
 				continue
 			}
+			sessionMaker[lr.GetSessionId()] = lm
 			crypters[lr.GetSessionId()] = cr
 			takes[lr.GetSessionId()] = lr.GetTakeAmount()
 			fmt.Printf("lift requested: session %s offer %s take %d\n",
@@ -477,17 +523,18 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 		case from.GetSwapMsg() != nil:
 			sm := from.GetSwapMsg()
 			sid := sm.GetSessionId()
-			if accepted[sid] {
+			sm2 := sessionMaker[sid]
+			if accepted[sid] && sm2 != nil {
 				// The taker couriered SwapComplete: the same-chain lift settled on-chain. Ack the relay
 				// so it records the trade + decrements this resting order — the relay never parses the
 				// opaque courier, so without this ack the order lingers as a ghost and the trades feed
 				// stays empty (B-1). Best-effort txid from the completed tx; fill_base is the lift's take.
-				txid, _ := maker.HandleComplete(sm.GetCiphertext(), crypters[sid])
+				txid, _ := sm2.HandleComplete(sm.GetCiphertext(), crypters[sid])
 				// anchor_confs = the offer's own min_anchor_depth: the maker declares its finality
 				// bar met at settlement, so a min_anchor_depth>0 offer reaches FILLED (default 0 keeps
 				// the 0-conf-tolerant behavior). Previously the relay hard-coded 0, so >0 never finalized.
 				if we := writeWS(conn, &seqobv1.To{Msg: &seqobv1.To_SettleAck{SettleAck: &seqobv1.SettleAck{
-					SessionId: sid, SettleTxid: txid, FillBase: takes[sid], AnchorConfs: o.GetMinAnchorDepth(),
+					SessionId: sid, SettleTxid: txid, FillBase: takes[sid], AnchorConfs: sm2.Offer.GetMinAnchorDepth(),
 				}}}); we != nil {
 					fmt.Printf("session %s: settle-ack write failed: %v; reconnecting\n", sid, we)
 					conn = redial(conn)
@@ -496,16 +543,17 @@ func serve(conn *websocket.Conn, maker *client.Maker, makerKey *btcec.PrivateKey
 				delete(accepted, sid) // B3: prune per-session state now the swap is done (serve() runs forever)
 				delete(crypters, sid)
 				delete(takes, sid)
+				delete(sessionMaker, sid)
 				liveSessions.Add(-1)
 				requoteExitIfPending(idle)
 				continue
 			}
 			cr := crypters[sid]
-			if cr == nil {
+			if cr == nil || sm2 == nil {
 				fmt.Printf("session %s: swap_msg before lift_requested; ignoring\n", sid)
 				continue
 			}
-			sealedAccept, err := maker.HandleRequest(sm.GetCiphertext(), cr)
+			sealedAccept, err := sm2.HandleRequest(sm.GetCiphertext(), cr)
 			if err != nil {
 				fmt.Printf("session %s: complete swap failed: %v\n", sid, err)
 				continue
