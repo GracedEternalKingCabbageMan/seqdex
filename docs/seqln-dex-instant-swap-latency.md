@@ -1,5 +1,9 @@
 # SeqLN DEX — making asset↔BTC-LN swaps feel instant (latency design note)
 
+> **Historical** (status as of 2026-08-22): the 2026-07-03 design note. Its constructions are
+> implemented on `main` (`seqob-maker -mode lightning` / `pureln`); see the followup note and
+> `README.md`.
+
 STATUS: design note, to revisit WHEN/just-before wiring the LN-DEX into the wallets (Phoenix-like UX). Not
 yet implemented. Captures the 2026-07-03 discussion so we build the fast constructions, not the slow one.
 

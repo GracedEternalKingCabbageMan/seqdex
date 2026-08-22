@@ -1,5 +1,9 @@
 # Sequentia P2P Order-Book DEX — Implementable Design
 
+> **Historical** (status as of 2026-08-22): the design this order book was built from. It is
+> implemented on `main` (`daemon/internal/seqob`); where it and the code differ, the code and
+> `README.md` are authoritative.
+
 Status: design for review. No consensus change. Reuses the proven seqdex same-chain PSET co-signing and cross-chain HTLC settlement verbatim; adds a non-custodial order-book relay and a maker/taker order layer borrowing SideSwap's wire shape.
 
 ---
@@ -309,7 +313,7 @@ Our current market maker (the seqdex operator with CPMM markets and reserves) is
 - New component `cmd/seqob-mm/` (or refactor the existing MM service): on a loop, for each pair it wants to make, it computes bid/ask and posts signed `Offer`s via the relay `POST /v1/offers`, exactly like a wallet user. It cancels/edits as price moves.
 - Pricing kept: reuse the existing pricing source (price-server-fed; CPMM-style spread around mid if desired) but it now expresses prices as discrete limit offers rather than a continuous `Preview` curve. The CPMM formula (`pkg/marketmaking/formula/balanced.go`) becomes an internal quoting helper that emits ladder offers; it is no longer consulted by takers.
 - Co-signing: when a taker lifts one of the MM's offers, the MM runs the identical `CompleteSwap` responder path (§6) — same code the daemon already runs. The MM holds its own wallet; the relay never touches its funds.
-- Cross-chain reserves: the MM keeps its testnet4 BTC reserve (memory: `seqdex-mm-btc`) and posts cross-chain offers in both directions, implementing the reverse-direction role from §6.
+- Cross-chain reserves: the MM keeps its testnet4 BTC reserve and posts cross-chain offers in both directions, implementing the reverse-direction role from §6.
 - Removed: operator-only RPC (NewMarket, UpdateMarketPrice, WithdrawFeeFunds, slippage config — Analysis A "Scrap"). The MM is now just a well-capitalized peer.
 
 Critical: the relay has zero special-casing for the MM. Its offers are validated, rate-limited, and ranked identically; takers can and should match other users' offers first if they're better priced (price-time priority).
@@ -328,7 +332,7 @@ New panels (Analysis D Screens 1-5):
 
 Reused as-is: asset pickers, reference-currency hints (`C.refValueStr`), fee selectors, the `SignerRequest`-style net-effect review ("you send X / receive Y / fee Z" — borrowed from SideSwap, Analysis C §5), the cross-chain wizard.
 
-Naming/copy (memory Principles 3 & NAMING): no "native asset"/"(native)" tags, SEQ is one row among equals, headline = total in reference currency; never call it "the SEQ chain"; fee-rate units are the chosen fee asset's own units/vByte, never "sat/vB."
+Naming/copy (the Sequentia design principles, node repo `doc/sequentia/00-overview.md`): no "native asset"/"(native)" tags, SEQ is one row among equals, headline = total in reference currency; never call it "the SEQ chain"; fee-rate units are the chosen fee asset's own units/vByte, never "sat/vB."
 
 ---
 

@@ -1,9 +1,34 @@
-# SeqDEX architecture (as built)
+# SeqDEX architecture (2026-07-08 snapshot)
 
-This document describes the system as it exists on `main`, verified against the
-code on 2026-07-08. It covers the components and ports, the SeqOB order-book
-protocol and its settlement flows (same-chain, cross-chain, submarine), the
-cross-chain safety model, the RFQ trade daemon, and the fee model.
+> **Status (2026-08-22): a snapshot of `main` as verified on 2026-07-08,
+> superseded where the README says so.** Since then the RFQ cross-chain rail
+> was deleted (2026-07-29) and the covenant order book landed on `main`. Read
+> with these corrections, which the README and `daemon/README.md` carry in
+> full:
+>
+> - Section 2: `seqdex-xchaind`, `seqdex-xchain-taker` and
+>   `seqdex-xchain-reverse-taker` no longer exist, and `/dex/` now serves the
+>   SeqDEX website rather than tdexd's REST gateway. Missing from the table:
+>   `seqob-settler`, `seqob-watcher`, `seqob-bridge`, `seqob-covenant`,
+>   `seqob-relaycli`.
+> - Section 3: there is no `seqdex/v1/xchain.proto`.
+> - Section 4.1: the `settlement` oneof has a fourth variant, `CovenantTerms
+>   = 23` (a funded, self-enforcing resting order), and `LightningTerms` now
+>   covers submarine, pure-LN and sub-asset directions.
+> - Section 7: tdexd serves same-chain trades only; the `XchainService`
+>   bullet describes deleted code.
+> - Section 9: pure-Lightning swaps, the continuous matcher and the covenant
+>   builder are on `main`. The shipped covenant is a tapscript introspection
+>   leaf (`daemon/pkg/covenant`), not Simplicity; the Simplicity design doc
+>   describes the design space.
+>
+> The SeqOB protocol (sections 4.2 to 4.6), the cross-chain safety model
+> (5), the anchor-depth dial (6) and the fee model (8) are still as built.
+
+This document describes the system as it existed on `main` on 2026-07-08. It
+covers the components and ports, the SeqOB order-book protocol and its
+settlement flows (same-chain, cross-chain, submarine), the cross-chain safety
+model, the RFQ trade daemon, and the fee model.
 
 ## 1. Overview
 
