@@ -15,8 +15,9 @@ the same commit title.
 The documentation rewrite lives only on `main`. `README.md`, `docs/ARCHITECTURE.md` and
 `docs/DEV.md` on `phase3-pure-ln` are the older, much shorter pre-rewrite versions, and
 `wallet/README.md` there is still verbatim upstream Ocean. **When you want to know how something
-works, read the docs on `main`** (`git show main:docs/DEV.md`), then verify against code, because
-even `main`'s docs predate the July retirement described below.
+works, read the docs on `main`** (`git show main:docs/DEV.md`), then verify against code. They
+were brought up to date on 2026-08-22; `docs/ARCHITECTURE.md` is kept as a 2026-07-08 snapshot
+with a header listing what has changed since.
 
 ## Modules and layout
 
@@ -41,9 +42,10 @@ The retired RFQ rail and the live order-book cross rail were **both** called "xc
 rail was deleted (its protos, its `xchainmaker` application package, and the `seqdex-xchaind` /
 `seqdex-xchain-taker` / `seqdex-xchain-reverse-taker` binaries). What survived, deliberately:
 
-- **`daemon/pkg/xchain/` is the live cross taker and is imported by 43 files** — `seqob-maker`,
-  `seqob-cli`, `seqob-settler`, `seqob-crosser`, the `internal/seqob/client/xdriver*.go` drivers,
-  and even `tdexd`'s fee-rate handler. Deleting it breaks nearly everything.
+- **`daemon/pkg/xchain/` is the live cross taker and is imported by about 40 files** —
+  `seqob-maker`, `seqob-cli`, `seqob-settler`, the `internal/seqob/client/xdriver*.go` drivers,
+  `seqob-crosser` on `phase3-pure-ln`, and even `tdexd`'s fee-rate handler. Deleting it breaks
+  nearly everything.
 - `daemon/cmd/seqdex-xchain-swapdemo` is kept for the same reason: despite its name it exercises
   `pkg/xchain` and holds no reference to the retired service.
 - The `x`-prefixed files under `daemon/internal/seqob/client/` (`xcourier*.go`, `xdriver*.go`,
@@ -63,15 +65,16 @@ proto that no longer exists. Its file-existence guard makes it a silent no-op.
 |---|---|
 | `seqobd` | The relay. Stores signed offers, serves the book over REST and WS, couriers opaque end-to-end-encrypted swap messages. **Holds no wallet, no keys and no funds.** The chain watcher runs as a goroutine inside it when given `-node-rpc`. |
 | `seqob-maker` | The maker. Modes: `samechain`, `cross`, `lightning`, `pureln`, `subasset`, `subasset-sell`. |
-| `seqob-crosser` | Crossing agent; polls every relay and takes both sides. |
+| `seqob-crosser` | Crossing agent; polls every relay and takes both sides. **Not on `main`**: it exists only on `phase3-pure-ln`, so if it runs on the box it is built from that branch. |
 | `seqob-settler` | Always-online non-custodial settler for the passive covenant CLOB (`plan`, `run`). |
 | `seqob-bridge` | Cross-rail settlement bridge; the only seqob component holding its own inventory and LN node. |
 | `tdexd` | The forked LP daemon. Deployed under the name `seqdexd` — there is no `cmd/seqdexd`. |
 | `oceand` | The wallet daemon, from the `wallet/` module. |
 
 The box runs **several `seqobd` relay instances**, one per rail; the `seqob-crosser` `-relays`
-default documents the fleet (9955 cross, 9965 pure-LN and submarine, 9966 sub-asset buy, 9971
-sub-asset sell, plus the covenant relay).
+default (on `phase3-pure-ln`) documents the fleet (9955 cross, 9965 pure-LN and submarine, 9966
+sub-asset buy, 9971 sub-asset sell, plus the covenant relay). Publicly they are the
+`/seqob`, `/seqob-pln` and `/seqob-conf` mounts.
 
 Everything else in `cmd/` is a one-shot CLI or a regtest helper.
 
@@ -124,8 +127,10 @@ Build binaries with `-o` into `bin/`. Running `go build ./cmd/<name>` from insid
 stray binaries in `daemon/`, which has happened often enough that `.gitignore` has entries for
 them by name.
 
-Regtest needs Elements mode (`-con_elementsmode=1`); a plain `elementsd -chain=regtest` runs in
-Bitcoin serialization mode and the parsers cannot decode it.
+Regtest needs Elements mode (`-con_elementsmode=1`); a plain `sequentiad -chain=regtest` runs in
+Bitcoin serialization mode and the parsers cannot decode it. The node binaries are `sequentiad`
+and `sequentia-cli`; `pkg/xchain/testdata/start-regtest.sh` falls back to the legacy
+`elementsd` names only for a clone built before the rename.
 
 ## Correctness rules with a history behind them
 

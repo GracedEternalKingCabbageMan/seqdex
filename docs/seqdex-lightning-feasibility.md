@@ -1,5 +1,11 @@
 # Lightning on Sequentia: Pure-LN and Submarine Swaps for Assets ↔ BTC — Feasibility, Safety, and DEX Implications
 
+> **Historical** (status as of 2026-08-22): a feasibility note written before SeqLN existed.
+> Submarine and pure-Lightning swaps are implemented (`seqob-maker -mode lightning` / `pureln`).
+> The block counts below assume the old ~90-second spacing; Sequentia blocks are 60 seconds
+> apart since testnet height 93,800, so for example Bitcoin's ~40-block CLTV delta is about 400
+> Sequentia blocks, not 270.
+
 ## 1. Direct answer — "Possible?" per scenario
 
 **(a) Pure-LN swap, both sides off-chain (Sequentia-asset LN ↔ Bitcoin LN): YES-WITH-CAVEATS.** The atomicity primitive (one shared HTLC/PTLC secret reused across two independent LN payments, stitched at a translating node) is mechanically sound and already demonstrated for LN↔LN cases. The binding caveat is the asset leg: carrying an *issued asset* (not native BTC) over Lightning needs asset-aware channels, which were specced-but-never-shipped on Liquid; until that exists, the asset side cannot ride LN.
@@ -14,7 +20,7 @@
 
 ## 2. Lightning-on-Sequentia feasibility (asset-denominated channels) — Analysis A
 
-Running Lightning on Sequentia is technically feasible for **single-asset channels** because every script Lightning needs (HTLC hashlock + CLTV, `to_self_delay` via CSV, revocation/penalty branch, anchor outputs, PTLC/Taproot) is plain Bitcoin Script, and Elements/Sequentia is a strict superset. It was done in limited form on Liquid in 2019 (c-lightning `--network liquid`, L-BTC only). **CORRECTION (2026-07-02 research): CLN did NOT drop Liquid** — Elements support (`liquid`/`liquid-regtest` in `bitcoin/chainparams.c`) is in-tree and CI-tested against Elements Core 23.2.1; it is L-BTC-only and dormant, not removed. What actually ships in production Liquid LN is still **swaps, not channels** (Blockstream's Boltz integration; PeerSwap). See the full fork spec `seqln-core-lightning-fork-spec.md`.
+Running Lightning on Sequentia is technically feasible for **single-asset channels** because every script Lightning needs (HTLC hashlock + CLTV, `to_self_delay` via CSV, revocation/penalty branch, anchor outputs, PTLC/Taproot) is plain Bitcoin Script, and Elements/Sequentia is a strict superset. It was done in limited form on Liquid in 2019 (c-lightning `--network liquid`, L-BTC only). **CORRECTION (2026-07-02 research): CLN did NOT drop Liquid** — Elements support (`liquid`/`liquid-regtest` in `bitcoin/chainparams.c`) is in-tree and CI-tested against Elements Core 23.2.1; it is L-BTC-only and dormant, not removed. What actually ships in production Liquid LN is still **swaps, not channels** (Blockstream's Boltz integration; PeerSwap). See the full fork spec `seqln-core-lightning-fork-spec.md` (in the `seqln` repo, `doc/seqln-design/`).
 
 What it takes, in increasing difficulty:
 

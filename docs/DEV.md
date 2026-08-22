@@ -1,24 +1,30 @@
 # SeqDEX development guide
 
 How to build, test, and run every part of this repo locally. Commands were
-verified on Linux with Go 1.26 on 2026-07-08. For what the parts are and how
-they fit together, read [ARCHITECTURE.md](ARCHITECTURE.md) first.
+verified on Linux with Go 1.26 on 2026-07-08; binary names, flags and
+subcommands were re-checked against the code on 2026-08-22. For what the parts
+are and how they fit together, read the [README](../README.md) and
+[daemon/README.md](../daemon/README.md) first ([ARCHITECTURE.md](ARCHITECTURE.md)
+is a 2026-07-08 snapshot).
 
 ## Prerequisites
 
 - A recent Go toolchain (Go 1.26 verified; the daemon's release build script
   uses `CGO_ENABLED=1`).
-- For anything on-chain: a built Sequentia node, i.e. `elementsd` and
-  `elements-cli` from
+- For anything on-chain: a built Sequentia node, i.e. `sequentiad` and
+  `sequentia-cli` from
   https://github.com/GracedEternalKingCabbageMan/Sequentia (about an hour to
   build; see that repo's docs).
 - Optional: [`buf`](https://buf.build) for proto codegen, Docker for the
-  inherited upstream compose files, a SeqLN node for submarine swaps.
+  inherited upstream compose files, a SeqLN node for the Lightning rails
+  (submarine, pure-LN, sub-asset).
 
 ## Build
 
-The repo holds three Go modules: `daemon/`, `wallet/`, and the top-level
-`proto/gen` module. Build the two service modules:
+The repo holds seven Go modules; the two that matter are `daemon/` and
+`wallet/` (the others are the top-level `proto/gen` module and small
+self-contained modules under `daemon/pkg` and `daemon/cmd/migration`). Build
+the two service modules:
 
 ```sh
 cd daemon && go build ./...
@@ -33,6 +39,8 @@ go build -o ../bin/seqobd       ./cmd/seqobd        # order-book relay
 go build -o ../bin/seqob-maker  ./cmd/seqob-maker   # order-book maker
 go build -o ../bin/seqob-cli    ./cmd/seqob-cli     # order-book taker CLI
 go build -o ../bin/seqob-octl   ./cmd/seqob-octl    # ocean account helper
+go build -o ../bin/seqob-settler ./cmd/seqob-settler # passive covenant settler
+go build -o ../bin/seqob-covenant ./cmd/seqob-covenant # covenant builder CLI
 go build -o ../bin/tdexd        ./cmd/tdexd         # RFQ trade daemon
 go build -o ../bin/tdex         ./cmd/tdex          # RFQ operator CLI
 cd ../wallet
@@ -48,7 +56,7 @@ development.)
 Unit tests need no node and pass on a clean checkout:
 
 ```sh
-cd daemon && go test ./internal/seqob/... ./pkg/xchain/...
+cd daemon && go test ./internal/seqob/... ./pkg/xchain/... ./pkg/covenant/...
 cd ../wallet && go test ./pkg/...
 ```
 
@@ -60,8 +68,13 @@ Notes:
   `pkg/xchain/testdata/start-regtest.sh` when they can find the node binaries,
   and **skip** (not fail) otherwise. Point them at your node clone with
   `SEQUENTIA_REPO=/path/to/Sequentia` (the script expects
-  `$SEQUENTIA_REPO/build-linux/src/elementsd`), or at already-running nodes
-  with `SEQDEX_XCHAIN_PARENT_RPC` / `SEQDEX_XCHAIN_SEQ_RPC`.
+  `$SEQUENTIA_REPO/build-linux/src/sequentiad` and `sequentia-cli`, falling
+  back to the legacy `elementsd` / `elements-cli` names), or at
+  already-running nodes with the test-only env knobs `SEQDEX_XCHAIN_PARENT_RPC`
+  / `SEQDEX_XCHAIN_SEQ_RPC`.
+- The consensus-level covenant proofs (`test/regtest/feature_seqob_*.py`)
+  run against a real node via the node repo's functional test framework; see
+  [../test/regtest/README.md](../test/regtest/README.md).
 - The submarine/Lightning integration tests additionally want `SEQLN_SOCK1` /
   `SEQLN_SOCK2` (two SeqLN `lightning-rpc` sockets) and skip without them.
 - The upstream test suites under `wallet/internal/core/...` predate the
@@ -88,18 +101,17 @@ It starts both nodes with `-signblockscript=51 -con_any_asset_fees=1
 -blindedaddresses=0 ...`, wires the Sequentia node's anchoring to the parent
 (`-con_bitcoin_anchor=1 -validateanchor=1 -mainchainrpc*`), and creates a
 wallet `w` on each. Cross-chain flows against a real `bitcoind` (testnet4 or
-Bitcoin regtest) are also supported by every binary via `-btc-chain` /
-`XCHAIN_PARENT_KIND=bitcoin`.
+Bitcoin regtest) are also supported by every binary via `-btc-chain`.
 
 ### Why Elements mode matters for the wallet
 
-Plain `elementsd -chain=regtest` runs in Bitcoin serialization mode, which the
+Plain `sequentiad -chain=regtest` runs in Bitcoin serialization mode, which the
 go-elements transaction parsers the wallet relies on cannot decode. Real
 Sequentia runs in Elements mode. For a faithful standalone node (without the
 harness) use:
 
 ```sh
-elementsd -datadir=<dir> -server -daemon \
+sequentiad -datadir=<dir> -server -daemon \
   -con_elementsmode=1 -signblockscript=51 -validatepegin=0 \
   -bech32_hrp=bcrt -blech32_hrp=bcrt -pubkeyprefix=111 -scriptprefix=196 -blindedprefix=4 \
   -rpcport=19996 -rpcuser=s -rpcpassword=s \
@@ -233,6 +245,53 @@ Requires a SeqLN/CLN node on the BTC side for each party
 ./bin/seqob-cli xsubbuy  -ln-socket ... -min-anchor-depth 2 ...
 ```
 
+### Pure Lightning and sub-asset over the order book
+
+Pure-LN: both legs over Lightning, so each party needs a SeqLN node on
+Sequentia (the asset leg) and one on Bitcoin (the BTC leg); nothing touches a
+chain and there is no anchor wait.
+
+```sh
+# maker: base = the asset, quote = the BTC sentinel (or -quote-asset <hex> for asset-for-asset)
+./bin/seqob-maker -mode pureln -relay ... -base <asset hex> -side sell \
+  -base-amount 100 -quote-amount 15000 \
+  -asset-ln-socket /path/to/seq/lightning-rpc -ln-socket /path/to/btc/lightning-rpc
+# taker
+./bin/seqob-cli xpln -relay ... -side buy -asset <hex> -offer-id ... -maker-pubkey ... \
+  -asset-ln-socket ... -ln-socket ...
+```
+
+Sub-asset (the submarine's mirror: the asset over Lightning, BTC as an
+on-chain HTLC):
+
+```sh
+# maker sells the asset over LN against on-chain BTC
+./bin/seqob-maker -mode subasset -relay ... -base <asset hex> \
+  -base-amount 100 -quote-amount 15000 \
+  -asset-ln-socket ... -btc-rpc ... -btc-wallet ... -btc-chain testnet4
+# taker pays BTC on-chain, receives the asset over LN
+./bin/seqob-cli xsubas -relay ... -asset <hex> -offer-id ... -maker-pubkey ... \
+  -btc-rpc ... -btc-wallet ... -btc-chain testnet4 -asset-ln-socket ... -state-file subas.json
+# the reverse direction is -mode subasset-sell / seqob-cli xsubas-sell (+ xsubas-claim-btc)
+```
+
+### Covenant resting orders (passive)
+
+A covenant order is funded on-chain, so the maker needs nothing running after
+placement. The end-to-end proofs are the regtest scripts in `test/regtest/`
+(`feature_seqob_covenant_fill.py`, `feature_seqob_joint_covenant.py`,
+`feature_seqob_matcher_covenant.py`, `feature_seqob_watcher.py`,
+`feature_seqob_bridge.py`); they drive the production Go builders through the
+CLIs:
+
+```sh
+./bin/seqob-covenant derive -a <A> -b <B> -num N -den D -minlot M -prog P -expiry E -makerx X
+./bin/seqob-covenant fill   ...derive flags... -locked L -filled F -k K
+echo '<cross json>' | ./bin/seqob-settler plan
+./bin/seqobd -listen :9955 -node-rpc 127.0.0.1:19996 -node-rpc-user <user> -node-rpc-pass <pass>
+#   ^ the relay runs the covenant chain-watcher when given -node-rpc
+```
+
 ## Run the RFQ loop (tdexd)
 
 ```sh
@@ -246,10 +305,9 @@ SEQDEX_NO_MACAROONS=true SEQDEX_NO_OPERATOR_TLS=true \
 Then initialize and drive it with the helpers (regtest) or the `tdex` CLI:
 `seqdex-initwallet` (create), `seqdex-unlock` (unlock; this starts the Trade
 interface on `:9945`), `seqdex-market` (create/fund/open a market),
-`seqdex-taker` (perform a same-chain swap). Enable the integrated cross-chain
-maker by additionally setting `SEQDEX_XCHAIN_PARENT_RPC`,
-`SEQDEX_XCHAIN_SEQ_RPC`, `SEQDEX_XCHAIN_SEQ_ASSET` (or `SEQDEX_XCHAIN_MARKETS`)
-and friends; see [../daemon/README.md](../daemon/README.md) for the full list.
+`seqdex-taker` (perform a same-chain swap). tdexd serves same-chain trades
+only; for cross-chain runs use the order book ("Cross-chain over the order
+book" above).
 
 ## Proto codegen
 
