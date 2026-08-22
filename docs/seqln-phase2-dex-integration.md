@@ -1,7 +1,11 @@
 # SeqLN Phase 2 → SeqDEX/wallet integration plan
 
+> **Historical** (status as of 2026-08-22): the integration plan for submarine swaps over the
+> order book, implemented on `main` as `seqob-maker -mode lightning` and `seqob-cli xsublift` /
+> `xsubbuy`.
+
 Phase 2 delivered the submarine-swap PRIMITIVES (both directions, proven live; see
-`seqln-phase2-submarine-swaps.md`). This note maps them onto the EXISTING SeqDEX order-book
+`seqln-phase2-submarine-swaps.md` in the `seqln` repo, `doc/seqln-design/`). This note maps them onto the EXISTING SeqDEX order-book
 architecture so a wallet user can trade a Sequentia asset ↔ BTC-over-Lightning. It is the §5b-style
 seam map for the integration layer, grounded in the live code (`~/seqdex/daemon`, branch `main`).
 

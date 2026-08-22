@@ -1,7 +1,10 @@
 # HANDOVER — 2026-07-31 — SeqDEX: the eight rail combinations
 
-Written by the outgoing agent (Saba) at Andreas's instruction, after he lost confidence in it. Read
-this in full before touching the wallet, the LSP tooling, or seqdex. It is written for a successor who
+> **Historical** (status as of 2026-08-22): a handover note frozen at 2026-07-31. The rails it
+> describes are on `main` today; the current state is in `README.md` and `daemon/README.md`.
+
+Written at Andreas's instruction as a handover, after confidence in the previous session's work was
+lost. Read this in full before touching the wallet, the LSP tooling, or seqdex. It is written for a successor who
 has none of the session context.
 
 **The single standing instruction, verbatim, given repeatedly and never rescinded:**

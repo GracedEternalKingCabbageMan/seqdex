@@ -1,10 +1,15 @@
 # SeqDEX gap-closure plan (audit of 2026-07-22)
 
+> **Historical** (status as of 2026-08-22): a snapshot of the gaps found on 2026-07-22 and the
+> plan to close them. Several documents it cites live in other repos (noted inline). For what is
+> on `main` today read `README.md`.
+
 Status: canonical execution plan. Produced by a 53-agent audit (8 subsystem auditors, each
 blocker/major finding adversarially re-verified against code and branches, plus a read-only
 live-box probe and a completeness critic) against the canonical spec set:
 `seqdex-terminal-spec.md`, `seqdex-orderbook-design.md`, `cross-chain-orderbook-consolidation.md`,
-`sbtc-peg-design.md`, `simplicity-dex-covenant-offers-design.md`, `seqln-phase2-dex-integration.md`.
+`sbtc-peg-design.md` (Sequentia node repo, `doc/sequentia/`), `simplicity-dex-covenant-offers-design.md`,
+`seqln-phase2-dex-integration.md`.
 
 When this plan and the terminal spec disagree, the spec wins. Every claim below carries
 file evidence in the audit record; severities were confirmed or corrected by an independent
@@ -21,7 +26,7 @@ noted, deployed and verified on the live box.
 - **P0 (stabilize + recover): DONE + DEPLOYED.** Relay back under systemd with the covenant
   watcher + trade feed on; ln-asset nodes + sbtc-bridge made durable systemd units; rogue
   processes/duplicate supervisor cleaned; health probe (5-min timer, GREEN) + the fork
-  runbook (`hard-fork-and-restart-runbook.md`) added. The one stranded HTLC was
+  runbook (`hard-fork-and-restart-runbook.md`, Sequentia node repo `doc/sequentia/`) added. The one stranded HTLC was
   unrecoverable (ephemeral harness key) but the harness now persists a recovery file.
 - **P1 (fund-safety): DONE + DEPLOYED** (3 adversarial rounds). Locktime-ordering gate,
   seqlnSwap false-success misroute, SBTC mis-sell binding, sbtc-bridge crash-safety +
@@ -312,7 +317,7 @@ Each item names its repo(s). Deploy pipeline as always: laptop commit -> push ->
 2. `systemctl restart lsp-b5b1` to load staged Findings 3/4/5; fix its logging (journal to
    a file, not a dead socket); re-run one bridge E2E only AFTER P1.1-1.2 land.
 3. Bring ln-asset + ln-asset-b back with a CONSISTENT seqln install (the asset-bin
-   isolation pattern; per the binary-upgrade memory, no DB surgery), verify holdinvoice
+   isolation pattern; per the SeqLN binary-upgrade procedure, no DB surgery), verify holdinvoice
    loads from config, and confirm the :9966/:9971 books repopulate. This also removes the
    front-ln getroute wedge cause.
 4. Dedupe supervise-xresume (kill one instance; make it a systemd unit with a single
