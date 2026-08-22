@@ -72,8 +72,8 @@ one; the relay grants makers no special standing. Six settlement modes:
 - `-mode samechain` (default): asset-for-asset atomic swap, settled through the
   Ocean wallet's blind-aware `CompleteSwap`. Needs `-ocean` + `-account` (the
   account holding the offered asset) and `-node-rpc` for the open fee market.
-  `-confidential=true` (default) publishes a blinding pubkey and settles
-  blinded; `-confidential=false` settles explicit.
+  `-confidential=false` (default: Sequentia is transparent by default) settles
+  explicit; `-confidential=true` publishes a blinding pubkey and settles blinded.
 - `-mode cross`: BTC-for-asset on-chain HTLC swaps. Funds legs from node
   wallets directly: needs `-btc-rpc`/`-btc-wallet`/`-btc-chain`
   (testnet4|regtest) and `-xseq-rpc`/`-xseq-wallet`. Pair is always
