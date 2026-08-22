@@ -1,5 +1,10 @@
 # Simplicity for SeqDEX — Does It Open Doors, and Which?
 
+> **Historical** (status as of 2026-08-22): a feasibility assessment. The node activated
+> Simplicity and the tapscript introspection opcodes together at testnet height 89,856; the
+> covenant resting orders shipped on `main` use a tapscript introspection leaf
+> (`daemon/pkg/covenant`), not Simplicity.
+
 ## 1. VERDICT — the doors Simplicity actually opens
 
 Simplicity's decisive contribution is **introspection-based covenants**: a Taproot leaf (version `0xbe`) carrying a program that reads the spending transaction's outputs/amounts/assets/locktime and approves only transactions matching committed constraints. That single primitive opens three concrete, high-value doors for SeqDEX, plus one marginal one.

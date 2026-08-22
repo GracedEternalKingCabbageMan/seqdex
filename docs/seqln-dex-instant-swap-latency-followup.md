@@ -1,5 +1,9 @@
 # SeqLN DEX instant-swap latency — followup: the endgame is built
 
+> **Historical** (status as of 2026-08-22): a design note from 2026-07-04. Pure-Lightning swaps
+> are on `main` as `seqob-maker -mode pureln` / `seqob-cli xpln`. The `seqln-*` documents it cites
+> live in the `seqln` repo under `doc/seqln-design/`.
+
 STATUS: followup to `seqln-dex-instant-swap-latency.md` (2026-07-04). That note framed the problem, the
 near-term mitigations (hold-invoice reverse buy, `max_0conf` small sell), and named the true fix — the
 "endgame" of asset-aware channels + pure-LN value transfer — as "the long pole, being worked next." It is no
@@ -25,7 +29,7 @@ and therefore NO anchor-depth gate. Proven live through the seqob order-book rel
 both directions (buy the asset with BTC / sell the asset for BTC), atomic refund on failure, and a REAL Bitcoin
 **testnet4** BTC-LN leg (M5), not a stand-in. This is genuinely instant AND final AND zero-reorg-risk, because
 nothing happened on any chain — the whole "impossible triangle" dissolves once the on-chain leg is removed.
-(Detail: `seqln-step2-pure-ln-swaps-design.md`.)
+(Detail: `seqln-step2-pure-ln-swaps-design.md`, `seqln` repo `doc/seqln-design/`.)
 
 So the endgame's *value-transfer* half — "the user holds the asset in an asset-LN channel, the sale never
 touches an on-chain leg" — is real. On-chain materialization stays decoupled and off-path exactly as the
@@ -44,7 +48,7 @@ That is the piece we have now built.
 WE host the SeqLN node (channels, routing, liquidity, watchtower); the user's DEVICE holds the keys and
 co-signs every channel state. Non-custodial by construction: the hosted node cannot move the user's funds
 without the device's signature, and the user runs no node. This is the Phoenix/Greenlight model, done natively
-on our fork. Status (2026-07-04, all committed to `seqln`; detail in `seqln-tier2-hosted-channels-design.md`):
+on our fork. Status (2026-07-04, all committed to `seqln`; detail in `seqln-tier2-hosted-channels-design.md`, `seqln` repo `doc/seqln-design/`):
 
 - **The split is a first-class seam** (`--subdaemon=hsmd:PATH`) — no `lightningd` change. **[M0 done]**
 - **`hsmd-proxy` ↔ `signerd`** splits the signer out of process; a full channel lifecycle signs out of process
@@ -88,7 +92,7 @@ The mechanism is proven; making it a product is the current work, in order:
    capacity, plus the wallet-facing API to open a channel + trade.
 5. **Wallet integration.** The device signer as WASM (web) / Rust FFI (Ambra) + the SDK that runs the signer,
    connects the (secured) transport to the hosted node, and drives pure-LN trades. Under the LSP model in the
-   UX audit (`ux-audit-spec-2026-07-02.md` §8): users never run a node.
+   UX audit (`ux-audit-spec-2026-07-02.md` §8, Sequentia node repo `doc/sequentia/`): users never run a node.
 
 ## The one-line answer
 

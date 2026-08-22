@@ -1,5 +1,9 @@
 # Consolidating cross-chain onto the order book (retiring the RFQ special-maker)
 
+> **Historical** (status as of 2026-08-22): a decision record, carried out on 2026-07-29 when the
+> RFQ cross-chain rail (`XchainService`, `seqdex-xchaind` and the two xchain takers) was deleted.
+> Cross-chain settlement is order-book only; see `README.md`.
+
 ## The question
 
 "The cross-chain market shouldn't drive BTC in the swap tab, since we've moved on

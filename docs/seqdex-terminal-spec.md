@@ -13,10 +13,11 @@ states, in one place, the product it is all supposed to add up to:
 - `cross-chain-orderbook-consolidation.md` — BTC is just another asset in the **one**
   book; the offer schema already carries `CrossChainTerms cross_chain = 21` beside
   `SameChainTerms same_chain = 20`; the privileged RFQ maker is to be retired.
-- `dex-rail-agnostic-matching` (memory) + `seqln-phase2-dex-integration.md` — matching
-  is blind to rails; the LSP bridges rails at settlement.
-- The 11 first principles (memory `MEMORY.md`): no privileged coin, dual-chain, any-asset
-  fees, reference-currency display, transparent-by-default, Bitcoin-anchored finality.
+- `seqln-phase2-dex-integration.md` — matching is blind to rails; the LSP bridges rails at
+  settlement.
+- The Sequentia design principles (the node repo's `doc/sequentia/00-overview.md`): no
+  privileged coin, dual-chain, any-asset fees, reference-currency display,
+  transparent-by-default, Bitcoin-anchored finality.
 
 ---
 
@@ -226,7 +227,8 @@ no-trusted-window guarantee as a bridged one.
 `provisionInbound` (LP opens toward the user, `mindepth=0`); mixed/submarine dispatch = `runMixed`;
 front cap = `MIXED_MAX_0CONF`. Wallet readiness = `ln-rail.js` `legOption`/`railAvailability`;
 composer copy = `renderRailNote` (`swap.js`). Design background: `seqln-dex-instant-swap-latency.md`
-(+ `-followup`), `seqln-tier2-hosted-channels-design.md`.
+(+ `-followup`), `seqln-tier2-hosted-channels-design.md` (in the `seqln` repo,
+`doc/seqln-design/`).
 
 ### Finality
 
@@ -300,7 +302,7 @@ custodies the reserve BTC on Bitcoin, no closer to consensus than any third-part
 there is zero consensus change. It is a **trusted** bridge (no BTC peg can be trustless
 without Bitcoin covenants). SBTC is otherwise a normal, UNPRIVILEGED asset (native BTC stays
 privileged), and its wrap/unwrap is exposed publicly (e.g. confidential-tx use). Full design:
-`sbtc-peg-design.md`.
+`sbtc-peg-design.md` in the Sequentia node repo, `doc/sequentia/`.
 
 ---
 
