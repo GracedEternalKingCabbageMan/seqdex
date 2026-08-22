@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the Go bindings for the SeqDEX seqdex.v1 API surface into
-# ../gen/seqdex/v1. This covers BOTH:
-#
-#   * the public same-chain Trade/Swap/Transport API (trade.proto, swap.proto,
-#     transport.proto, types.proto) — Phase 6a, the seqdex.v1 successor to the
-#     upstream tdex.v2 TradeService; AND
-#   * the cross-chain swap API (xchain.proto) — Phase 5 m2 / Phase 6b.
+# ../gen/seqdex/v1: the public same-chain Trade/Swap/Transport API (trade.proto,
+# swap.proto, transport.proto, types.proto) — Phase 6a, the seqdex.v1 successor
+# to the upstream tdex.v2 TradeService.
 #
 # All live in package seqdex.v1 and are generated together so their shared
 # google.api annotations and the grpc-gateway REST bindings are produced in one
@@ -71,7 +68,7 @@ YAML
 
 ( cd "$WORK" && "$BUF" dep update && "$BUF" lint && "$BUF" generate )
 
-for f in trade swap transport types xchain; do
+for f in trade swap transport types; do
   for suffix in pb.go _grpc.pb.go pb.gw.go; do
     src="$WORK/gen/seqdex/v1/${f}${suffix}"
     if [ -f "$src" ]; then
@@ -79,5 +76,5 @@ for f in trade swap transport types xchain; do
     fi
   done
 done
-echo "regenerated $PROTOBUF_DIR/gen/seqdex/v1/{trade,swap,transport,types,xchain}.{pb,_grpc.pb,pb.gw}.go"
+echo "regenerated $PROTOBUF_DIR/gen/seqdex/v1/{trade,swap,transport,types}.{pb,_grpc.pb,pb.gw}.go"
 ls -1 "$PROTOBUF_DIR/gen/seqdex/v1/"
