@@ -56,8 +56,8 @@ rail was deleted (its protos, its `xchainmaker` application package, and the `se
 `daemon/pkg/xchain/maker.go` carries an explicit warning header saying exactly this, because its
 previous header claimed it served the retired service and that was already false when written.
 
-One consequence: `daemon/api-spec/protobuf/seqdex/gen-seqdex.sh` still loops over an `xchain`
-proto that no longer exists. Its file-existence guard makes it a silent no-op.
+One consequence, since removed: `daemon/api-spec/protobuf/seqdex/gen-seqdex.sh` kept looping
+over an `xchain` proto that no longer existed, and its file-existence guard hid that.
 
 ## What runs on the server
 
