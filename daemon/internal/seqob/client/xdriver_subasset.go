@@ -56,7 +56,7 @@ type SubAssetMakerOps interface {
 		txid string, vout uint32, amount uint64, minConf int) (*xchain.VerifiedBTCLeg, error)
 	// PayAssetHold pays the taker's asset hold invoice bound to h for amtMsat and
 	// BLOCKS until the taker settles it, returning the revealed preimage P.
-	PayAssetHold(bolt11 string, h []byte, amtMsat uint64) (preimage []byte, err error)
+	PayAssetHold(bolt11 string, h []byte, amtMsat uint64, maxDelay uint32) (preimage []byte, err error)
 	// PayAssetHashHold pays the taker's HELD invoice by BARE HASH to takerNodeID
 	// (the taker's device registered a hold on h at its OWN hosted node; there is no
 	// bolt11), BLOCKS until the DEVICE settles, and returns the revealed preimage P.
@@ -125,8 +125,14 @@ func (o *LiveSubAssetMakerOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub
 	// assetID "" = real BTC on the parent chain.
 	return o.Swap.VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, providedScript, btcLocktime, txid, vout, amount, "", minConf)
 }
-func (o *LiveSubAssetMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64) ([]byte, error) {
-	return o.AssetLN.Pay(bolt11, h, amtMsat)
+func (o *LiveSubAssetMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64, maxDelay uint32) ([]byte, error) {
+	capped, ok := o.AssetLN.(interface {
+		PayCapped(string, []byte, uint64, uint32) ([]byte, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: asset leg cannot cap its timelock", xchain.ErrCltvUncapped)
+	}
+	return capped.PayCapped(bolt11, h, amtMsat, maxDelay)
 }
 
 // PayAssetHashHold pays the taker's HELD invoice by BARE HASH to takerNodeID: the
@@ -137,6 +143,17 @@ func (o *LiveSubAssetMakerOps) PayAssetHashHold(takerNodeID string, h []byte, am
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret)
 	return o.AssetLN.PayHash(takerNodeID, h, amtMsat, 18, secret)
+}
+
+// SubAssetPayMarginSecs is the time the sub-asset BUY maker keeps between the
+// latest its asset payment may resolve and T_btc: learning P and claiming the BTC
+// on-chain before the taker's refund branch opens.
+const SubAssetPayMarginSecs = 60 * 60
+
+// subAssetPayCap is the asset-leg (Sequentia-block) timelock cap for paying the
+// taker's hold while its BTC HTLC refunds at tBtc, btcRemaining blocks away.
+func subAssetPayCap(btcRemaining uint32) uint32 {
+	return xchain.CapDelay(btcRemaining, xchain.BTCTiming, xchain.SeqTiming, SubAssetPayMarginSecs)
 }
 func (o *LiveSubAssetMakerOps) InjectSecret(preimage []byte) error {
 	return o.Swap.InjectSecret(preimage)
@@ -459,12 +476,23 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 	// 5. Pay the taker's asset hold invoice. This BLOCKS until the taker settles it
 	//    with P; on settle we learn P. The payment is a HELD LN HTLC until then, so
 	//    a taker that never settles simply times it out (nothing delivered).
+	// The asset payment's timelock is capped against T_btc: a taker whose asset
+	// hold outlasts its own BTC refund could refund the BTC and settle afterwards.
+	maxDelay := subAssetPayCap(tBtc - uint32(tip))
+	if maxDelay == 0 {
+		sendXcFail(p.Crypter, send, "claim_window", "T_btc leaves no room for the asset payment's timelock")
+		return res, fmt.Errorf("subasset maker: T_btc %d vs tip %d leaves no timelock room", tBtc, tip)
+	}
 	var preimage []byte
 	if hodl {
+		if maxDelay < 18 {
+			sendXcFail(p.Crypter, send, "claim_window", "T_btc too close for an 18-block hold payment")
+			return res, fmt.Errorf("subasset maker: HODL pay needs 18 blocks, T_btc allows %d", maxDelay)
+		}
 		p.logf("subasset maker: paying %d asset atoms by bare hash to taker node %s (HODL; device settles, no bolt11)", takeAsset, funded.TakerLNNodeID)
 		preimage, err = ops.PayAssetHashHold(funded.TakerLNNodeID, hashH, takeAsset*1000)
 	} else {
-		preimage, err = ops.PayAssetHold(funded.Bolt11, hashH, takeAsset*1000)
+		preimage, err = ops.PayAssetHold(funded.Bolt11, hashH, takeAsset*1000, maxDelay)
 	}
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_asset", err.Error())

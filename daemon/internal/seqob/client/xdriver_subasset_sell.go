@@ -125,7 +125,7 @@ func (o *LiveSubAssetSellTakerOps) VerifyBTCLeg(hashH, takerClaimPub, makerRefun
 func (o *LiveSubAssetSellTakerOps) PayAsset(makerNodeID string, wantHash []byte, amtMsat uint64) ([]byte, error) {
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret)
-	return o.AssetLN.PayHash(makerNodeID, wantHash, amtMsat, 18, secret)
+	return o.AssetLN.PayHash(makerNodeID, wantHash, amtMsat, SubAssetSellPayFinalCltv, secret)
 }
 func (o *LiveSubAssetSellTakerOps) InjectSecret(preimage []byte) error {
 	return o.Swap.InjectSecret(preimage)
@@ -314,6 +314,14 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 	p.logf("subasset-sell maker: settled the asset hold with P; took the asset (taker now claims the BTC with P)")
 	return res, nil
 }
+
+// SubAssetSellPayFinalCltv is the final-hop timelock (Sequentia blocks) the taker
+// pays the maker's asset hold with; SubAssetSellClaimMarginSecs is the time it keeps
+// after that for its own on-chain BTC claim once the maker settles.
+const (
+	SubAssetSellPayFinalCltv    = 18
+	SubAssetSellClaimMarginSecs = 30 * 60
+)
 
 // RefundSubAssetSellBTC reclaims the maker's funded BTC HTLC via the CLTV refund branch
 // after T_btc, when the taker never paid.
@@ -545,8 +553,15 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if err != nil {
 		return res, fmt.Errorf("subasset-sell taker: btc tip: %w", err)
 	}
-	if tBtc <= uint32(tip) || tBtc-uint32(tip) < p.MinClaimWindow {
-		return res, fmt.Errorf("subasset-sell taker: T_btc %d within %d of tip %d; not paying", tBtc, p.MinClaimWindow, tip)
+	// The asset we pay over Lightning can be held for its full 18-block final
+	// timelock; T_btc must outlast that, with room to claim the BTC on-chain after
+	// the maker settles, or the maker refunds its BTC first and settles afterwards.
+	need := xchain.CoverDelay(SubAssetSellPayFinalCltv, xchain.SeqTiming, xchain.BTCTiming, SubAssetSellClaimMarginSecs)
+	if need < p.MinClaimWindow {
+		need = p.MinClaimWindow
+	}
+	if tBtc <= uint32(tip) || tBtc-uint32(tip) < need {
+		return res, fmt.Errorf("subasset-sell taker: T_btc %d within %d of tip %d (need %d to outlast the asset hold); not paying", tBtc, tBtc-uint32(tip), tip, need)
 	}
 	p.logf("subasset-sell taker: maker BTC HTLC %s verified (%d sats for %d asset atoms, T_btc=%d); paying the asset over LN", terms.Leg.Txid, sliceBtc, takeAsset, tBtc)
 

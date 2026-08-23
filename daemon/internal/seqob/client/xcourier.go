@@ -94,6 +94,7 @@ type XcMsg struct {
 
 	// Pure-LN (both legs Lightning) fields. See xcourier_pureln.go.
 	MakerLNNodeID string `json:"maker_ln_node_id,omitempty"` // pure-LN: the maker's incoming-leg node id (the taker pays its hold by bare hash)
+	HoldCltv      uint32 `json:"hold_cltv,omitempty"`        // pure-LN hold_ready: final-hop timelock (hold-leg blocks) the taker must pay the hold with
 	TakerLNNodeID string `json:"taker_ln_node_id,omitempty"` // sub-asset BUY HODL: the taker's HOSTED asset node id; the MAKER pays the hold by BARE HASH to it (device holds P, no bolt11)
 
 	Preimage string `json:"preimage,omitempty"` // XcSecretRevealed

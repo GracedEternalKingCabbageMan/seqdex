@@ -3,8 +3,10 @@ package xchain
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/btcsuite/btcd/txscript"
@@ -106,13 +108,18 @@ func (c *Chain) FindHTLCUTXO(redeemScript []byte) (*FundedHTLC, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.findHTLCUTXOAt(p2sh)
+}
+
+// findHTLCUTXOAt is FindHTLCUTXO for an already-derived P2SH address.
+func (c *Chain) findHTLCUTXOAt(p2sh string) (*FundedHTLC, error) {
 	var scan struct {
 		Success  bool `json:"success"`
 		Unspents []struct {
-			TxID   string  `json:"txid"`
-			Vout   uint32  `json:"vout"`
-			Amount float64 `json:"amount"`
-			Asset  string  `json:"asset"`
+			TxID   string      `json:"txid"`
+			Vout   uint32      `json:"vout"`
+			Amount json.Number `json:"amount"`
+			Asset  string      `json:"asset"`
 		} `json:"unspents"`
 	}
 	if err := c.rpc.Call(&scan, "scantxoutset", "start", []interface{}{"addr(" + p2sh + ")"}); err != nil {
@@ -126,7 +133,70 @@ func (c *Chain) FindHTLCUTXO(redeemScript []byte) (*FundedHTLC, error) {
 	}
 	u := scan.Unspents[0]
 	return &FundedHTLC{TxID: u.TxID, Vout: u.Vout,
-		Amount: uint64(math.Round(u.Amount * 1e8)), AssetID: u.Asset}, nil
+		Amount: coinsToAtoms(u.Amount), AssetID: u.Asset}, nil
+}
+
+// locateFundedHTLC is the dry-locate that makes LockHTLC idempotent: a funding
+// this wallet already sent to the HTLC's P2SH (still unspent), whether it is in
+// the mempool or confirmed. sendtoaddress can succeed on the node while the HTTP
+// reply times out, and a retry then funded the same deterministic P2SH AGAIN —
+// two outputs the counterparty could claim with one preimage. Any lookup error
+// fails closed: better to not fund than to fund twice.
+func (c *Chain) locateFundedHTLC(p2sh, spkHex string) (*FundedHTLC, error) {
+	var txns []struct {
+		TxID     string `json:"txid"`
+		Address  string `json:"address"`
+		Category string `json:"category"`
+	}
+	for skip := 0; skip < 10000; skip += 1000 {
+		var page []struct {
+			TxID     string `json:"txid"`
+			Address  string `json:"address"`
+			Category string `json:"category"`
+		}
+		if err := c.rpc.Call(&page, "listtransactions", "*", 1000, skip, true); err != nil {
+			return nil, fmt.Errorf("listtransactions: %w", err)
+		}
+		txns = append(txns, page...)
+		if len(page) < 1000 {
+			break
+		}
+	}
+	seen := map[string]bool{}
+	for _, tx := range txns {
+		if tx.Address != p2sh || (tx.Category != "send" && tx.Category != "") || seen[tx.TxID] {
+			continue
+		}
+		seen[tx.TxID] = true
+		var raw struct {
+			Vout []struct {
+				Value        json.Number `json:"value"`
+				Asset        string      `json:"asset"`
+				N            uint32      `json:"n"`
+				ScriptPubKey struct {
+					Hex string `json:"hex"`
+				} `json:"scriptPubKey"`
+			} `json:"vout"`
+		}
+		if err := c.rpc.Call(&raw, "getrawtransaction", tx.TxID, true); err != nil {
+			return nil, fmt.Errorf("getrawtransaction %s: %w", tx.TxID, err)
+		}
+		for _, v := range raw.Vout {
+			if v.ScriptPubKey.Hex != spkHex {
+				continue
+			}
+			var utxo *struct {
+				Confirmations int `json:"confirmations"`
+			}
+			if err := c.rpc.Call(&utxo, "gettxout", tx.TxID, v.N, true); err != nil {
+				return nil, fmt.Errorf("gettxout %s:%d: %w", tx.TxID, v.N, err)
+			}
+			if utxo != nil {
+				return &FundedHTLC{TxID: tx.TxID, Vout: v.N, Amount: coinsToAtoms(v.Value), AssetID: v.Asset}, nil
+			}
+		}
+	}
+	return c.findHTLCUTXOAt(p2sh)
 }
 
 // LockHTLC pays `amountCoins` (a decimal string, e.g. "10") of the given asset
@@ -146,6 +216,14 @@ func (c *Chain) LockHTLC(redeemScript []byte, amountCoins, assetLabel string) (*
 		return nil, err
 	}
 
+	// Idempotency: a funding of this exact script already sent by this wallet and
+	// still unspent is adopted instead of funding the P2SH a second time.
+	if prior, err := c.locateFundedHTLC(p2sh, va.ScriptPubKey); err != nil {
+		return nil, fmt.Errorf("lock HTLC: cannot establish whether it is already funded: %w", err)
+	} else if prior != nil {
+		return prior, nil
+	}
+
 	named := map[string]interface{}{"address": p2sh, "amount": amountCoins}
 	if assetLabel != "" {
 		named["assetlabel"] = assetLabel
@@ -157,9 +235,9 @@ func (c *Chain) LockHTLC(redeemScript []byte, amountCoins, assetLabel string) (*
 
 	var raw struct {
 		Vout []struct {
-			Value        float64 `json:"value"`
-			Asset        string  `json:"asset"`
-			N            uint32  `json:"n"`
+			Value        json.Number `json:"value"`
+			Asset        string      `json:"asset"`
+			N            uint32      `json:"n"`
 			ScriptPubKey struct {
 				Hex string `json:"hex"`
 			} `json:"scriptPubKey"`
@@ -256,13 +334,24 @@ type ChainOutput struct {
 	ScriptPubKeyHex string
 }
 
+// OutputUnspent reports whether (txid, vout) is in the UTXO set (mempool-aware).
+func (c *Chain) OutputUnspent(txid string, vout uint32) (bool, error) {
+	var utxo *struct {
+		Confirmations int `json:"confirmations"`
+	}
+	if err := c.rpc.Call(&utxo, "gettxout", txid, vout, true); err != nil {
+		return false, err
+	}
+	return utxo != nil, nil
+}
+
 // OutputAt returns the (txid, vout) output of any on-chain tx.
 func (c *Chain) OutputAt(txid string, vout uint32) (*ChainOutput, error) {
 	var raw struct {
 		Vout []struct {
-			Value        float64 `json:"value"`
-			Asset        string  `json:"asset"`
-			N            uint32  `json:"n"`
+			Value        json.Number `json:"value"`
+			Asset        string      `json:"asset"`
+			N            uint32      `json:"n"`
 			ScriptPubKey struct {
 				Hex string `json:"hex"`
 			} `json:"scriptPubKey"`
@@ -428,6 +517,12 @@ func (c *Chain) ExtractPreimage(txid string, wantHash []byte) ([]byte, error) {
 		for _, it := range items {
 			h := sha256.Sum256(it)
 			if bytes.Equal(h[:], wantHash) {
+				// Lightning settles only 32-byte preimages. The on-chain script accepts
+				// any length, so a counterparty could reveal a 33-byte P that claims the
+				// chain leg yet can never settle a hold; refuse to carry such a P forward.
+				if len(it) != PreimageLen {
+					return nil, fmt.Errorf("%w: revealed preimage is %d bytes, not %d", ErrBadPreimageLen, len(it), PreimageLen)
+				}
 				return it, nil
 			}
 		}
@@ -544,7 +639,7 @@ func (c *Chain) AssetBalance(assetID string) (uint64, error) {
 	if asset == "" {
 		asset = "bitcoin"
 	}
-	var bal float64
+	var bal json.Number
 	if err := c.rpc.Call(&bal, "getbalance", "*", 1, false, false, asset); err != nil {
 		return 0, err
 	}
@@ -565,6 +660,29 @@ func (c *Chain) PeggedAsset() (string, error) {
 
 const coin = 100_000_000
 
-func coinsToAtoms(v float64) uint64 {
-	return uint64(math.Round(v * coin))
+// coinsToAtoms converts the node's decimal-coins text to atoms exactly. A float64
+// is exact only below 2^53 atoms; a leg above that compared with "!=" against the
+// quoted amount would spuriously mismatch (or, worse, match a different value).
+func coinsToAtoms(v json.Number) uint64 {
+	s := strings.TrimSpace(v.String())
+	if s == "" || strings.HasPrefix(s, "-") || strings.ContainsAny(s, "eE") {
+		return 0
+	}
+	whole, frac, _ := strings.Cut(s, ".")
+	if len(frac) > 8 {
+		frac = frac[:8]
+	}
+	frac += strings.Repeat("0", 8-len(frac))
+	if whole == "" {
+		whole = "0"
+	}
+	w, err := strconv.ParseUint(whole, 10, 64)
+	if err != nil || w > math.MaxUint64/coin {
+		return 0
+	}
+	f, err := strconv.ParseUint(frac, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return w*coin + f
 }
