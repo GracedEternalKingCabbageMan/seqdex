@@ -152,6 +152,12 @@ func (v *Validator) ValidateOffer(ctx context.Context, o *seqobv1.Offer, ip stri
 	if n := proto.Size(o); n > MaxOfferBytes {
 		return fmt.Errorf("offer too large (%d bytes, max %d)", n, MaxOfferBytes)
 	}
+	// The pubkey is part of the signed bytes and is the book's key string, so it
+	// cannot be normalised here; both signers emit lowercase, and a mixed-case twin
+	// would be a second book entry for the same key.
+	if pk := o.GetMakerPubkey(); pk != strings.ToLower(pk) {
+		return fmt.Errorf("maker_pubkey must be lowercase hex")
+	}
 	if err := offer.VerifyOffer(o); err != nil {
 		return fmt.Errorf("signature: %w", err)
 	}
@@ -267,6 +273,31 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 // placeholder names).
 func checkCovenant(o *seqobv1.Offer) error {
 	ct := o.GetCovenant()
+	// Structural bounds first, so a malformed covenant never reaches the chain
+	// watcher (which would spend a pass of RPCs on it every interval).
+	if b, err := hex.DecodeString(ct.GetCovenantTxid()); err != nil || len(b) != 32 {
+		return fmt.Errorf("covenant_txid must be 32-byte hex")
+	}
+	for name, v := range map[string]string{"asset_a": ct.GetAssetA(), "asset_b": ct.GetAssetB()} {
+		if b, err := hex.DecodeString(v); err != nil || (len(b) != 32 && len(v) != 2) {
+			// 2-char placeholders are allowed only alongside non-hex pair names (fixtures).
+			if _, ok := asset32(o.GetOfferAsset()); ok || len(v) != 2 {
+				return fmt.Errorf("covenant %s must be 32-byte hex", name)
+			}
+		}
+	}
+	if len(ct.GetMakerProg()) != 32 || ct.GetMakerProgVer() != 1 {
+		return fmt.Errorf("covenant maker_prog must be a 32-byte v1 program")
+	}
+	if len(ct.GetMakerX()) != 32 {
+		return fmt.Errorf("covenant maker_x must be 32 bytes")
+	}
+	if ik := ct.GetInternalKey(); len(ik) != 0 && len(ik) != 32 {
+		return fmt.Errorf("covenant internal_key must be 32 bytes when present")
+	}
+	if ct.GetExpiryLocktime() == 0 {
+		return fmt.Errorf("covenant expiry_locktime must be set")
+	}
 	if ct.GetRateNum() < 1 || ct.GetRateDen() < 1 {
 		return fmt.Errorf("covenant rate %d/%d: numerator and denominator must be >= 1", ct.GetRateNum(), ct.GetRateDen())
 	}

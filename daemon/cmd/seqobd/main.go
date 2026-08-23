@@ -99,20 +99,21 @@ func main() {
 	vcfg.MaxExpiry = *maxExpiry
 	vcfg.MaxOffersPerMinPerPubkey = *offersPerMin
 	vcfg.MaxOffersPerMinPerIP = *offersPerMinI
-	// Phase-1 stub liveness probe (no-op). A later build wires this to nodeRPC.
-	v := validator.New(vcfg, validator.NoopLivenessProbe{})
-
-	// A node RPC (parsed once here) powers BOTH the covenant chain-watcher and the
-	// interactive-fill reorg watcher (P3.9).
+	// A node RPC (parsed once here) powers the covenant submit probe, the covenant
+	// chain-watcher and the interactive-fill reorg watcher (P3.9).
 	var nodeHost string
 	var nodePort int
+	var probe validator.LivenessProbe = validator.NoopLivenessProbe{}
 	if *nodeRPC != "" {
 		h, p, err := splitHostPort(*nodeRPC)
 		if err != nil {
 			logger.Fatalf("bad -node-rpc %q: %v", *nodeRPC, err)
 		}
 		nodeHost, nodePort = h, p
+		// A covenant offer is admitted only if its outpoint is funded as advertised.
+		probe = watcher.SubmitProbe{Chain: watcher.NewRPCChain(nodeHost, nodePort, *nodeUser, *nodePass)}
 	}
+	v := validator.New(vcfg, probe)
 
 	// onReopen returns an order to the book. It fires in two cases (Principle 1):
 	//   - a lift ABORTS/times out before settlement: the order was never removed, so

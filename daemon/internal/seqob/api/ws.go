@@ -476,14 +476,21 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 			// Edit demands a signature over DIFFERENT canonical bytes than the resting
 			// copy (a byte-identical one is caught as ErrReplay above, and signatures are
 			// canonical low-S DER so no second encoding of the same bytes verifies); only
-			// the key holder can produce that, which is what makes re-registering the
-			// maker endpoint below safe.
+			// the key holder can produce that. Registration additionally requires the copy
+			// to be STRICTLY newer than the resting one: an earlier variant the maker
+			// itself signed in the same second (and a third party captured from the
+			// public book before it was replaced) still carries a real signature but
+			// proves nothing about who holds this socket. A reconnecting maker re-signs
+			// with the current time, which is newer.
+			prev, _ := s.store.Get(offerstore.Key{MakerPubkey: o.GetMakerPubkey(), OfferID: o.GetOfferId()})
 			if eerr := s.store.Edit(o); eerr != nil {
 				c.sendErr(409, "submit(refresh): "+eerr.Error())
 				return
 			}
-			s.registerMaker(c, o.GetMakerPubkey())
-			s.ownOffer(c, o)
+			if prev == nil || o.GetCreatedAtUnix() > prev.Offer.GetCreatedAtUnix() {
+				s.registerMaker(c, o.GetMakerPubkey())
+				s.ownOffer(c, o)
+			}
 			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 			return
 		}

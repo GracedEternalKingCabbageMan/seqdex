@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"strconv"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -93,9 +94,9 @@ func (c *rpcChain) Tip() (string, int64, error) {
 }
 
 type txout struct {
-	Confirmations int     `json:"confirmations"`
-	Value         float64 `json:"value"`
-	Asset         string  `json:"asset"`
+	Confirmations int         `json:"confirmations"`
+	Value         json.Number `json:"value"`
+	Asset         string      `json:"asset"`
 	ScriptPubKey  struct {
 		Hex string `json:"hex"`
 	} `json:"scriptPubKey"`
@@ -108,9 +109,9 @@ type rawtx struct {
 		Vout uint32 `json:"vout"`
 	} `json:"vin"`
 	Vout []struct {
-		N            uint32  `json:"n"`
-		Value        float64 `json:"value"`
-		Asset        string  `json:"asset"`
+		N            uint32      `json:"n"`
+		Value        json.Number `json:"value"`
+		Asset        string      `json:"asset"`
 		ScriptPubKey struct {
 			Hex string `json:"hex"`
 		} `json:"scriptPubKey"`
@@ -229,10 +230,32 @@ func spentInputIndex(tx *rawtx, txid string, vout uint32) (uint32, bool) {
 	return 0, false
 }
 
-// coinsToAtoms converts a decimal-coins value to integer atoms (1e8 per coin).
-func coinsToAtoms(v float64) uint64 {
-	if v <= 0 {
+// coinsToAtoms converts the node's decimal-coins value to integer atoms (1e8 per
+// coin) EXACTLY, from the decimal text. Going through float64 is exact only below
+// 2^53 atoms (about 9e7 units at 8 decimals); a large issuance read that way
+// mis-sizes the live covenant by whole atoms, and the watcher then "reconciles" the
+// order to a wrong size. A malformed or negative value reads as 0 (the classifier
+// treats that as an unfundable covenant, the safe direction).
+func coinsToAtoms(v json.Number) uint64 {
+	s := strings.TrimSpace(v.String())
+	if s == "" || strings.HasPrefix(s, "-") || strings.ContainsAny(s, "eE") {
 		return 0
 	}
-	return uint64(math.Round(v * 1e8))
+	whole, frac, _ := strings.Cut(s, ".")
+	if len(frac) > 8 {
+		frac = frac[:8]
+	}
+	frac += strings.Repeat("0", 8-len(frac))
+	if whole == "" {
+		whole = "0"
+	}
+	w, err := strconv.ParseUint(whole, 10, 64)
+	if err != nil || w > math.MaxUint64/100_000_000 {
+		return 0
+	}
+	f, err := strconv.ParseUint(frac, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return w*1e8 + f
 }
