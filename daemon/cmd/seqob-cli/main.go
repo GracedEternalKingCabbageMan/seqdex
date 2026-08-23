@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -387,6 +388,12 @@ func buildTakerWallet(esploraURL, netName, takerPriv, takerBlinding string, conf
 	rb := client.NewRealBackend(net, mustHex32(takerPriv, "taker-priv"), mustHex32(takerBlinding, "taker-blinding"))
 	rb.FetchUtxos = svc.GetUnspents
 	rb.BroadcastFn = svc.BroadcastTransaction
+	rb.RejectedTxSink = func(txHex string) {
+		path := filepath.Join(os.TempDir(), fmt.Sprintf("seqob-rejected-%d.hex", time.Now().UnixNano()))
+		if err := os.WriteFile(path, []byte(txHex+"\n"), 0o600); err == nil {
+			fmt.Printf("rejected tx hex saved to %s (decoderawtransaction it to see why)\n", path)
+		}
+	}
 	fmt.Printf("LIVE taker (confidential=%v) — fund this address with the pay asset: %s\n", confidential, rb.TakerAddress())
 	return &client.LiveWallet{Backend: rb, TakerInputsConfidential: confidential, TakerRecvConfidential: confidential}
 }
