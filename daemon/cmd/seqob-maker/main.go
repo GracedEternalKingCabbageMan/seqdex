@@ -11,6 +11,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -88,6 +89,28 @@ func inFlightSwaps() int {
 // isDraining reports whether a shutdown has been requested; serve loops refuse NEW
 // lifts once it is set, so the drain can actually finish.
 func isDraining() bool { return atomic.LoadInt32(&draining) == 1 }
+
+// refuseIfDraining answers a lift with an explicit, retryable refusal while the
+// maker is shutting down, so it takes no NEW value during the drain. Every serve
+// loop calls it after reserving the in-flight slot; the caller releases the slot.
+func refuseIfDraining(sid string, cr *client.Crypter, refuse func(sid string, cr *client.Crypter, code, msg string)) bool {
+	if !isDraining() {
+		return false
+	}
+	refuse(sid, cr, "draining", "this maker is shutting down for a re-quote; retry on another offer")
+	return true
+}
+
+// derivedRefundKey is a per-purpose key derived from the maker's identity key, used
+// where a maker locks funds it may later need to RECLAIM by timelock. A fresh random
+// key minted for one swap lives only in that process: if the supervisor re-quotes or
+// kills it before the refund, the locked asset is lost for good (the 2026-08-11
+// class). A key derived from -maker-priv can always be rebuilt from the operator's
+// own key file plus the on-chain script, with no per-swap state at all.
+func derivedRefundKey(identity *btcec.PrivateKey, purpose string) *xchain.Key {
+	h := sha256.Sum256(append(identity.Serialize(), []byte("seqob-maker/refund/"+purpose)...))
+	return xchain.KeyFromBytes(h[:])
+}
 
 func armGracefulShutdown(cap time.Duration) {
 	ch := make(chan os.Signal, 1)
@@ -197,6 +220,7 @@ func main() {
 			quoteAsset: *quoteAsset, seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet,
 			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
 			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
+			stateDir: *xstateDir,
 		})
 		return
 	}
@@ -1026,8 +1050,11 @@ func loadOrGenKey(hexKey string) *btcec.PrivateKey {
 		if err != nil {
 			fatal("gen key: %v", err)
 		}
-		fmt.Printf("generated maker key: priv=%s pub=%s\n",
-			hex.EncodeToString(k.Serialize()), hex.EncodeToString(k.PubKey().SerializeCompressed()))
+		// Only the public half is printed: under a supervisor stdout is a log file, and
+		// the identity key must not end up in it. A generated key lives only in this
+		// process; pass -maker-priv to keep a stable identity across restarts.
+		fmt.Printf("generated maker key (not persisted; pass -maker-priv for a stable identity): pub=%s\n",
+			hex.EncodeToString(k.PubKey().SerializeCompressed()))
 		return k
 	}
 	b, err := hex.DecodeString(hexKey)
@@ -1314,6 +1341,15 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			cr, err := client.NewMakerCrypterFromLift(cfg.makerKey, lr.GetTakerSessionPubkey())
 			if err != nil {
 				fmt.Printf("lift %s: crypter error: %v\n", sid, err)
+				continue
+			}
+			// The relay routes by pubkey; a sibling process under the same identity key
+			// may own the offer this lift names. The other serve loops already refuse
+			// that up front. Here it matters most: the REVERSE cross maker funds its BTC
+			// leg before the taker checks anything, so a mis-wired lift strands maker BTC
+			// until T_btc.
+			if lr.GetOfferId() != o.GetOfferId() {
+				refuse(sid, cr, "stale_offer", "this maker process serves offer "+o.GetOfferId()+", not "+lr.GetOfferId())
 				continue
 			}
 			mu.Lock()
@@ -1792,6 +1828,89 @@ func persistXSessionSubmarine(dir, sid, offerID string, r *client.MakerSubmarine
 	}
 	if err := ioutil.WriteFile(filepath.Join(dir, sid+".json"), b, 0o600); err != nil {
 		fmt.Printf("session %s: persist write: %v\n", sid, err)
+	}
+}
+
+// persistXSessionSubmarineReverse records a REVERSE submarine maker lift (the maker
+// locked the asset and waits for the taker's Lightning payment). The refund key is
+// derived from the identity key, so the file's job is to name the leg: with it, the
+// operator can build the CLTV refund after T_seq without scanning the chain.
+func persistXSessionSubmarineReverse(dir, sid, offerID string, r *client.MakerReverseSubmarineResult) {
+	if dir == "" {
+		dir = "xmaker-sessions"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Printf("session %s: persist mkdir: %v\n", sid, err)
+		return
+	}
+	st := xmakerSessionState{
+		SessionID: sid, OfferID: offerID, Direction: "submarine-reverse",
+		SeqLocktime: r.SeqLocktime,
+		Bolt11:      r.Bolt11,
+		InvoiceMsat: r.FilledMsat,
+		Settled:     r.Settled,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(r.HashH) > 0 {
+		st.HashHex = hex.EncodeToString(r.HashH)
+	}
+	if r.SeqRefundKey != nil {
+		st.SeqRefundPrivHex = hex.EncodeToString(r.SeqRefundKey.Bytes())
+	}
+	if r.SeqLeg != nil && r.SeqLeg.Funded != nil {
+		st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = r.SeqLeg.Funded.TxID, r.SeqLeg.Funded.Vout, r.SeqLeg.Funded.Amount
+		st.SeqLegAsset = r.SeqLeg.Funded.AssetID
+		st.SeqLegScriptHex = hex.EncodeToString(r.SeqLeg.Script)
+	}
+	writeSessionState(dir, sid, &st)
+}
+
+// persistXSessionSubAssetSell records a sub-asset SELL maker lift whose BTC (or
+// quote-asset) HTLC is funded and not yet settled, so the leg can be reclaimed at
+// T_btc with the identity-derived refund key.
+func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAssetSellResult, refund *xchain.Key) {
+	if dir == "" {
+		dir = "xmaker-sessions"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Printf("session %s: persist mkdir: %v\n", sid, err)
+		return
+	}
+	st := xmakerSessionState{
+		SessionID: sid, OfferID: offerID, Direction: "subasset-sell",
+		BtcLocktime: r.BtcLocktime,
+		Settled:     r.Settled,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(r.HashH) > 0 {
+		st.HashHex = hex.EncodeToString(r.HashH)
+	}
+	if refund != nil {
+		st.BtcRefundPrivHex = hex.EncodeToString(refund.Bytes())
+	}
+	if r.BtcLeg != nil && r.BtcLeg.Funded != nil {
+		st.BtcLegTxid, st.BtcLegVout, st.BtcLegAmount = r.BtcLeg.Funded.TxID, r.BtcLeg.Funded.Vout, r.BtcLeg.Funded.Amount
+		st.BtcLegScriptHex = hex.EncodeToString(r.BtcLeg.Script)
+	}
+	writeSessionState(dir, sid, &st)
+}
+
+// writeSessionState writes a session file atomically (temp + rename), so a crash
+// mid-write never leaves a truncated file the resume pass would skip.
+func writeSessionState(dir, sid string, st *xmakerSessionState) {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		fmt.Printf("session %s: persist marshal: %v\n", sid, err)
+		return
+	}
+	final := filepath.Join(dir, sid+".json")
+	tmp := final + ".tmp"
+	if err := ioutil.WriteFile(tmp, b, 0o600); err != nil {
+		fmt.Printf("session %s: persist write: %v\n", sid, err)
+		return
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		fmt.Printf("session %s: persist rename: %v\n", sid, err)
 	}
 }
 
