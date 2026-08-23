@@ -50,6 +50,11 @@ type RealBackend struct {
 	// validates the maker-returned SwapAccept against it before signing, so it is
 	// authentic taker-side state (never relay-supplied).
 	lastReq *seqdexv1.SwapRequest
+	// RejectedTxSink, when set, receives the fully co-signed tx hex the node
+	// refused, so an operator can decode what was actually rejected instead of
+	// reasoning from the node's one-line reason.
+	RejectedTxSink func(txHex string)
+
 	// lastConfidential records whether the last proposal was a BLINDED-book lift, so
 	// ProposerFinalize can fail closed (reject a maker-returned tx that is not fully
 	// blinded) before the taker signs its inputs.
@@ -235,6 +240,9 @@ func (b *RealBackend) ProposerFinalize(acc *seqdexv1.SwapAccept) (*seqdexv1.Swap
 	}
 	txid, err := b.BroadcastFn(txHex)
 	if err != nil {
+		if b.RejectedTxSink != nil {
+			b.RejectedTxSink(txHex)
+		}
 		return nil, "", err
 	}
 	return &complete, txid, nil
