@@ -1044,8 +1044,8 @@ func resumeParamsFromStateReverse(st *xmakerSessionState, btcChain *xchain.Bitco
 	// rebuild the script and scan the UTXO set for it.
 	if rp.SeqLeg == nil && st.TakerSeqRefundPub != "" && st.SeqLocktime > 0 && rp.SeqClaimKey != nil {
 		if refundPub, rerr := hex.DecodeString(st.TakerSeqRefundPub); rerr == nil && len(refundPub) == 33 {
-			if script, serr := rp.Ops.(*client.LiveXcOps).Swap.SEQHTLCScript(rp.SeqClaimKey.PubKey(), refundPub, st.SeqLocktime); serr == nil {
-				if utxo, ferr := seqChain.FindHTLCUTXO(script); ferr == nil && utxo != nil {
+			if script, utxo := discoverHTLC(seqChain, rp.Ops.(*client.LiveXcOps).Swap.SEQHTLCScriptVariants, rp.SeqClaimKey.PubKey(), refundPub, st.SeqLocktime); utxo != nil {
+				{
 					bh, _ := seqChain.BlockHashOfTx(utxo.TxID)
 					fmt.Printf("session %s: reverse resume: DISCOVERED the taker's asset leg on-chain (%s:%d, %d atoms) — the courier announce never arrived; claiming from the persisted terms\n",
 						sid, utxo.TxID, utxo.Vout, utxo.Amount)
@@ -2017,6 +2017,22 @@ func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAss
 	writeSessionState(dir, sid, &st)
 }
 
+// discoverHTLC scans the UTXO set for a leg funded to any accepted script form for
+// these parameters (a counterparty may have built the legacy form), returning the
+// script that matched and the funding.
+func discoverHTLC(seqChain *xchain.Chain, variants func(claimPub, refundPub []byte, locktime uint32) ([][]byte, error), claimPub, refundPub []byte, locktime uint32) ([]byte, *xchain.FundedHTLC) {
+	vs, err := variants(claimPub, refundPub, locktime)
+	if err != nil {
+		return nil, nil
+	}
+	for _, script := range vs {
+		if utxo, ferr := seqChain.FindHTLCUTXO(script); ferr == nil && utxo != nil {
+			return script, utxo
+		}
+	}
+	return nil, nil
+}
+
 // onchainBackend names the chain a sub-asset rail's on-chain leg lives on: "bitcoin"
 // for the parent chain, or "seq:<asset>" for the mixed same-chain shape where a
 // Sequentia quote asset stands in BTC's place.
@@ -2114,8 +2130,8 @@ func resumeSubmarineSession(st *xmakerSessionState, seqChain *xchain.Chain, lnSo
 	// fully determined by persisted material once the taker refund pub is known.
 	if st.SeqLegTxid == "" && st.TakerSeqRefundPub != "" && st.SeqLocktime > 0 {
 		if refundPub, rerr := hex.DecodeString(st.TakerSeqRefundPub); rerr == nil && len(refundPub) == 33 {
-			if script, serr := sub.SEQHTLCScript(claimKey.PubKey(), refundPub, st.SeqLocktime); serr == nil {
-				if utxo, ferr := seqChain.FindHTLCUTXO(script); ferr == nil && utxo != nil {
+			if script, utxo := discoverHTLC(seqChain, sub.SEQHTLCScriptVariants, claimKey.PubKey(), refundPub, st.SeqLocktime); utxo != nil {
+				{
 					fmt.Printf("%s: submarine resume: DISCOVERED the taker's asset leg on-chain (%s:%d, %d atoms)\n",
 						name, utxo.TxID, utxo.Vout, utxo.Amount)
 					st.SeqLegTxid, st.SeqLegVout, st.SeqLegAmount = utxo.TxID, utxo.Vout, utxo.Amount

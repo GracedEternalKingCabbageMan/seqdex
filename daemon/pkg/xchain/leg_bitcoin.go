@@ -60,6 +60,16 @@ func (l *BitcoinLeg) HTLCScript(claimPub, refundPub []byte, locktime uint32) ([]
 	return l.prim.LockScript(claimPub, refundPub, locktime)
 }
 
+// HTLCScriptVariants lists the accepted script forms for these parameters.
+func (l *BitcoinLeg) HTLCScriptVariants(claimPub, refundPub []byte, locktime uint32) ([][]byte, error) {
+	return ScriptVariants(l.prim, claimPub, refundPub, locktime)
+}
+
+// MatchHTLCScript returns provided if it is an accepted form, else nil.
+func (l *BitcoinLeg) MatchHTLCScript(provided, claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
+	return MatchScript(l.prim, provided, claimPub, refundPub, locktime)
+}
+
 // P2SHAddress derives the base58 P2SH address for a redeemScript using this
 // leg's chain params. Unlike the Elements leg (which asks the node via
 // decodescript), the maker derives the Bitcoin HTLC address itself so it never
@@ -235,11 +245,21 @@ func (l *BitcoinLeg) VerifyFundedHTLC(
 	wantAmount uint64,
 	confirmations, minConf int,
 ) (*FundedBTCHTLC, error) {
-	// 1) recompute the redeemScript.
 	wantScript, err := l.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
 	if err != nil {
 		return nil, err
 	}
+	return l.VerifyFundedHTLCScript(rawTxHex, wantScript, hashH, wantAmount, confirmations, minConf)
+}
+
+// VerifyFundedHTLCScript is VerifyFundedHTLC for an already-matched script (the
+// counterparty's, verified against the accepted forms by the caller).
+func (l *BitcoinLeg) VerifyFundedHTLCScript(
+	rawTxHex string,
+	wantScript, hashH []byte,
+	wantAmount uint64,
+	confirmations, minConf int,
+) (*FundedBTCHTLC, error) {
 	// The redeemScript embeds H (OP_SHA256 <H> ...); a script byte match implies
 	// the hashlock matches, but assert H explicitly for a clear error.
 	if !scriptEmbedsHash(wantScript, hashH) {

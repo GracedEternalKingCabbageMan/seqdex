@@ -17,9 +17,13 @@ func initExplorer() error {
 	return err
 }
 
+// stubExplorer is a non-nil explorer.Service for option validation tests that
+// never reach the network.
+type stubExplorer struct{ explorer.Service }
+
 func TestNewTrade(t *testing.T) {
 	if err := initExplorer(); err != nil {
-		t.Fatal(err)
+		t.Skipf("no Esplora at localhost:3001: %v", err)
 	}
 
 	client, err := tradeclient.NewTradeClient("localhost", 9000)
@@ -43,6 +47,7 @@ func TestFailingNewTrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	explorerSvc := explorer.Service(stubExplorer{})
 
 	tests := []struct {
 		opts NewTradeOpts
