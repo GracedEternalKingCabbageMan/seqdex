@@ -55,6 +55,17 @@ const (
 	pingPeriod = 50 * time.Second
 )
 
+// maxWSFrameBytes bounds one inbound WebSocket frame. Every legitimate To message is
+// a signed offer, a lift, or a sealed courier frame of a few KiB; gorilla's default
+// is unlimited, so without this one frame could allocate whatever the peer declares.
+const maxWSFrameBytes = 256 << 10
+
+// maxSubsPerConn bounds the per-pair market subscriptions one connection may hold.
+// Each subscription is a forwarder goroutine plus a buffered delta channel, keyed by an
+// arbitrary pair string the subscriber chooses, so without a cap one socket could hold
+// an unbounded number and make every book event O(n) in its forwarders.
+const maxSubsPerConn = 64
+
 func (c *wsConn) send(from *seqobv1.From) error {
 	b, err := jsonMarshal.Marshal(from)
 	if err != nil {
@@ -124,6 +135,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// P3.8 keepalive: bound reads by a deadline the pong handler (and any inbound
 	// frame) extends, and ping on a ticker so a half-open peer is reaped instead of
 	// pinning its offers forever.
+	conn.SetReadLimit(maxWSFrameBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -329,7 +341,7 @@ func (s *Server) dispatch(c *wsConn, to *seqobv1.To, ip string) {
 	case *seqobv1.To_SwapMsg:
 		s.wsSwapMsg(c, m.SwapMsg)
 	case *seqobv1.To_ListMarkets:
-		_ = c.send(&seqobv1.From{Msg: &seqobv1.From_MarketList{MarketList: &seqobv1.MarketList{Markets: s.store.Markets()}}})
+		_ = c.send(&seqobv1.From{Msg: &seqobv1.From_MarketList{MarketList: &seqobv1.MarketList{Markets: s.markets()}}})
 	default:
 		c.sendErr(400, "unknown or empty To.msg")
 	}
@@ -357,6 +369,14 @@ func (s *Server) wsSubscribe(c *wsConn, pair *seqobv1.AssetPair) {
 	// transparent-book UI never renders a confidential offer and vice-versa.
 	confidential := pair.GetConfidential()
 	pk := subKey(pair)
+	c.mu.Lock()
+	_, replacing := c.subs[pk]
+	full := !replacing && len(c.subs) >= maxSubsPerConn
+	c.mu.Unlock()
+	if full {
+		c.sendErr(429, fmt.Sprintf("market_subscribe: at most %d subscriptions per connection", maxSubsPerConn))
+		return
+	}
 	snap, id, ch := s.store.Subscribe(pair, confidential)
 	stop := make(chan struct{})
 
@@ -435,9 +455,12 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 		if errors.Is(err, validator.ErrReplay) {
 			// ITEM A: byte-identical replay of an already-resting offer. It cost the
 			// maker no rate budget; do not re-submit (the store would reject the
-			// duplicate key). Re-register reachability and re-ack the live status.
-			s.registerMaker(c, o.GetMakerPubkey())
-			s.ownOffer(c, o)
+			// duplicate key). Re-ack the live status and nothing else: the signed bytes
+			// are public (the orderbook serves them), so a replay proves nothing about
+			// who is on this socket. Registering it as the maker's endpoint would hand any
+			// client the maker's lift routing and, on disconnect, the eviction of the
+			// maker's whole book. A maker that reconnects re-signs (fresh created_at /
+			// expiry) and registers through the edit path below.
 			_ = c.send(&seqobv1.From{Msg: &seqobv1.From_OrderStatus{OrderStatus: s.restingStatus(o)}})
 			return
 		}
@@ -450,6 +473,11 @@ func (s *Server) wsOfferSubmit(c *wsConn, o *seqobv1.Offer, ip string) {
 		// still-resting key. Treat that as an EDIT + re-register (so lifts route to the reconnected
 		// agent) rather than a 409 — this is what keeps the durable book populated across WS churn.
 		if errors.Is(err, offerstore.ErrExists) {
+			// Edit demands a signature over DIFFERENT canonical bytes than the resting
+			// copy (a byte-identical one is caught as ErrReplay above, and signatures are
+			// canonical low-S DER so no second encoding of the same bytes verifies); only
+			// the key holder can produce that, which is what makes re-registering the
+			// maker endpoint below safe.
 			if eerr := s.store.Edit(o); eerr != nil {
 				c.sendErr(409, "submit(refresh): "+eerr.Error())
 				return
