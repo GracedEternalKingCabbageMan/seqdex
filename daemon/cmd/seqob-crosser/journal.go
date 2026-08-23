@@ -128,6 +128,30 @@ func (j *Journal) Update(pair string) error {
 	return j.flushLocked()
 }
 
+// SetLeg records one leg's outcome under the journal's lock and flushes. Records
+// live inside the journal's map, so mutating them from a pair's goroutine while
+// another pair's End marshals the map was a data race (a torn string in the file).
+func (j *Journal) SetLeg(pair string, second bool, status, stateFile, resume string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	rec := j.st.InFlight[pair]
+	if rec == nil {
+		return nil
+	}
+	leg := &rec.First
+	if second {
+		leg = &rec.Second
+	}
+	leg.Status = status
+	if stateFile != "" {
+		leg.StateFile = stateFile
+	}
+	if resume != "" {
+		leg.Resume = resume
+	}
+	return j.flushLocked()
+}
+
 // End closes a pair's in-flight record, folding `drift` (nil for a clean
 // outcome) into the settled ledger.
 func (j *Journal) End(pair string, drift map[string]int64) error {

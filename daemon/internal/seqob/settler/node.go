@@ -26,7 +26,7 @@ const dustFold = 1000
 // do is build a tx the covenants reject on broadcast.
 type NodeFunder struct {
 	chain     *xchain.Chain
-	bitcoin   string // pegged asset DISPLAY hex (the listunspent "asset" field)
+	bitcoin   string // fee/gap asset DISPLAY hex (the listunspent "asset" field); the pegged asset by default, any accepted asset by -fee-asset
 	btcCommit []byte // 0x01 || internal-order bitcoin asset (change/fee outputs)
 	feeAtoms  uint64
 }
@@ -214,8 +214,25 @@ func (f *NodeFunder) addrSPK(addr string) (string, error) {
 // ChainBroadcaster implements Broadcaster over a node's sendrawtransaction.
 type ChainBroadcaster struct{ Chain *xchain.Chain }
 
-// Broadcast submits the fully-assembled joint-fill tx and returns its txid.
+// Broadcast gates the fully-assembled joint-fill tx on testmempoolaccept, then
+// submits it and returns its txid. A spend the node would reject (a covenant
+// floor missed by one atom, a fee under the relay floor) used to be sent blind,
+// fail, and be rebuilt with fresh addresses every pass.
 func (b ChainBroadcaster) Broadcast(rawTxHex string) (string, error) {
+	var accept []struct {
+		Allowed      bool   `json:"allowed"`
+		RejectReason string `json:"reject-reason"`
+	}
+	if err := b.Chain.RPC().Call(&accept, "testmempoolaccept", []string{rawTxHex}); err != nil {
+		return "", fmt.Errorf("testmempoolaccept: %w", err)
+	}
+	if len(accept) == 0 || !accept[0].Allowed {
+		reason := "unknown"
+		if len(accept) > 0 && accept[0].RejectReason != "" {
+			reason = accept[0].RejectReason
+		}
+		return "", fmt.Errorf("node would reject the joint fill (%s); not broadcast", reason)
+	}
 	return b.Chain.Broadcast(rawTxHex)
 }
 
@@ -237,6 +254,19 @@ type Inspector interface {
 func Resolve(m matcher.Match, view Inspector) (lockedA, lockedB uint64, err error) {
 	if !m.BothCovenant() {
 		return 0, 0, fmt.Errorf("not a both-covenant match")
+	}
+	// Past a covenant's REFUND expiry its maker can reclaim at any time and race
+	// the joint fill; nothing is lost (first spend wins) but the attempt is wasted.
+	if tv, ok := view.(interface {
+		Tip() (string, int64, error)
+	}); ok {
+		if _, tip, terr := tv.Tip(); terr == nil {
+			for _, ct := range []*seqobv1.CovenantTerms{m.RestingCovenant, m.IncomingCovenant} {
+				if exp := int64(ct.GetExpiryLocktime()); exp != 0 && tip >= exp {
+					return 0, 0, fmt.Errorf("covenant %s:%d is past its refund expiry %d (tip %d)", ct.GetCovenantTxid(), ct.GetCovenantVout(), exp, tip)
+				}
+			}
+		}
 	}
 	lockedA, err = resolveOne(m.RestingCovenant, view)
 	if err != nil {

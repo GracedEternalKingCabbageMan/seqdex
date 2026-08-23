@@ -75,6 +75,8 @@ type scriptedNode struct {
 	rejectReason   string
 
 	addrN       int
+	locked      int // lockunspent(false) calls
+	unlocked    int // lockunspent(true) calls
 	signCalls   []string
 	mempoolHex  []string
 	sent        []string
@@ -147,6 +149,14 @@ func (n *scriptedNode) Call(out interface{}, method string, params ...interface{
 		raw, _ := params[0].(string)
 		n.sent = append(n.sent, raw)
 		return respond(strings.Repeat("f1", 32))
+	case "lockunspent":
+		unlock, _ := params[0].(bool)
+		if unlock {
+			n.unlocked++
+		} else {
+			n.locked++
+		}
+		return respond(true)
 	default:
 		n.t.Fatalf("unexpected RPC %s", method)
 		return nil
