@@ -68,6 +68,13 @@ type TakerReverseParams struct {
 	MinBtcClaimDelta uint32 // T_btc >= btcTip + this (default 30 parent blocks)
 	MinSeqFundWindow uint32 // T_seq >= seqTip + this (default 120 SEQ blocks)
 	BtcClaimMargin   uint32 // refuse to claim closer than this to T_btc (default 6)
+	// MaxSeqLockDelta caps T_seq above the SEQ tip (default 480). Both locktimes come
+	// from the maker; without an upper bound on T_seq, and without T_btc being long
+	// enough to outlast it, the maker can refund its BTC at T_btc and then claim our
+	// asset with the secret it holds, since the claim branch never expires. The
+	// cross-leg rule is the B1 one: T_btc - btcTip >= ceil((T_seq - seqTip) * 90/150)
+	// + BtcClaimMargin, under the same slow-SEQ / fast-BTC divisors the payer bridge uses.
+	MaxSeqLockDelta uint32
 
 	MinBTCConf   int    // confirmations required on the MAKER's BTC leg before we fund (default 1)
 	SpendFeeSats uint64 // fee target in native sats (default 1000)
@@ -99,6 +106,15 @@ type TakerReverseResult struct {
 	FilledBtc uint64
 }
 
+// reverseMinBtcDelta is the fewest parent blocks T_btc must sit above the BTC tip
+// for the maker's BTC refund to come AFTER our asset refund at T_seq: the asset
+// refund must always be reachable before the maker can take its BTC back and
+// still claim our asset. Slow-SEQ (90 s) over fast-BTC (150 s) is the conservative
+// ratio the payer bridge's B1 rule uses; margin is our claim runway on top.
+func reverseMinBtcDelta(seqDelta, margin uint32) uint32 {
+	return uint32((uint64(seqDelta)*90+149)/150) + margin
+}
+
 func (p *TakerReverseParams) logf(format string, args ...interface{}) {
 	if p.Log != nil {
 		p.Log(format, args...)
@@ -126,6 +142,9 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	}
 	if p.BtcClaimMargin == 0 {
 		p.BtcClaimMargin = 6
+	}
+	if p.MaxSeqLockDelta == 0 {
+		p.MaxSeqLockDelta = 480
 	}
 	// 0 IS A REAL CHOICE — accept the counterparty's BTC HTLC straight from the
 	// mempool. It used to be coerced to 1, which made "instant" inexpressible and
@@ -259,6 +278,14 @@ func RunTakerReverse(p TakerReverseParams, send XcSend, recv XcRecv) (*TakerReve
 	if tSeq < uint32(seqTip)+p.MinSeqFundWindow {
 		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_locktime leaves no funding window")
 		return res, fmt.Errorf("%w: T_seq %d vs tip %d (min window %d)", ErrXcBadTerms, tSeq, seqTip, p.MinSeqFundWindow)
+	}
+	if tSeq > uint32(seqTip)+p.MaxSeqLockDelta {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "seq_locktime too far out")
+		return res, fmt.Errorf("%w: T_seq %d vs tip %d (max delta %d)", ErrXcBadTerms, tSeq, seqTip, p.MaxSeqLockDelta)
+	}
+	if minBtc := reverseMinBtcDelta(tSeq-uint32(seqTip), p.BtcClaimMargin); tBtc-uint32(btcTip) < minBtc {
+		sendXcFail(p.Crypter, send, "terms_mismatch", "btc_locktime does not outlast seq_locktime")
+		return res, fmt.Errorf("%w: T_btc delta %d must be >= %d to outlast T_seq delta %d (B1 ordering)", ErrXcBadTerms, tBtc-uint32(btcTip), minBtc, tSeq-uint32(seqTip))
 	}
 
 	// 3. Verify the maker's BTC leg against OUR node, polling out propagation
@@ -552,8 +579,11 @@ type MakerReverseParams struct {
 	BtcAmount uint64 // sats we pay
 	FeeBtc    uint64 // advisory fee surfaced in terms
 
-	BtcLocktimeDelta uint32 // default 100 (our BTC refund if the taker vanishes; ~16h)
-	SeqLocktimeDelta uint32 // default 240 (the taker's refund horizon; ~2h)
+	// BtcLocktimeDelta defaults to 180, the same as the forward maker and the binary's
+	// flag: the taker now requires T_btc to outlast T_seq under the B1 ratio
+	// (ceil(240*90/150)+6 = 150 for the default T_seq), and the old 100 failed it.
+	BtcLocktimeDelta uint32 // default 180 (our BTC refund if the taker vanishes; ~30h)
+	SeqLocktimeDelta uint32 // default 240 (the taker's refund horizon; ~4h at 60 s slots)
 
 	MinBTCConf     int    // confirmations we need on our OWN BTC leg before the anchor gate (default 1)
 	SeqClaimMargin uint32 // never reveal the secret closer than this to T_seq (default 10)
@@ -616,7 +646,7 @@ func RunMakerReverse(p MakerReverseParams, in <-chan []byte, send XcSend) (*Make
 		return nil, errors.New("maker reverse: offer amounts required")
 	}
 	if p.BtcLocktimeDelta == 0 {
-		p.BtcLocktimeDelta = 100
+		p.BtcLocktimeDelta = 180
 	}
 	if p.SeqLocktimeDelta == 0 {
 		p.SeqLocktimeDelta = 240

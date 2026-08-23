@@ -41,6 +41,7 @@ const (
 type mockBlock struct {
 	anchor    int64
 	certified bool
+	orphaned  bool // known header, no longer on the active chain (confirmations -1)
 }
 
 // mockSeqNode serves the three reads VerifySeqLegSafe makes: getblockheader
@@ -71,9 +72,13 @@ func (m *mockSeqNode) chain(t *testing.T) *xchain.Chain {
 					"result": nil, "error": map[string]interface{}{"code": -5, "message": "Block not found"}, "id": "t"})
 				return
 			}
+			confs := 1
+			if b.orphaned {
+				confs = -1
+			}
 			reply(map[string]interface{}{
 				"hash": hash, "anchorheight": b.anchor, "poscertified": b.certified,
-				"poscountersigs": 15, "posquorum": 14,
+				"poscountersigs": 15, "posquorum": 14, "confirmations": confs,
 			})
 		case "getanchorstatus":
 			reply(map[string]interface{}{
@@ -101,6 +106,24 @@ func (m *mockSeqNode) swap(t *testing.T) *xchain.Swap {
 	t.Helper()
 	// Only the SEQ side is exercised; the BTC backend is never called.
 	return xchain.NewSwap(nil, m.chain(t), xchain.NewHashLockFromHash(make([]byte, 32)))
+}
+
+// A header is served for an orphaned block too, and its anchorheight then commits
+// nothing. The gate must refuse such a block (retryably: the caller re-derives the
+// confirming block from the leg's txid) rather than read a number the chain no
+// longer stands behind.
+func TestVerifySeqLegSafeRefusesOrphanedBlock(t *testing.T) {
+	node := &mockSeqNode{
+		blocks:    map[string]mockBlock{liveBuryBlock: {anchor: liveBuryAnchor, certified: true, orphaned: true}},
+		tipAnchor: liveBuryAnchor, tipStatus: "ok",
+	}
+	_, err := node.swap(t).VerifySeqLegSafe(liveBuryBlock, liveBTCLegHeight)
+	if err == nil {
+		t.Fatal("gate accepted an orphaned block whose anchor would otherwise satisfy the ordering")
+	}
+	if !errors.Is(err, xchain.ErrAnchorOrdering) || errors.Is(err, xchain.ErrAnchorOrderingTerminal) {
+		t.Fatalf("want retryable ErrAnchorOrdering, got %v", err)
+	}
 }
 
 // TestVerifySeqLegSafeRejectsUnderAnchoredLeg replays the FAILED run. The refusal

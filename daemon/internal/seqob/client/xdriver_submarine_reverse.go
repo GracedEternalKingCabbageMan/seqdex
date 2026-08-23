@@ -376,6 +376,27 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 
 // --- REVERSE taker -----------------------------------------------------------
 
+// requireSeqClaimWindow refuses a maker T_seq that leaves fewer than
+// MinSeqClaimWindow Sequentia blocks past the current tip. A nil SeqTip disables
+// the check (test doubles without a chain).
+func (p *TakerReverseSubmarineParams) requireSeqClaimWindow(seqLocktime uint32) error {
+	if p.SeqTip == nil {
+		return nil
+	}
+	window := p.MinSeqClaimWindow
+	if window == 0 {
+		window = 120
+	}
+	tip, err := p.SeqTip()
+	if err != nil {
+		return fmt.Errorf("seq tip: %w", err)
+	}
+	if int64(seqLocktime) <= tip+int64(window) {
+		return fmt.Errorf("seq_locktime %d leaves fewer than %d blocks past tip %d", seqLocktime, window, tip)
+	}
+	return nil
+}
+
 type TakerReverseSubmarineParams struct {
 	// NewTakerOps binds the engine once H arrives (taker builds the SubmarineSwap
 	// with NewHashLockFromHash(H); it learns P only by paying).
@@ -400,6 +421,14 @@ type TakerReverseSubmarineParams struct {
 	SpendFeeAtoms  uint64 // NATIVE-sats target for the asset-claim spend (sized per-asset; default 1000)
 	Timing         XcTiming
 	Log            func(format string, args ...interface{})
+
+	// SeqTip reads the Sequentia tip. When set, the maker's T_seq is checked against
+	// it with MinSeqClaimWindow (default 120 blocks) BEFORE the irreversible invoice
+	// payment — once at terms time and again after the anchor wait, which can consume
+	// most of the window. T_seq is the maker's refund time: paying against an asset
+	// HTLC the maker can already (or soon) refund hands it the BTC for nothing.
+	SeqTip            func() (int64, error)
+	MinSeqClaimWindow uint32
 
 	// OnPaid is invoked the instant the invoice is paid and P is learned, BEFORE
 	// the asset claim, so the caller persists P + the leg: a crash between paying
@@ -509,13 +538,22 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	ops := p.NewTakerOps(hashH)
 
 	// 2. Verify the asset HTLC is a real Design-A HTLC claimable by us.
-	vseq, err := ops.VerifySEQLeg(hashH, p.SeqClaimKey.PubKey(), makerSeqRefundPub, script,
-		leg.Locktime, leg.Txid, leg.Vout, takeSeq, p.ExpectAsset, 1)
+	verifyLeg := func() (*xchain.VerifiedSEQLeg, error) {
+		return ops.VerifySEQLeg(hashH, p.SeqClaimKey.PubKey(), makerSeqRefundPub, script,
+			leg.Locktime, leg.Txid, leg.Vout, takeSeq, p.ExpectAsset, 1)
+	}
+	vseq, err := verifyLeg()
 	if err != nil {
 		sendXcFail(p.Crypter, send, "SEQ_LEG_INVALID", err.Error())
 		return res, fmt.Errorf("taker reverse verify asset HTLC: %w", err)
 	}
 	res.SeqLeg = vseq.Leg
+	// T_seq is the maker's refund height, and the maker chose it: a value at or near
+	// the tip lets it take the asset back while we pay. Refuse before any wait.
+	if err := p.requireSeqClaimWindow(leg.Locktime); err != nil {
+		sendXcFail(p.Crypter, send, "terms_mismatch", err.Error())
+		return res, fmt.Errorf("%w: %v", ErrXcBadTerms, err)
+	}
 
 	// 3. THE GATE: do NOT pay until the asset HTLC is anchor-buried (a plain invoice
 	// is irreversible once paid) — UNLESS this is a 0-conf LP-fronting swap. Below the
@@ -536,7 +574,14 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 		p.logf("reverse taker: asset HTLC anchor-buried (depth=%d); paying the invoice", ev.AnchorDepth)
 	}
 
-	// 4. Pay the invoice -> learn P. Irreversible.
+	// 4. Pay the invoice -> learn P. Irreversible, so look once more: the anchor wait
+	// may have eaten the claim window, and the maker may have refunded meanwhile.
+	if err := p.requireSeqClaimWindow(leg.Locktime); err != nil {
+		return res, fmt.Errorf("taker reverse: %w", err)
+	}
+	if _, err := verifyLeg(); err != nil {
+		return res, fmt.Errorf("taker reverse: asset HTLC no longer verifies before paying: %w", err)
+	}
 	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, p.ExpectInvoiceMsat)
 	if err != nil {
 		return res, fmt.Errorf("taker reverse pay invoice: %w", err)

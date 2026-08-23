@@ -2,6 +2,7 @@ package xchain
 
 import (
 	"fmt"
+	"math/bits"
 	"time"
 )
 
@@ -213,6 +214,14 @@ type AnchorEvidence struct {
 // (wrapped) if not — the orchestrator must NOT let the SEQ-side claimant treat
 // the leg as final unless this passes.
 func (s *Swap) VerifySeqLegSafe(seqBlockHash string, btcLegHeight int64) (*AnchorEvidence, error) {
+	// getblockheader answers for a disconnected block as well, and a stale header's
+	// anchorheight commits nothing. The gate establishes the block is on the active
+	// chain first (retryable: the caller re-derives the block from the leg's txid).
+	if active, err := s.seq.BlockOnActiveChain(seqBlockHash); err != nil {
+		return nil, err
+	} else if !active {
+		return nil, fmt.Errorf("%w (seq block %s is not on the active chain)", ErrAnchorOrdering, seqBlockHash)
+	}
 	anchor, err := s.seq.BlockAnchorHeight(seqBlockHash)
 	if err != nil {
 		return nil, err
@@ -293,23 +302,38 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 // raw atom count of a VALUABLE asset (e.g. GOLD, rate ~5e12) yields an absurd
 // native-equivalent fee that sendrawtransaction rejects (maxfeerate); sizing keeps the
 // fee's native value inside the node's relay bounds — a valuable asset correctly pays
-// FEWER atoms. Falls back to the flat target when no positive rate is published (the
-// native asset, where atoms == native sats) or the SEQ chain is unavailable (tests).
-func (s *Swap) sizeSeqSpendFee(assetHex string, legAmount, targetNativeFee uint64) uint64 {
+// FEWER atoms.
+//
+// No asset is 1:1 by assumption, the native one included: when the node cannot be
+// asked, or lists no rate for the asset, the fee cannot be sized and the spend must
+// not be built. The flat target as raw atoms was the previous fallback for both
+// cases; for a valuable asset it burned up to half the leg, for a cheap one it
+// left the spend under the relay floor until the counterparty's CLTV. Only a swap
+// with no Sequentia chain at all (unit tests) takes the target verbatim.
+func (s *Swap) sizeSeqSpendFee(assetHex string, legAmount, targetNativeFee uint64) (uint64, error) {
 	fee := targetNativeFee
 	if s.seq != nil {
-		if rate, ok := s.seq.FeeExchangeRate(assetHex); ok && rate > 0 {
-			const scale = 100_000_000                       // 1e8; matches price_server.py / exchangerates.cpp
-			fee = (targetNativeFee*scale + rate - 1) / rate // ceil
-			if fee == 0 {
-				fee = 1
-			}
+		rate, listed, err := s.seq.FeeExchangeRateErr(assetHex)
+		if err != nil {
+			return 0, fmt.Errorf("fee exchange rate for %s: %w", assetHex, err)
+		}
+		if !listed {
+			return 0, fmt.Errorf("asset %s has no published fee exchange rate; refusing to size its spend fee", assetHex)
+		}
+		const scale = 100_000_000 // 1e8; matches price_server.py / exchangerates.cpp
+		hi, lo := bits.Mul64(targetNativeFee, scale)
+		if hi != 0 {
+			return 0, fmt.Errorf("fee target %d native sats overflows the sizing arithmetic", targetNativeFee)
+		}
+		fee = (lo + rate - 1) / rate // ceil
+		if fee == 0 {
+			fee = 1
 		}
 	}
 	if maxFee := legAmount / 2; fee > maxFee {
 		fee = maxFee
 	}
-	return fee
+	return fee, nil
 }
 
 // ClaimBTCLeg performs step 5: Bob redeems the BTC leg with the now-revealed
