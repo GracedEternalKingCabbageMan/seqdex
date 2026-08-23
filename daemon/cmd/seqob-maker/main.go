@@ -153,13 +153,13 @@ func main() {
 	feeAsset := flag.String("fee-asset", "", "preferred fee asset hint (any-asset fee market)")
 	expiry := flag.Duration("expiry", time.Hour, "time until the offer expires")
 	minAnchor := flag.Uint("min-anchor-depth", 0, "Bitcoin-anchor confs before FILLED (0 = 0-conf tolerant)")
-	confidential := flag.Bool("confidential", true, "post a confidential offer (blinded settlement); false = explicit")
+	confidential := flag.Bool("confidential", false, "post a confidential offer (blinded settlement); default explicit — Sequentia is transparent by default, confidentiality is opt-in")
 	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
 	levels := flag.Int("levels", 1, "samechain: ladder depth — quote this many price levels on this side from ONE process/account (level 0 = the configured price/size; each deeper level rests further from the touch and larger). Every level is a real co-signable offer of this maker")
 	levelBps := flag.Int("level-bps", 40, "samechain ladder: extra distance from the touch per level, in basis points of the quote amount")
 	levelGrowth := flag.Float64("level-growth", 1.12, "samechain ladder: size multiplier per level (deeper levels rest larger)")
-	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning | pureln | subasset (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap; pureln = BOTH legs over Lightning; subasset = the submarine's MIRROR: asset over Lightning + BTC on-chain HTLC, taker pays BTC on-chain and receives the asset over LN; base is the asset, quote is the BTC sentinel)")
+	mode := flag.String("mode", "samechain", "settlement mode: samechain | cross | lightning | pureln | subasset | subasset-sell (cross = BTC<->asset on-chain HTLC; lightning = asset<->BTC-over-LN submarine swap; pureln = BOTH legs over Lightning; subasset = the submarine's MIRROR: asset over Lightning + BTC on-chain HTLC, taker pays BTC on-chain and receives the asset over LN; subasset-sell = the same rails in the other direction, taker pays the asset over LN and receives BTC on-chain; base is the asset, quote is the BTC sentinel)")
 	// Cross-mode settlement wiring (pkg/xchain, no Ocean needed): the SEQ leg is
 	// funded from the Sequentia NODE wallet and the BTC leg is claimed into the
 	// bitcoind wallet — the same reserves the RFQ maker uses.
