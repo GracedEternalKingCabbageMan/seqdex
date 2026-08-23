@@ -1,42 +1,337 @@
 # SeqDEX
 
-A non-custodial, atomic-swap DEX for the [Sequentia](https://sequentia.io) Bitcoin
-sidechain. SeqDEX is a fork of the [TDEX](https://github.com/tdex-network) stack
-(`tdex-daemon` + `tdex-protobuf`) and the [Ocean](https://github.com/vulpemventures/ocean)
-wallet daemon, adapted to Sequentia and extended with **native-BTC ↔ Sequentia-asset
-cross-chain swaps** that lean on Sequentia's Bitcoin anchoring.
+SeqDEX: non-custodial atomic-swap DEX for [Sequentia](https://sequentia.io), a
+Bitcoin sidechain for asset tokenization and decentralized exchange. It provides
+a peer-to-peer order book (SeqOB), same-chain asset-to-asset atomic swaps, and
+cross-chain BTC-to-asset swaps whose safety comes from Sequentia's real-time
+Bitcoin anchoring. No component ever takes custody of user funds: settlement is
+always an atomic transaction (same-chain), a hash-time-locked contract pair
+(cross-chain) or a consensus-enforced covenant spend (passive resting orders),
+and the order-book relay holds no keys, no wallet, and no funds.
 
-It is a backend product first: a liquidity-provider daemon exposing a language-neutral
-trade protocol, meant to be consumed by many client surfaces (the SWK web wallet first,
-then the Ambra mobile wallet, a browser-extension wallet, and a desktop app that can run
-alongside a Sequentia node).
+Everything here is **testnet software**. There is no Sequentia mainnet.
 
-## Layout
+## Where this fits in the Sequentia ecosystem
 
-```
-proto/      Protocol contract (buf). seqdex.v1 = public Trade + Swap + Transport
-            (forked/renamed from tdex.v2, PSETv2). ocean.v1 = wallet backend
-            contract, kept byte-identical so the daemon stays drop-in.
-daemon/     [phase 3] LP/market-maker daemon — fork of tdex-daemon.
-wallet/     [phase 2] Sequentia wallet daemon — thin fork of Ocean.
-xchain/     [phase 5] BTC ↔ Sequentia-asset cross-chain swap service (Design A, on-chain HTLC,
-            anchor-aware finality), abstracted over a LockPrimitive so PTLC can drop in.
-docs/       Design docs. See docs/ARCHITECTURE.md.
-```
+| Repo | One-liner |
+|---|---|
+| [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (Sequentia Core, a fork of Elements 23.3.3; binaries `sequentiad` / `sequentia-cli`): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [`seqdex`](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX - P2P order book (seqob), same-chain swaps, and cross-chain BTC<->asset swaps made safe by Bitcoin anchoring. |
+| [`seqdex-web`](https://github.com/GracedEternalKingCabbageMan/seqdex-web) | The SeqDEX website, live at https://sequentiatestnet.com/dex/: three trading surfaces over the relay mounts, settling through the Ambra browser extension. |
+| [`SWK`](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK - Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
+| [`sequentia-web-wallet`](https://github.com/GracedEternalKingCabbageMan/sequentia-web-wallet) | Proof-of-concept browser wallet built on SWK, live at https://sequentiatestnet.com/wallet. |
+| [`seqln`](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary - asset channels, any-asset payments, pure-Lightning swaps. |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design, the fork plan,
-and the build phasing.
+Protocol-level background (anchoring, proof of stake, the open fee market) lives
+in the node repo's documentation:
+https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/master/doc/sequentia
 
-## Proto codegen
+## What is in this repo
 
-Requires [`buf`](https://buf.build) and Go.
+Two cooperating DEX subsystems plus the shared settlement engines, all in Go:
+
+1. **SeqOB, the peer-to-peer order-book DEX** (`daemon/internal/seqob`,
+   `daemon/pkg/covenant`, and the `daemon/cmd/seqob*` commands). Interactive
+   resting orders are **signed intents** (price, size, expiry, keys), never
+   pre-signed transactions and never named UTXOs. A non-custodial relay
+   (`seqobd`) stores the signed offers, serves the per-pair book over REST and
+   WebSocket, matches crossing orders, and couriers **opaque, end-to-end-
+   encrypted** swap-session messages between maker and taker: it never
+   decrypts, never signs, and never touches funds. Settlement happens directly
+   between the two peers. **Covenant resting orders** are the passive
+   complement: the maker funds one taproot UTXO whose tapscript leaves enforce
+   the price, so anyone can fill it while the maker is offline, and two such
+   orders are settled against each other by the keyless `seqob-settler`. The
+   chain-watcher keeps the covenant book consistent with the chain, and
+   `seqob-bridge` settles a covenant order against a Lightning order.
+
+2. **The RFQ trade daemon** (`daemon/cmd/tdexd` plus the `wallet/` Ocean fork),
+   a liquidity-provider daemon forked from the TDEX stack. A trader asks it for
+   a quote and settles a cooperative same-chain atomic swap against the daemon's
+   own market-maker wallet, over gRPC, grpc-web and REST. Cross-chain
+   settlement is order-book only (item 3); the RFQ `XchainService` and its
+   takers were removed on 2026-07-29.
+
+3. **The cross-chain HTLC engine** (`daemon/pkg/xchain`), driven by the SeqOB
+   maker, CLI, settler and bridge: BTC-to-asset atomic swaps between Bitcoin
+   (testnet4 or a regtest stand-in) and Sequentia, in both directions, with the
+   BTC leg on-chain (HTLC), over Lightning (submarine swaps via a SeqLN/CLN
+   node), both legs over Lightning (pure-LN), or the asset over Lightning
+   against on-chain BTC (sub-asset rails).
+
+Both subsystems settle same-chain swaps through the same proven path: the
+`wallet/` daemon (a thin fork of Ocean) builds, blinds when requested, and
+co-signs the atomic swap PSET.
+
+## Status (2026-08-22)
+
+Works today, exercised on the public testnet or in the committed test suites:
+
+- SeqOB relay + maker + taker CLI: same-chain asset-to-asset lifts, partial
+  fills, signed cancels, offer expiry, replay protection, rate limits.
+- Covenant-funded passive resting orders (tapscript introspection covenants):
+  permissionless fills, partial fills with a re-rested remainder, joint
+  settlement of two passive orders by `seqob-settler`, the continuous matcher
+  in the relay, the chain-watcher (ghost removal, remainder re-resting, reorg
+  re-opening), and the rail-crossing bridge. Proven at consensus level by
+  `test/regtest/feature_seqob_*.py` against a real node.
+- Cross-chain order-book settlement over the relay courier, both directions:
+  forward (taker pays BTC, receives the asset) and reverse (taker sells the
+  asset for BTC), with CLTV refund paths and maker crash-resume from persisted
+  session state.
+- Submarine swaps (asset on-chain against BTC over Lightning, both directions),
+  pure-Lightning swaps (`-mode pureln`, both legs over SeqLN channels, no
+  on-chain leg and no anchor wait) and the sub-asset rails (`-mode subasset` /
+  `subasset-sell`: asset over Lightning against an on-chain BTC HTLC, either
+  direction). All need a running SeqLN node per party.
+- RFQ same-chain trades (preview, propose, complete) over gRPC/REST.
+- Network fees payable in any fee-eligible asset, defaulting to the transacted
+  asset (see "Fee model" below).
+
+Deliberate gaps, stated honestly:
+
+- The relay's maker-liveness probe and its settlement reorg watcher for
+  **interactive** orders are no-op stubs. If an interactive settlement's
+  Bitcoin anchor were orphaned, the relay does not re-open the order
+  automatically (the on-chain refund paths, not the relay, are the safety net;
+  the relay never holds anything either way). Covenant orders are covered by
+  the chain-watcher.
+- Order and session state in the relay and the SeqOB maker's same-chain path is
+  in-memory (`seqobd -trade-log` persists the trade feed); cross-chain sessions
+  are persisted (`-xstate-dir`) and resumable, same-chain lifts simply expire
+  and the book re-forms.
+- `phase3-pure-ln` has diverged from `main`; see "Development branches" below.
+
+## The live public testnet deployment
+
+The public Sequentia testnet exposes the order book under
+https://sequentiatestnet.com (verified 2026-08-22):
+
+- **SeqOB relays**, one per rail: `https://sequentiatestnet.com/seqob/v1/...`
+  (on-chain: same-chain, covenant and cross-chain offers), `/seqob-pln/v1/...`
+  (Lightning rails) and `/seqob-conf/v1/...` (confidential markets). For
+  example `GET /seqob/v1/markets` lists the markets; a cross-chain pair's quote
+  asset is the literal sentinel `"BTC"`.
+- `https://sequentiatestnet.com/dex/` is the SeqDEX website (`seqdex-web`),
+  not an API. The RFQ daemon's REST gateway is not publicly exposed.
+
+Try it:
 
 ```sh
-cd proto
-buf dep update
-buf generate          # -> proto/gen/go
+curl -s https://sequentiatestnet.com/seqob/v1/markets | python3 -m json.tool | head -30
 ```
+
+The web wallet at https://sequentiatestnet.com/wallet and the SeqDEX site at
+https://sequentiatestnet.com/dex/ are the graphical clients: their trade
+surfaces consume these relays. The CLIs in this repo (`seqob-cli` with its
+`xlift`/`xsell`/`xsublift`/`xsubbuy`/`xpln`/`xsubas` subcommands, and
+`seqdex-taker` for the RFQ loop) are the reference command-line clients.
+
+## How a trade works
+
+**Same-chain, over the order book.** A maker posts a signed offer (for example,
+sell 100 GOLD atoms for 4500 USDX atoms; the authoritative price is the integer
+ratio `want_amount / offer_amount`, there is no float in the signed bytes). A
+taker picks the offer from the book and opens a lift session. Relay-couriered,
+end-to-end-encrypted messages carry a `SwapRequest` from the taker, a
+`SwapAccept` (the maker's half-signed PSET) back, and a `SwapComplete`; the
+taker signs and broadcasts one atomic transaction that pays both sides. At no
+point can either party or the relay take the other's funds: an unsigned or
+half-signed swap is worthless, and the worst outcome is a session timeout.
+
+**Covenant resting orders (passive).** The maker locks the offered asset in one
+taproot UTXO with a NUMS internal key and a `{FILL, REFUND}` leaf tree; the FILL
+leaf bakes in the asset pair, price, payout program and minimum lot, enforced by
+the node's tapscript introspection opcodes. The relay only advertises the
+outpoint (`CovenantTerms`); a taker re-derives the output key and verifies it
+against the chain, then spends the UTXO in a fill that pays the maker its pinned
+price. The order *is* the coin, so oversell is impossible and the maker can be
+offline. Two passive orders that cross are settled in one transaction by
+`seqob-settler`, which funds the fee but cannot alter a payout. The design
+space is in [docs/simplicity-dex-covenant-offers-design.md](docs/simplicity-dex-covenant-offers-design.md);
+the shipped leaf is tapscript (`daemon/pkg/covenant`).
+
+**Cross-chain (BTC on-chain).** The legs are two HTLCs sharing one SHA256
+hashlock, with asymmetric timelocks (the BTC leg always refunds later than the
+Sequentia leg). Forward direction: the taker locks BTC first, the maker locks
+the Sequentia asset, the taker claims the asset (revealing the secret on
+Sequentia), the maker claims the BTC. What makes this fast and safe is
+Sequentia's anchoring: the claimant accepts the Sequentia leg only once it sits
+in a block whose Bitcoin anchor height is at or above the BTC leg's
+confirmation height, with `getanchorstatus` ok and the block quorum-certified.
+Because a Sequentia block reverts if and only if its anchored Bitcoin block
+reverts, no extra reorg buffer is needed on the Sequentia side. If anything
+stalls, each party refunds its own leg after its timelock. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the exact message flows.
+
+**Submarine (BTC over Lightning).** Same hashlock idea, but the BTC leg is a
+BOLT11 Lightning payment instead of an on-chain HTLC. The maker plays the
+non-custodial Boltz-style role and must not take the irreversible Lightning
+action until the relevant Sequentia transaction is buried under a real Bitcoin
+anchor depth (default 3, minimum 2).
+
+**Pure Lightning and sub-asset.** With both legs over Lightning (the asset on a
+SeqLN asset channel, BTC on a SeqLN-on-Bitcoin channel) a trade is a pair of
+hold invoices under one hash: nothing touches a chain, so there is no anchor
+wait. The sub-asset rails are the submarine's mirror: the asset travels over
+Lightning while BTC is an on-chain HTLC.
+
+## Finality honesty
+
+Nothing on Sequentia is "final" at 0 confirmations. The honest finality measure
+is **anchor depth**: how many Bitcoin blocks confirm the anchor of the
+Sequentia block containing your settlement.
+
+Every SeqOB offer carries a maker-chosen dial, `min_anchor_depth` (default 0):
+the number of Bitcoin-anchor confirmations the maker requires on the settling
+transaction before the order is marked `FILLED`. The DEX is 0-conf-tolerant by
+design and enforces no floor; a maker who wants stronger guarantees (or a taker
+choosing whom to trade with) raises the dial. Client UIs surface anchor depth
+rather than pretending instant finality, and a status of `FILLED` at depth 0
+can still revert if Bitcoin reorganizes: that is a property of every chain, and
+Sequentia's design makes it visible instead of hiding it.
+
+## Fee model
+
+Sequentia has an open fee market: there is no privileged fee asset, and block
+producers choose which assets they accept for fees and at what exchange rate
+(published by the node as `getfeeexchangerates`). SeqDEX implements this
+end-to-end:
+
+- The on-chain network fee of a swap is paid **in any fee-eligible asset,
+  defaulting to the transacted asset**, valued at the node's native-equivalent
+  exchange rate. The legacy native-asset fee account is only a fallback.
+- A taker can fund the network fee itself by adding an explicit fee output in
+  its chosen asset; the maker's wallet validates it (correct value at the
+  current rate) and then skips its own fee block.
+- SeqOB offers carry a `fee_asset_hint`; it is a hint, never a privilege.
+- Fee rates are always denominated in the chosen fee asset's own units per
+  vByte, never "sat/vB".
+
+## Running it yourself
+
+Prerequisites: a recent Go toolchain (both modules build cleanly with Go 1.26;
+the daemon's release build uses CGO), and for full local loops a built Sequentia
+node (`sequentiad` and `sequentia-cli` from
+https://github.com/GracedEternalKingCabbageMan/Sequentia).
+
+Build every binary:
+
+```sh
+cd daemon && go build ./... && cd ../wallet && go build ./...
+# or specific binaries, e.g.:
+cd daemon
+go build -o ../bin/seqobd        ./cmd/seqobd
+go build -o ../bin/seqob-maker   ./cmd/seqob-maker
+go build -o ../bin/seqob-cli     ./cmd/seqob-cli
+go build -o ../bin/seqob-settler ./cmd/seqob-settler
+go build -o ../bin/tdexd         ./cmd/tdexd
+cd ../wallet
+go build -o ../bin/seqdex-wallet ./cmd/oceand
+```
+
+Run the unit tests (no node required; the cross-chain integration test
+self-skips unless it finds a node, see [docs/DEV.md](docs/DEV.md)):
+
+```sh
+cd daemon && go test ./internal/seqob/... ./pkg/xchain/... ./pkg/covenant/...
+```
+
+[docs/DEV.md](docs/DEV.md) walks through the full local loop: a two-chain
+regtest (parent chain + anchored Sequentia), the wallet daemon, the relay, a
+maker, and a taker lift, plus the cross-chain, Lightning and covenant variants.
+
+## Repo layout
+
+```
+daemon/                The Go daemon module (fork of tdex-daemon).
+  cmd/seqobd/          SeqOB relay: non-custodial order book, matcher, opaque
+                       courier; runs the covenant chain-watcher when given
+                       -node-rpc.
+  cmd/seqob-maker/     SeqOB maker: posts offers, settles lifts. Modes:
+                       samechain, cross, lightning, pureln, subasset,
+                       subasset-sell. Anyone can run one.
+  cmd/seqob-cli/       SeqOB taker CLI: post/book/lift plus the cross-chain,
+                       submarine, pure-LN and sub-asset taker commands.
+  cmd/seqob-settler/   Always-online, keyless settler for two crossing covenant
+                       orders (plan | run).
+  cmd/seqob-watcher/   The covenant chain-watcher as a standalone binary
+                       (classify | run); seqobd embeds the same core.
+  cmd/seqob-bridge/    Cross-rail settlement bridge: fills a covenant order
+                       against a Lightning order under one preimage. The only
+                       seqob component holding its own inventory and LN node.
+  cmd/seqob-covenant/  Covenant builder CLI (derive | fill): scriptPubKey and
+                       FILL witness for a resting order, byte-identical to the
+                       proven Python.
+  cmd/seqob-relaycli/  Scripting client for the relay (post | take), used by
+                       the regtest matcher proof.
+  cmd/seqob-octl/      Helper for inspecting/preparing Ocean maker accounts.
+  cmd/tdexd/           RFQ trade daemon (Trade :9945, Operator :9000).
+  cmd/tdex/            Upstream operator CLI for tdexd.
+  cmd/seqdex-*         tdexd regtest helpers + the raw-HTLC swap demo.
+  internal/seqob/      Order book: offer signing, store, validator, matcher,
+                       session router, E2E courier client, lift drivers,
+                       covenant fill/settler/watcher/bridge cores, reorg.
+  pkg/covenant/        The tapscript covenant leaf builder (golden-vector
+                       pinned against the Python in test/regtest).
+  pkg/xchain/          Cross-chain HTLC engine + submarine, pure-LN and
+                       sub-asset swaps + regtest harness
+                       (testdata/start-regtest.sh).
+  api-spec/protobuf/   The authoritative protocol contracts (seqdex.v1,
+                       seqob.v1, ocean.v1, legacy tdex-daemon operator protos).
+wallet/                Sequentia wallet daemon (thin fork of Ocean); tdexd and
+                       seqob-maker settle through it. Builds `oceand`.
+proto/                 Standalone phase-1 copy of the seqdex.v1 + ocean.v1
+                       contracts with local buf codegen (predates seqob.v1;
+                       daemon/api-spec is current).
+docs/                  Design and handover notes, see the list below.
+test/regtest/          Consensus-level proofs of the covenant order book, run
+                       against a real Sequentia node (see its README).
+```
+
+The `docs/` directory, with each file's status as of 2026-08-22:
+
+- `ARCHITECTURE.md` - **2026-07-08 snapshot**, superseded where its header says
+  (RFQ cross-chain rail, "not on main" claims); the SeqOB protocol, the
+  cross-chain safety model and the fee model are still as built.
+- `DEV.md` - current: local runs of every loop.
+- `seqdex-terminal-spec.md` - current product spec for the wallets' Swap tab
+  (cross-repo, self-declared canonical).
+- `simplicity-dex-covenant-offers-design.md` (+ `.html`/`.pdf`) - current
+  design for the covenant rail; the shipped leaf is tapscript introspection.
+- `rail-crossing-p2p-lsp-design.md` - current design, partially implemented
+  (`cmd/seqob-bridge`).
+- `seqdex-gap-closure-plan.md` - historical (audit snapshot of 2026-07-22).
+- `seqdex-orderbook-design.md` - historical design, implemented.
+- `cross-chain-orderbook-consolidation.md` - historical decision record,
+  implemented 2026-07-29.
+- `seqdex-simplicity-assessment.md`, `seqdex-lightning-feasibility.md` -
+  historical feasibility notes.
+- `seqln-phase2-dex-integration.md`, `seqln-dex-instant-swap-latency.md`,
+  `seqln-dex-instant-swap-latency-followup.md` - historical design notes,
+  implemented as `-mode lightning` and `-mode pureln`.
+- `HANDOVER-2026-07-31-dex-eight-rails.md` - historical handover.
+
+Component docs: [daemon/README.md](daemon/README.md),
+[wallet/README.md](wallet/README.md).
+
+## Development branches
+
+`main` is the integration branch; PRs target `main`. Two feature branches exist
+(states verified 2026-08-22):
+
+- `phase2-submarine-ln`: historical; fully merged into `main` (its head is an
+  ancestor of `main`). It carried the submarine-swap work now on `main`.
+- `phase3-pure-ln`: has **diverged** from `main` (20 commits ahead, 12 behind).
+  The features it was started for - pure-Lightning swaps, the continuous
+  matcher and the covenant builder - are on `main`. What it still carries
+  exclusively is `seqob-crosser`, the crossing agent that polls every relay and
+  takes both sides; if one runs on the testnet box it is built from that
+  branch. Its docs are the older, pre-rewrite versions; see `CLAUDE.md`.
 
 ## License
 
-MIT. SeqDEX retains the upstream TDEX and Ocean MIT notices — see [NOTICE](NOTICE).
+MIT, see [LICENSE](LICENSE). SeqDEX is a fork of the
+[TDEX](https://github.com/tdex-network) stack (`tdex-daemon`, `tdex-protobuf`)
+and the [Ocean](https://github.com/vulpemventures/ocean) wallet daemon; the
+upstream MIT notices are retained in [NOTICE](NOTICE).

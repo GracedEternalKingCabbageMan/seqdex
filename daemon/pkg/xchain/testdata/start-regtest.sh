@@ -4,9 +4,15 @@
 # test/functional/feature_anchor_swap_consistency.py.
 set -euo pipefail
 
-REPO="$HOME/SequentiaByClaude"
-ELD="$REPO/build-linux/src/elementsd"
-ELC="$REPO/build-linux/src/elements-cli"
+REPO="${SEQUENTIA_REPO:-$HOME/Sequentia}"
+# The node binaries are sequentiad / sequentia-cli; fall back to the legacy
+# Elements names for a clone built before the rename.
+ELD="$REPO/build-linux/src/sequentiad"
+ELC="$REPO/build-linux/src/sequentia-cli"
+if [ ! -x "$ELD" ] && [ -x "$REPO/build-linux/src/elementsd" ]; then
+  ELD="$REPO/build-linux/src/elementsd"
+  ELC="$REPO/build-linux/src/elements-cli"
+fi
 BASE="${SEQDEX_XCHAIN_DIR:-/tmp/seqdex-xchain-regtest}"
 
 PARENT_DIR="$BASE/parent"

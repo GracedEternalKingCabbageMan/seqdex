@@ -1,106 +1,304 @@
-# tdex-daemon
+# SeqDEX daemon module
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/tdex-network/tdex-daemon)](https://goreportcard.com/report/github.com/tdex-network/tdex-daemon)
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/tdex-network/tdex-daemon)](https://pkg.go.dev/github.com/tdex-network/tdex-daemon)
-[![Release](https://img.shields.io/github/release/tdex-network/tdex-daemon.svg)](https://github.com/tdex-network/tdex-daemon/releases/latest)
+The Go module holding everything server- and client-side for SeqDEX except the
+wallet daemon: the SeqOB order-book relay and its maker/taker/settler programs,
+the covenant builder, the RFQ trade daemon (forked from
+[tdex-daemon](https://github.com/tdex-network/tdex-daemon)), and the
+cross-chain HTLC engine. The wallet daemon it settles through lives in
+[`../wallet`](../wallet). Design: [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
+(a 2026-07-08 snapshot; this file is current as of 2026-08-22);
+runbooks: [../docs/DEV.md](../docs/DEV.md).
 
-Go implementation of the TDex Daemon
+Everything here is testnet software; nothing in this module ever holds user
+funds (the RFQ daemon holds only its operator's own market-making liquidity,
+via the wallet daemon, and `seqob-bridge` only its own fronted inventory).
 
-## 📄 Usage
+## Binaries
 
-In-depth documentation for installing and using the tdex-daemon is available at [docs.tdex.network](https://dev.tdex.network/docs/provider/intro)
+### `cmd/seqobd`: the order-book relay
 
+Non-custodial: stores signed offers, serves the per-pair book, matches
+crossing orders, couriers opaque end-to-end-encrypted swap-session frames. No
+wallet, no keys, no funds, never decrypts.
 
-## 🛣 Roadmap
-
-* [x] Swap protocol
-* [x] Trade protocol
-* [x] Confidential support
-* [x] Automated Market Making
-* [x] Pluggable Market Making
-
-
-## 🖥 Local Development
-
-Below is a list of commands you will likely find useful for development.
-
-### Requirements
-
-* [Golang](https://go.dev/) (^1.16.*)
-* [Ocean wallet](https://github.com/vulpemventures/ocean)
-
-### Run daemon (dev mode)
-
-[Start](https://github.com/vulpemventures/ocean/#local-run) the ocean wallet.
-
-Start the daemon:
-
-```bash
-$ make run
+```
+seqobd [flags]
+  -listen            HTTP listen address        (default ":9955", env SEQOB_LISTEN)
+  -node-rpc          read-only Sequentia node RPC host:port for the covenant
+                     chain-watcher; empty disables the watcher
+                                                (env SEQOB_NODE_RPC)
+  -node-rpc-user / -node-rpc-pass   node JSON-RPC credentials
+                                                (env SEQOB_NODE_RPC_USER / _PASS)
+  -watch-interval    chain-watcher reconcile interval (default 5s)
+  -session-deadline  lift co-sign deadline      (default 2m)
+  -xsession-deadline courier deadline for cross-chain lift sessions
+                     (default 3h; they span a real parent-chain confirmation)
+  -expiry-sweep      offer expiry sweep interval        (default 15s)
+  -session-sweep     session deadline sweep interval    (default 10s)
+  -min-expiry / -max-expiry   allowed offer expiry horizon (30s .. 168h)
+  -offers-per-min / -offers-per-min-ip   rate limits (60 per maker key, 120 per IP)
+  -trade-log         append-only JSONL trade log so last_price, trades and
+                     candles survive a restart (env SEQOB_TRADE_LOG; empty =
+                     in-memory only)
+  -interactive-cap   soft per-maker committed-capital cap per offered asset
+                     (atoms) for interactive offers; past it an offer is
+                     flagged demoted (phantom depth); 0 disables
 ```
 
-### Build daemon
+HTTP surface (bodies are protojson of `api-spec/protobuf/seqob/v1`):
 
-Build `tdexd` as a static binary in the `./build` folder
-
-```bash
-$ make build
+```
+POST /v1/offers                             submit a signed Offer
+POST /v1/offers/cancel                      submit a signed OfferCancel
+GET  /v1/offers?maker_pubkey=<hex>          a maker's own orders
+GET  /v1/markets                            market summaries
+GET  /v1/market/{base}/{quote}/orderbook    per-pair snapshot
+POST /v1/lift                               open a lift session
+GET  /v1/ws                                 WebSocket (To/From envelope): book
+                                            subscriptions, offer submission,
+                                            lift and match notifications,
+                                            opaque SwapMsg courier
 ```
 
-### Build CLI
+Live instances: `https://sequentiatestnet.com/seqob/v1/...` (on-chain rails),
+`/seqob-pln/v1/...` (Lightning rails), `/seqob-conf/v1/...` (confidential
+markets); one `seqobd` process per mount.
 
-Build `tdex` as a static binary in the `./build` folder
+### `cmd/seqob-maker`: the maker participant
 
-```bash
-$ make build-cli
+Posts one signed resting offer and serves lifts until stopped. Anyone can run
+one; the relay grants makers no special standing. Six settlement modes:
+
+- `-mode samechain` (default): asset-for-asset atomic swap, settled through the
+  Ocean wallet's blind-aware `CompleteSwap`. Needs `-ocean` + `-account` (the
+  account holding the offered asset) and `-node-rpc` for the open fee market.
+  `-confidential=false` (default: Sequentia is transparent by default) settles
+  explicit; `-confidential=true` publishes a blinding pubkey and settles blinded.
+- `-mode cross`: BTC-for-asset on-chain HTLC swaps. Funds legs from node
+  wallets directly: needs `-btc-rpc`/`-btc-wallet`/`-btc-chain`
+  (testnet4|regtest) and `-xseq-rpc`/`-xseq-wallet`. Pair is always
+  base = the asset (`-base`), quote = the `"BTC"` sentinel; `-base-amount` is
+  asset atoms, `-quote-amount` BTC sats; no partial fills. Per-lift session
+  state persists under `-xstate-dir`; `-resume` finishes every non-terminal
+  session (claim or refund) after a restart, then exits. Safety dials:
+  `-min-btc-conf` (default 1), `-btc-locktime-delta` (T_btc, default 100
+  parent blocks), `-seq-locktime-delta` (T_seq, default 240 Sequentia blocks),
+  `-btc-fee-rate`, `-spend-fee`.
+- `-mode lightning`: submarine swaps (asset on-chain against BTC over
+  Lightning). Needs `-ln-socket` (a SeqLN/CLN `lightning-rpc` on Bitcoin) plus
+  `-xseq-rpc`/`-xseq-wallet`. `-side buy` serves the NORMAL direction (taker
+  sells the asset, maker pays the taker's invoice), `-side sell` the REVERSE
+  (maker locks the asset, taker pays the maker's invoice).
+  `-sub-anchor-depth` (default 3, floor 2) is the Bitcoin-anchor depth the
+  maker requires on the taker's Sequentia funding before taking the
+  irreversible Lightning action.
+- `-mode pureln`: both legs over Lightning, no on-chain leg and no anchor
+  wait. Needs `-ln-socket` (BTC leg) and `-asset-ln-socket` (the maker's
+  SeqLN-on-Sequentia socket, asset leg). `-quote-asset` advertises an
+  asset-for-asset market instead of the BTC sentinel and `-btc-asset` routes
+  the counter leg over that asset; `-hold-timeout` (default 2m) bounds the
+  wait for the taker's hold invoice.
+- `-mode subasset` / `-mode subasset-sell`: the submarine's mirror, the asset
+  over Lightning against an on-chain BTC HTLC. `subasset`: the taker pays BTC
+  on-chain and receives the asset over LN; `subasset-sell`: the reverse. Need
+  `-asset-ln-socket` plus `-btc-rpc`/`-btc-wallet`/`-btc-chain`; with
+  `-quote-asset` the on-chain leg becomes an HTLC on that Sequentia asset
+  (via `-xseq-rpc`/`-xseq-wallet`) and no bitcoind is involved.
+
+`-requote` (cross, lightning, pureln, sub-asset) re-posts a fresh offer under
+the same id after each settled fill instead of exiting.
+
+Common flags: `-relay`, `-maker-priv` (32-byte hex identity/E2E key, generated
+if empty), `-base`, `-quote`, `-side sell|buy`, `-base-amount`,
+`-quote-amount`, `-fee-asset` (hint, any-asset fee market),
+`-min-anchor-depth` (Bitcoin-anchor confirmations before the order is FILLED;
+default 0 = 0-conf tolerant), `-expiry`, `-offer-id`, `-msats-per-byte`.
+
+### `cmd/seqob-cli`: the taker (and ad-hoc maker) CLI
+
+```
+seqob-cli post         post a signed offer (no maker process; lifts need one)
+seqob-cli book         print a market's order book
+seqob-cli lift         lift a same-chain offer (real settlement with
+                       -esplora -taker-priv -taker-blinding; stub-wallet
+                       demo mode without them)
+seqob-cli xlift        buy an asset with on-chain BTC (forward cross-chain)
+seqob-cli xsell        sell an asset for on-chain BTC (reverse cross-chain)
+seqob-cli xrefund      recover the BTC leg of an aborted xlift after T_btc
+seqob-cli xrefund-seq  recover the asset leg of an aborted xsell after T_seq
+seqob-cli xsublift     sell an asset for BTC over Lightning (normal submarine)
+seqob-cli xsubbuy      buy an asset with BTC over Lightning (reverse submarine;
+                       anchor-gates the maker's HTLC before paying)
+seqob-cli xpln         trade an asset against BTC with both legs over
+                       Lightning (pure-LN; -side buy|sell, -asset-ln-socket,
+                       -ln-socket)
+seqob-cli xsubas       buy an asset by paying BTC on-chain and receiving it
+                       over Lightning (sub-asset; -taker-ln-node-id for a
+                       non-custodial hold-invoice buy)
+seqob-cli xsubas-refund      recover the BTC HTLC of an aborted xsubas after T_btc
+seqob-cli xsubas-sell        sell an asset over Lightning for on-chain BTC
+seqob-cli xsubas-claim-btc   claim the BTC HTLC of an xsubas-sell with the preimage
+seqob-cli xsubas-refund-btc  LSP side: reclaim a payer-bridge BTC HTLC after T_btc
+seqob-cli xsubas-htlc-spend-status
+                       read the on-chain fate of a BTC HTLC (unspent, claimed
+                       with the preimage, or refunded); fails closed
+seqob-cli xsubas-node-caps   assert the BTC node is unpruned with a synced
+                       txindex before running payer bridges
+seqob-cli xhtlc-observe      report an HTLC outpoint's spend on either chain
+                       (extracting the preimage when given the hash)
+seqob-cli xfund-seq    fund an on-chain Sequentia asset HTLC
+seqob-cli xseq-refund  reclaim an asset HTLC by outpoint after T_seq
+seqob-cli keygen       print a fresh 32-byte hex key and its pubkey
 ```
 
-### Build and Run with docker
+Run any subcommand without flags for its exact flag list. Cross-chain
+subcommands persist their session (secret, keys, legs, locktimes) to
+`-state-file` before funding anything, so refunds survive a crash.
 
-Start oceand and tdexd services as docker contaniner.
+### `cmd/seqob-settler`: the passive-CLOB settler
 
-#### Start oceand and tdexd
+Always-online, keyless, fundless settler for two covenant-funded resting
+orders whose makers are both offline: the relay matches them, the settler
+assembles the single joint FILL transaction, funds its fee and broadcasts.
+Both covenants' FILL leaves enforce every maker credit, so it can only build a
+conforming transaction or none. `plan` (JSON cross on stdin) prints the
+enforced recipe; `run` is the loop against a relay and a node.
 
-Start `oceand` and `tdexd` containters:
+### `cmd/seqob-watcher`: the covenant chain-watcher
 
-```bash
-$ docker-compose -f resources/compose/docker-compose.yml up -d oceand tdexd
+Reconciles the relay's covenant book to the node's current tip: removes
+orders whose funding UTXO is gone (including after a Bitcoin-driven reorg),
+re-rests partial-fill remainders at their new outpoint, holds unconfirmed
+spends pending, re-opens fills that never confirmed. In production the same
+core runs inside `seqobd` (`-node-rpc`); this binary exposes it standalone:
+`classify` (JSON state on stdin) and `run`.
+
+### `cmd/seqob-bridge`: the cross-rail bridge
+
+Settles a covenant order against a Lightning order under one preimage when the
+matcher crosses them: fills the on-chain covenant and delivers/collects the
+Lightning leg through the submarine/pure-LN orchestrator. Unlike every other
+seqob component it holds its own inventory and an LN node; the only capital at
+risk is its own fronted inventory, bounded by the per-offer 0-conf cap.
+`plan` and `run` as for the settler.
+
+### `cmd/seqob-covenant`: the covenant builder CLI
+
+`derive` prints a resting order's leaves, merkle data, output key and
+scriptPubKey; `fill` prints the permissionless FILL spend (credit/remainder
+indices, witness, control block). Byte-identical to the Python builder in
+`../test/regtest`, pinned by `pkg/covenant/leaf_test.go`.
+
+### `cmd/seqob-relaycli`: relay scripting client
+
+`post` signs an offer and POSTs it (the stateless maker path); `take` signs,
+submits over WebSocket and waits for the matcher's match. Used by the regtest
+matcher proof.
+
+### `cmd/seqob-octl`: maker account helper
+
+Read-mostly Ocean helper: `-action balance | address | create` against
+`-ocean <addr> -account <name>`. No keys, no signing.
+
+### `cmd/tdexd`: the RFQ trade daemon
+
+The forked tdex-daemon. It serves same-chain trades only; cross-chain lives in
+`pkg/xchain` behind the SeqOB maker, CLI, settler and bridge (the RFQ
+`XchainService` was removed on 2026-07-29). Configuration is env-only with
+prefix `SEQDEX_` (upstream used `TDEX_`); the main keys (see
+`internal/config/config.go` for all):
+
+| Env | Meaning | Default |
+|---|---|---|
+| `SEQDEX_WALLET_ADDR` | ocean wallet gRPC endpoint | - |
+| `SEQDEX_TRADE_LISTENING_PORT` | Trade interface (gRPC + grpc-web + REST) | `9945` |
+| `SEQDEX_OPERATOR_LISTENING_PORT` | Operator interface | `9000` |
+| `SEQDEX_NODE_RPC` | Sequentia node RPC URL for `getfeeexchangerates` (any-asset network fees); unset = legacy native-asset fee path | - |
+| `SEQDEX_NO_MACAROONS`, `SEQDEX_NO_OPERATOR_TLS` | disable auth/TLS (dev) | `false` |
+| `SEQDEX_DATADIR`, `SEQDEX_DB_TYPE`, `SEQDEX_LOG_LEVEL` | state and logging | `~/.seqdex-daemon`, `badger`, `4` |
+
+Interfaces served:
+
+- **Trade** (`:9945`, TLS optional, permissive CORS): gRPC
+  `seqdex.v1.TradeService` plus grpc-web and a grpc-gateway REST mapping:
+  `POST /v1/markets`, `/v1/market/balance`, `/v1/market/price`,
+  `/v1/trade/preview`, `/v1/trade/propose`, `/v1/trade/complete`. The Trade
+  interface starts after the wallet is unlocked.
+- **Operator** (`:9000`, macaroons unless disabled): wallet init/unlock, market
+  lifecycle, deposits, withdrawals, fee config (protos under
+  `api-spec/protobuf/tdex-daemon/v2`). Drive it with `cmd/tdex` or the
+  `seqdex-initwallet` / `seqdex-unlock` / `seqdex-market` helpers.
+
+The REST gateway is not publicly exposed on the testnet.
+
+### Demos and regtest helpers
+
+- `cmd/seqdex-xchain-swapdemo`: runs the raw HTLC mechanism end to end against
+  the two-chain regtest, including the negative test (a Sequentia leg with an
+  insufficient anchor height is rejected). Despite its name it exercises
+  `pkg/xchain`, not the retired RFQ service.
+- `cmd/seqdex-taker`, `cmd/seqdex-market`, `cmd/seqdex-initwallet`,
+  `cmd/seqdex-unlock`: throwaway regtest helpers for the RFQ loop.
+
+## Package map
+
+```
+internal/seqob/offer       offer/cancel canonical bytes, signing, verification,
+                           the BTC sentinel, direction consistency
+internal/seqob/offerstore  the book: keys, statuses, partial fills, anchor-aware
+                           FILLED, reopen hook, expiry sweeper, trade log
+internal/seqob/validator   admission: signature/schema/amounts/expiry checks,
+                           rate limits, replay gate (liveness probe = stub)
+internal/seqob/matcher     continuous matching of crossing orders, including
+                           covenant-vs-covenant and cross-rail matches
+internal/seqob/session     lift-session router: peer binding, opaque courier,
+                           deadlines (reorg watcher for interactive orders = stub)
+internal/seqob/api         REST + WS server over the To/From envelope
+internal/seqob/client      taker/maker drivers: same-chain (driver.go),
+                           cross-chain (xdriver*.go), submarine
+                           (xdriver_submarine*.go), pure-LN (xdriver_pureln.go),
+                           sub-asset (xdriver_subasset*.go), E2E crypter, live
+                           wallet backend over Ocean
+internal/seqob/covfill     covenant fill construction for takers
+internal/seqob/settler     joint settlement of two covenant orders
+internal/seqob/watcher     covenant book reconciliation against the chain
+internal/seqob/bridge      cross-rail (covenant vs Lightning) settlement
+internal/seqob/reorg       Bitcoin-anchor reorg detection helpers
+pkg/covenant               the tapscript covenant leaf builder (NUMS key,
+                           FILL/REFUND leaves, output key, fill planning)
+pkg/xchain                 the HTLC engine: legs (elements/bitcoin/lightning),
+                           orchestrator, VerifySeqLegSafe anchor gate,
+                           submarine, pure-LN and sub-asset swaps, regtest
+                           harness (testdata/)
+internal/core, internal/infrastructure, pkg/trade, pkg/swap, ...
+                           the inherited tdex-daemon core (application services,
+                           ocean-wallet port, taker SDK), adapted for Sequentia
+                           (seqnet params, runtime policy asset, any-asset fees)
+pkg/seqnet                 Sequentia network parameters + address handling
+api-spec/protobuf          authoritative contracts: seqdex/v1, seqob/v1,
+                           tdex-daemon/v1+v2, generated Go under gen/
 ```
 
-#### Use the CLI
+## Build and test
 
-```bash
-$ alias tdex="docker exec tdexd tdex"
-
-# Configure the CLI
-$ tdex config init --no-tls --no-macaroons
-
-# Use the CLI
-$ tdex status
-$ tdex --help
+```sh
+go build ./...                                   # everything
+make build                                       # tdexd via scripts/build (CGO, stripped)
+go test ./internal/seqob/... ./pkg/xchain/... ./pkg/covenant/...
+                                                 # unit + (auto-skipping) integration
+make lint                                        # golangci-lint
 ```
 
-### Test
+The `pkg/xchain` integration tests start their own two-chain regtest via
+`pkg/xchain/testdata/start-regtest.sh` when `SEQUENTIA_REPO` points at a built
+node clone (or use running nodes via the test-only env knobs
+`SEQDEX_XCHAIN_PARENT_RPC` / `SEQDEX_XCHAIN_SEQ_RPC`); otherwise they skip.
+The consensus-level covenant proofs live in `../test/regtest`. See
+[../docs/DEV.md](../docs/DEV.md).
 
-```bash
-# Unit testing
-$ make test
+## Upstream
 
-# Integration testing
-$ make integrationtest
-```
-
-## Release
-
-Precompiled binaries are published with each [release](https://github.com/tdex-network/tdex-daemon/releases).
-
-## Versioning
-
-We use [SemVer](http://semver.org/) for versioning. For the versions available, see the
-[tags on this repository](https://github.com/tdex-network/tdex-daemon/tags). 
-
-## License
-
-This project is licensed under the MIT License - see the
-[LICENSE](https://github.com/tdex-network/tdex-daemon/blob/master/LICENSE) file for details.
-
+This module began as tdex-daemon (MIT); upstream docs live at
+https://dev.tdex.network/. The `internal/seqob`, `pkg/covenant` and
+`pkg/xchain` trees and the `seqob*`/`seqdex-*` commands are new here;
+`../NOTICE` retains the upstream notices.
