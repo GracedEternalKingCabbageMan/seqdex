@@ -188,6 +188,13 @@ func FillCovenant(p Params) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Release the coins on every path that does not broadcast them.
+	broadcast := false
+	defer func() {
+		if !broadcast {
+			_ = lockCoins(p.Node, sel.inputs, true)
+		}
+	}()
 
 	// Per-asset change, with dust folded where it cannot hurt: credit-asset dust
 	// overpays the maker (the leaf enforces value >= required, never ==), fee-
@@ -265,8 +272,18 @@ func FillCovenant(p Params) (*Result, error) {
 	}
 	var txid string
 	if err := p.Node.Call(&txid, "sendrawtransaction", finalHex); err != nil {
+		// A reply lost after the node accepted the spend is not a failed fill: if the
+		// covenant outpoint is now spent and the node knows our transaction, the
+		// fill landed. Reporting "nothing executed" here made the crosser re-plan the
+		// same crossing, or book drift that never happened.
+		if landedTxid, ok := alreadyLanded(p.Node, p.Txid, p.Vout, finalHex); ok {
+			broadcast = true
+			return &Result{Txid: landedTxid, RawHex: finalHex, Locked: locked, Filled: plan.Filled,
+				Remainder: plan.Remainder, PaidB: creditValue, Partial: plan.Partial}, nil
+		}
 		return nil, fmt.Errorf("sendrawtransaction: %w", err)
 	}
+	broadcast = true
 	return &Result{
 		Txid:      txid,
 		RawHex:    finalHex,
@@ -276,6 +293,31 @@ func FillCovenant(p Params) (*Result, error) {
 		PaidB:     creditValue,
 		Partial:   plan.Partial,
 	}, nil
+}
+
+// alreadyLanded reports whether the covenant outpoint is spent and the node knows
+// our assembled transaction (decoded to its txid), i.e. the fill is in its mempool
+// or chain despite the broadcast reply being lost.
+func alreadyLanded(node Node, covTxid string, covVout uint32, rawHex string) (string, bool) {
+	var utxo *struct {
+		Confirmations int `json:"confirmations"`
+	}
+	if err := node.Call(&utxo, "gettxout", covTxid, covVout, true); err != nil || utxo != nil {
+		return "", false
+	}
+	var dec struct {
+		Txid string `json:"txid"`
+	}
+	if err := node.Call(&dec, "decoderawtransaction", rawHex); err != nil || dec.Txid == "" {
+		return "", false
+	}
+	var known struct {
+		Txid string `json:"txid"`
+	}
+	if err := node.Call(&known, "getrawtransaction", dec.Txid, true); err != nil {
+		return "", false
+	}
+	return dec.Txid, true
 }
 
 // verifyCovenantUTXO reads the covenant outpoint at the live tip (gettxout is
@@ -382,7 +424,27 @@ func selectFunding(node Node, need map[string]uint64, covTxid string, covVout ui
 		sel.inputs = append(sel.inputs, picked...)
 		sel.total[asset] += sum
 	}
+	// Lock the picked coins in the wallet until this fill is broadcast or abandoned:
+	// two fills funded from the same wallet in parallel (the crosser runs pairs
+	// concurrently) otherwise pick the same smallest coins and the loser fails the
+	// mempool gate with a conflict, booked as drift if it was the second leg.
+	if err := lockCoins(node, sel.inputs, false); err != nil {
+		return nil, fmt.Errorf("lockunspent: %w", err)
+	}
 	return sel, nil
+}
+
+// lockCoins locks (unlock=false) or releases (unlock=true) coins in the node wallet.
+func lockCoins(node Node, coins []fundUTXO, unlock bool) error {
+	if len(coins) == 0 {
+		return nil
+	}
+	refs := make([]map[string]interface{}, 0, len(coins))
+	for _, c := range coins {
+		refs = append(refs, map[string]interface{}{"txid": c.txid, "vout": c.vout})
+	}
+	var ok bool
+	return node.Call(&ok, "lockunspent", unlock, refs)
 }
 
 func pickCoins(cands []fundUTXO, target uint64) ([]fundUTXO, uint64) {

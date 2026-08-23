@@ -388,7 +388,7 @@ func (s *Server) pruneDeadLifts() {
 // so the abandoned-lift release that protects WS lifts never fires for it: one
 // unauthenticated POST per offer would keep the whole interactive book "lift in
 // progress". A real taker opens its socket and re-attaches within seconds.
-var restLiftAttachGrace = 30 * time.Second
+var restLiftAttachGrace = newDurationVar(30 * time.Second)
 
 // expireUnattachedLift aborts a REST-opened lift on a non-covenant offer if no taker
 // has attached to the session by the grace deadline. Covenant lifts hold no slot.
@@ -396,7 +396,7 @@ func (s *Server) expireUnattachedLift(sid string, k offerstore.Key) {
 	if e, ok := s.store.Get(k); !ok || e.Offer.GetCovenant() != nil {
 		return
 	}
-	time.AfterFunc(restLiftAttachGrace, func() {
+	time.AfterFunc(restLiftAttachGrace.Get(), func() {
 		s.takerMu.Lock()
 		_, attached := s.takerConns[sid]
 		s.takerMu.Unlock()

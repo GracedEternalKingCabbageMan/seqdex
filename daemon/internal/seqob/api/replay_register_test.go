@@ -88,9 +88,9 @@ func TestReplayOverWSDoesNotRegisterMaker(t *testing.T) {
 // protects WebSocket lifts never fires for it. Without an attach deadline one POST per
 // offer would hold every interactive offer's single lift slot until the session deadline.
 func TestRESTLiftWithoutTakerAttachIsReleased(t *testing.T) {
-	prev := restLiftAttachGrace
-	restLiftAttachGrace = 50 * time.Millisecond
-	t.Cleanup(func() { restLiftAttachGrace = prev })
+	prev := restLiftAttachGrace.Get()
+	restLiftAttachGrace.Set(50 * time.Millisecond)
+	t.Cleanup(func() { restLiftAttachGrace.Set(prev) })
 
 	ts, _ := newServer(t)
 	mk := key(t)
