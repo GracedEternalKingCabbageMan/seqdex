@@ -49,6 +49,7 @@ type subAssetSellMakerConfig struct {
 	spendFee     uint64
 	holdTimeout  time.Duration
 	requote      bool
+	stateDir     string // per-lift session persistence (the funded on-chain leg + refund material)
 }
 
 // buildSubAssetSellOffer builds a Lightning offer (base=asset, quote=BTC sentinel) with
@@ -182,6 +183,7 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 	filled := false
 	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
 	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
+	setBusyFn(func() int { mu.Lock(); defer mu.Unlock(); return inFlight })
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -248,6 +250,13 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 				refuse(sid, cr, "busy", "another swap is in flight")
 				continue
 			}
+			if refuseIfDraining(sid, cr, refuse) {
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
+				continue
+			}
 			fmt.Printf("sub-asset SELL swap requested: session %s offer %s\n", sid, lr.GetOfferId())
 			send := func(sealed []byte) error {
 				return ws.write(&seqobv1.To{Msg: &seqobv1.To_SwapMsg{SwapMsg: &seqobv1.SwapMsg{SessionId: sid, Ciphertext: sealed}}})
@@ -312,22 +321,30 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 					return
 				}
 				tBtc := uint32(h) + cfg.btcDelta
+				// The on-chain leg this maker funds must stay reclaimable after T_btc even if
+				// this process is gone by then: the refund key is derived from the identity
+				// key rather than minted per swap, and the funded leg is written down.
+				refundKey := derivedRefundKey(cfg.makerKey, "subasset-sell")
 				p := client.MakerSubAssetSellParams{
-					NewMakerOps: newOps,
-					Crypter:      cr,
-					BtcAmount:    o.GetOfferAmount(), // BTC sats a WHOLE fill locks (a partial locks the priced slice)
-					AssetAmount:  o.GetWantAmount(),  // asset atoms a WHOLE fill receives over LN (the taker may take a slice)
-					BtcLocktime:  tBtc,
-					MinBTCConf:   cfg.minBTCConf,
-					SpendFeeSats: cfg.spendFee,
-					HoldTimeout:  cfg.holdTimeout,
-					Log:          logf,
+					NewMakerOps:    newOps,
+					Crypter:        cr,
+					BtcAmount:      o.GetOfferAmount(), // BTC sats a WHOLE fill locks (a partial locks the priced slice)
+					AssetAmount:    o.GetWantAmount(),  // asset atoms a WHOLE fill receives over LN (the taker may take a slice)
+					BtcLocktime:    tBtc,
+					MinBTCConf:     cfg.minBTCConf,
+					SpendFeeSats:   cfg.spendFee,
+					HoldTimeout:    cfg.holdTimeout,
+					MakerRefundKey: refundKey,
+					Log:            logf,
 				}
 				res, err := client.RunMakerSubAssetSell(p, in, send)
+				if res != nil && res.BtcLeg != nil {
+					persistXSessionSubAssetSell(cfg.stateDir, sid, o.GetOfferId(), res, refundKey)
+				}
 				if err != nil {
 					fmt.Printf("session %s: sub-asset SELL swap ended: %v\n", sid, err)
 					if res != nil && res.BtcLeg != nil && !res.Settled {
-						fmt.Printf("session %s: (maker BTC %s reclaimable at T_btc=%d if the taker never paid)\n", sid, res.BtcLeg.Funded.TxID, res.BtcLocktime)
+						fmt.Printf("session %s: (maker on-chain leg %s reclaimable at T_btc=%d if the taker never paid; refund key derived from -maker-priv, leg persisted under %s)\n", sid, res.BtcLeg.Funded.TxID, res.BtcLocktime, cfg.stateDir)
 					}
 					return
 				}
