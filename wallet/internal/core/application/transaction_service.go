@@ -7,9 +7,15 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
+	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
+	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
+	wallet "github.com/aejkcs50/seqdex/wallet/pkg/wallet"
+	singlesig "github.com/aejkcs50/seqdex/wallet/pkg/wallet/single-sig"
 	"github.com/btcsuite/btcd/txscript"
 	log "github.com/sirupsen/logrus"
 	"github.com/vulpemventures/go-bip32"
@@ -17,11 +23,6 @@ import (
 	"github.com/vulpemventures/go-elements/network"
 	"github.com/vulpemventures/go-elements/psetv2"
 	"github.com/vulpemventures/go-elements/transaction"
-	"github.com/aejkcs50/seqdex/wallet/internal/core/domain"
-	"github.com/aejkcs50/seqdex/wallet/internal/core/ports"
-	"github.com/aejkcs50/seqdex/wallet/pkg/seqnet"
-	wallet "github.com/aejkcs50/seqdex/wallet/pkg/wallet"
-	singlesig "github.com/aejkcs50/seqdex/wallet/pkg/wallet/single-sig"
 )
 
 var (
@@ -281,6 +282,49 @@ func (ts *TransactionService) UpdatePset(
 	})
 }
 
+// SEQUENTIA: supervised assets are always explicit.
+//
+// A supervised asset is one whose issuer can freeze holders by consensus rule.
+// Consensus cannot read a blinded output's asset, so it refuses any transaction
+// that moves a supervised asset and blinds ANY of its outputs -- not just the
+// supervised ones, because which asset a blinded output carries is exactly what
+// cannot be determined. See Sequentia src/supervision.h.
+//
+// Without this the wallet builds a perfectly ordinary confidential transaction,
+// the node rejects it, and the failure reads as an unrelated wallet bug rather
+// than as the rule it is. The set is configured rather than discovered because
+// this daemon has no node RPC of its own; it is a small, slow-moving list, and
+// an asset can never gain or lose supervision, so a stale entry is wrong only
+// for assets issued after it was written.
+//
+// SEQDEX_SUPERVISED_ASSETS: comma-separated asset ids in hex.
+var supervisedAssets = loadSupervisedAssets()
+
+func loadSupervisedAssets() map[string]bool {
+	out := make(map[string]bool)
+	for _, id := range strings.Split(os.Getenv("SEQDEX_SUPERVISED_ASSETS"), ",") {
+		id = strings.ToLower(strings.TrimSpace(id))
+		if len(id) == 64 {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// Whether any asset this transaction moves is supervised, in which case every
+// output of it must stay explicit.
+func touchesSupervisedAsset(outs []wallet.Output) bool {
+	if len(supervisedAssets) == 0 {
+		return false
+	}
+	for _, o := range outs {
+		if supervisedAssets[strings.ToLower(o.Asset)] {
+			return true
+		}
+	}
+	return false
+}
+
 func (ts *TransactionService) BlindPset(
 	ctx context.Context,
 	ptx string, extraUnblindedInputs []UnblindedInput, lastBlinder bool,
@@ -506,11 +550,23 @@ func (ts *TransactionService) Transfer(
 			return "", err
 		}
 
+		// A supervised asset anywhere in this transaction makes all of it
+		// explicit, change included.
+		supervised := touchesSupervisedAsset(outputs.toWalletOutputs())
+		if !supervised {
+			for asset := range changeByAsset {
+				if supervisedAssets[strings.ToLower(asset)] {
+					supervised = true
+					break
+				}
+			}
+		}
+
 		i := 0
 		for asset, amount := range changeByAsset {
 			script, _ := hex.DecodeString(addressesInfo[i].Script)
 			var blindingKey []byte
-			if !account.Unconf {
+			if !account.Unconf && !supervised {
 				addr, _ := seqnet.FromConfidential(
 					addressesInfo[i].Address, ts.network,
 				)
@@ -681,15 +737,22 @@ func (ts *TransactionService) Transfer(
 		return "", err
 	}
 
-	blindedPtx, err := wallet.BlindPsetWithOwnedInputs(
-		wallet.BlindPsetWithOwnedInputsArgs{
-			PsetBase64:         ptx,
-			OwnedInputsByIndex: inputsByIndex,
-			LastBlinder:        true,
-		},
-	)
-	if err != nil {
-		return "", err
+	// SEQUENTIA: a transaction moving a supervised asset is not blinded at all.
+	// Every output already carries no blinding key, so there is nothing for the
+	// blinder to do, and asking it to run on a transaction with nothing to blind
+	// is how it fails rather than how it no-ops.
+	blindedPtx := ptx
+	if !touchesSupervisedAsset(outs) {
+		blindedPtx, err = wallet.BlindPsetWithOwnedInputs(
+			wallet.BlindPsetWithOwnedInputsArgs{
+				PsetBase64:         ptx,
+				OwnedInputsByIndex: inputsByIndex,
+				LastBlinder:        true,
+			},
+		)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	signedPtx, err := w.SignPset(singlesig.SignPsetArgs{

@@ -186,7 +186,16 @@ func main() {
 		logger.Printf("covenant chain-watcher + reorg watcher DISABLED (no -node-rpc): resting covenant orders are not reconciled and interactive fills are not reorg-undone")
 	}
 
-	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler()}
+	// Bound every phase of a plain HTTP exchange so a slow or silent peer cannot hold a
+	// handler goroutine open indefinitely. The WebSocket upgrade hijacks the connection
+	// and runs its own ping/pong deadline, so these only govern REST.
+	httpSrv := &http.Server{
+		Addr:              *listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	go func() {
 		logger.Printf("listening on %s (non-custodial relay; no wallet, no keys)", *listen)

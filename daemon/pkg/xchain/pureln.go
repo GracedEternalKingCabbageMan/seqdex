@@ -3,7 +3,9 @@ package xchain
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -47,9 +49,23 @@ func (s *PureLNSwap) AssetLegNodeID() (string, error) { return s.assetLeg.NodeID
 func takerPrepare(incoming LNLeg, p []byte, inAmtMsat uint64) (invoice string, h []byte, err error) {
 	sum := sha256.Sum256(p)
 	label := "pureln-" + hex.EncodeToString(sum[:6])
-	inv, err := incoming.CreateInvoice(p, inAmtMsat, 0, label, "pure-ln swap: taker incoming")
-	if err != nil {
-		return "", nil, fmt.Errorf("taker create invoice: %w", err)
+	// A just-booted node answers RPC before its channels finish re-establishing,
+	// and an invoice with route hints fails until they do (CLN error 902, "None
+	// of those hints were suitable local channels" — seen live 91 seconds after
+	// a boot, killing the swap before any HTLC existed). The race is transient
+	// by construction, so wait it out instead of aborting.
+	var inv string
+	var err2 error
+	for deadline := time.Now().Add(2 * time.Minute); ; {
+		inv, err2 = incoming.CreateInvoice(p, inAmtMsat, 0, label, "pure-ln swap: taker incoming")
+		if err2 == nil {
+			break
+		}
+		msg := err2.Error()
+		if !(strings.Contains(msg, "hints were suitable") || strings.Contains(msg, "902")) || time.Now().After(deadline) {
+			return "", nil, fmt.Errorf("taker create invoice: %w", err2)
+		}
+		time.Sleep(time.Second)
 	}
 	return inv, sum[:], nil
 }
@@ -69,18 +85,32 @@ func makerRegisterHold(incoming LNLeg, h []byte, inAmtMsat uint64) error {
 // P. On any failure before the settle it cancels the hold (the taker's incoming
 // is refunded and neither leg completes). Returns the preimage.
 func makerFulfill(incoming, outgoing LNLeg, h []byte, outInvoice string, outAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
+	// Maker-side stage stopwatch (stdout): splits the taker's opaque PayHold
+	// wait into held / paid / settled so the latency is attributable.
+	start := time.Now()
+	mstage := func(name string) { fmt.Printf("MSTAGE %s +%dms\n", name, time.Since(start).Milliseconds()) }
 	if _, err = incoming.WaitHeld(h, holdTimeout); err != nil {
 		_ = incoming.CancelHold(h)
 		return nil, fmt.Errorf("wait held: %w", err)
 	}
+	mstage("held")
 	p, err := outgoing.Pay(outInvoice, h, outAmtMsat)
 	if err != nil {
+		if errors.Is(err, ErrLNPayUnresolved) {
+			// The outgoing HTLC may still settle, and the incoming hold is the only thing
+			// that pays for it. Cancelling the hold here is the one way to lose the asset;
+			// leave it (it expires on its own CLTV) and let the operator settle from
+			// listpays if the payment completes.
+			return nil, fmt.Errorf("pay outgoing leg: %w (incoming hold LEFT IN PLACE)", err)
+		}
 		_ = incoming.CancelHold(h) // refund: nothing was delivered
 		return nil, fmt.Errorf("pay outgoing leg: %w", err)
 	}
+	mstage("paid")
 	if err := incoming.SettleHold(h, p); err != nil {
 		return nil, fmt.Errorf("settle hold (outgoing already paid!): %w", err)
 	}
+	mstage("settled")
 	return p, nil
 }
 

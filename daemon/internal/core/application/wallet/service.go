@@ -372,7 +372,10 @@ func (s *Service) CompleteSwap(
 		// PSET (it's in existingOutputs/allOutputs). Validate the fee asset is
 		// fee-eligible and its node-floor native-equivalent covers the size-based
 		// fee for the FINAL transaction, then add no maker fee input/output.
-		rate, eligible := s.feeExchangeRate(takerFeeAsset)
+		rate, eligible, rateErr := s.feeExchangeRate(takerFeeAsset)
+		if rateErr != nil {
+			return "", nil, -1, rateErr
+		}
 		if !eligible {
 			return "", nil, -1, fmt.Errorf(
 				"taker network-fee asset %s is not fee-eligible", takerFeeAsset,
@@ -432,7 +435,13 @@ func (s *Service) CompleteSwap(
 		// swaps never break.
 		nativeAsset := s.staticInfo.GetNativeAsset()
 		feeAssetNet := swapRequest.GetAssetR()
-		feeRate, eligible := s.feeExchangeRate(feeAssetNet)
+		feeRate, eligible, rateErr := s.feeExchangeRate(feeAssetNet)
+		if rateErr != nil {
+			// The node could not be asked. Falling through to "not eligible" would
+			// re-route the fee through the native asset at par on every transient
+			// failure; refuse and let the taker retry instead.
+			return "", nil, -1, rateErr
+		}
 		feeFundAccount := account
 		if !eligible {
 			// assetR isn't fee-eligible, so `account` (which holds assetR) can't

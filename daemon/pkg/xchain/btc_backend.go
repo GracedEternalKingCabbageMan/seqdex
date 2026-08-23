@@ -123,6 +123,11 @@ func (b *elementsBTCBackend) VerifyBTCLeg(
 	}
 	out, err := b.chain.OutputAt(txid, vout)
 	if err != nil {
+		// A node that has not SEEN the tx yet (propagation lag on a fresh 0-conf
+		// leg) is the retryable not-found class, not an invalid leg.
+		if isTxNotFoundRPC(err) {
+			return nil, fmt.Errorf("%w: funding tx %s: %v", ErrBTCLegNotSeen, txid, err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrBTCLegInvalid, err)
 	}
 	wantSPK, err := b.chain.AddressScriptPubKey(wantP2SH)
@@ -140,6 +145,11 @@ func (b *elementsBTCBackend) VerifyBTCLeg(
 	}
 	confs, err := b.chain.TxConfirmations(txid)
 	if err != nil {
+		// Same not-found split as OutputAt (the tx can be evicted between the
+		// two lookups): not-seen is retryable, everything else is invalid.
+		if isTxNotFoundRPC(err) {
+			return nil, fmt.Errorf("%w: funding tx %s: %v", ErrBTCLegNotSeen, txid, err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrBTCLegInvalid, err)
 	}
 	if confs < minConf {
@@ -323,6 +333,11 @@ func (b *bitcoinBTCBackend) VerifyBTCLeg(
 	// Fetch the raw funding tx (Bitcoin format) + confirmations and verify it.
 	rawHex, confs, err := b.chain.RawTxAndConfirmations(txid)
 	if err != nil {
+		// A node that has not SEEN the tx yet (propagation lag on a fresh 0-conf
+		// leg) is the retryable not-found class, not an invalid leg.
+		if isTxNotFoundRPC(err) {
+			return nil, fmt.Errorf("%w: funding tx %s: %v", ErrBTCLegNotSeen, txid, err)
+		}
 		return nil, fmt.Errorf("%w: fetch funding tx %s: %v", ErrBTCLegInvalid, txid, err)
 	}
 	funded, err := b.leg.VerifyFundedHTLC(rawHex, hashH, makerClaimPub, takerRefundPub, btcLocktime, amount, confs, minConf)

@@ -220,6 +220,20 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		params["asset"] = l.assetID // route in this leg's Sequentia asset (Step 1)
 	}
 	if err := l.rpc.call(&res, "pay", params); err != nil {
+		// AN ERROR FROM `pay` IS NOT A FAILED PAYMENT. The socket read is deadline-bound
+		// while `pay` legitimately runs longer (a retrying route, an HTLC held in flight),
+		// and CLN itself answers code 200 for "timed out, still in progress". Treating
+		// either as failure made the pure-LN maker cancel the taker's incoming hold while
+		// its own outgoing HTLC was still live — and then that HTLC settled: asset paid,
+		// nothing received. Resolve the payment's real state from the node before
+		// deciding anything; only a payment the node has recorded as failed (or never
+		// recorded) goes on to the fallback below.
+		switch pre, state, rerr := l.resolvePay(wantHash, payResolveWait); state {
+		case payComplete:
+			return pre, nil
+		case payPending:
+			return nil, fmt.Errorf("%w: pay: %v (%v)", ErrLNPayUnresolved, err, rerr)
+		}
 		// UNANNOUNCED PAYEE FALLBACK. `pay` plans from the gossip graph plus the invoice's
 		// routehints, so it cannot reach a payee whose only channels are PRIVATE -- it gives up with
 		// "not reachable directly and all routehints were unusable" even when that payee is our own
@@ -300,6 +314,64 @@ func (l *clnLNLeg) directHop(destNodeID string, amountMsat uint64, finalCltv uin
 		}
 	}
 	return nil, fmt.Errorf("no direct CHANNELD_NORMAL channel to %s with >= %d msat spendable", destNodeID, amountMsat)
+}
+
+// payState is what the node knows about an outgoing payment by hash.
+type payState int
+
+const (
+	payUnknown  payState = iota // no record, or failed: nothing is in flight
+	payPending                  // an HTLC is still out; the outcome is undecided
+	payComplete                 // settled; the preimage is known
+)
+
+// payResolveWait bounds how long Pay waits for a pending outgoing payment to
+// resolve after the `pay` call itself returned an error. Past it the payment is
+// reported as unresolved rather than failed.
+var payResolveWait = 10 * time.Minute
+
+// resolvePay reads the outgoing payment's state from listpays, waiting while it is
+// pending up to the given bound. A complete payment yields its preimage (verified
+// against the hash); a failed or unknown one yields payUnknown.
+func (l *clnLNLeg) resolvePay(paymentHash []byte, wait time.Duration) ([]byte, payState, error) {
+	phHex := hex.EncodeToString(paymentHash)
+	deadline := time.Now().Add(wait)
+	var lastErr error
+	for {
+		var res struct {
+			Pays []struct {
+				Status   string `json:"status"`
+				Preimage string `json:"preimage"`
+			} `json:"pays"`
+		}
+		rpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: l.rpc.timeout}
+		lastErr = rpc.call(&res, "listpays", map[string]interface{}{"payment_hash": phHex})
+		pending := false
+		if lastErr == nil {
+			for _, p := range res.Pays {
+				switch p.Status {
+				case "complete":
+					pre, err := hex.DecodeString(p.Preimage)
+					if err != nil || !hashEqualsPreimage(paymentHash, pre) {
+						return nil, payComplete, fmt.Errorf("%w: listpays preimage does not hash to the payment hash", ErrLNLegInvalid)
+					}
+					return pre, payComplete, nil
+				case "pending":
+					pending = true
+				}
+			}
+		}
+		if !pending && lastErr == nil {
+			return nil, payUnknown, nil
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return nil, payPending, fmt.Errorf("listpays: %w", lastErr)
+			}
+			return nil, payPending, nil
+		}
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func (l *clnLNLeg) PayHash(destNodeID string, paymentHash []byte, amountMsat uint64, finalCltv uint32, paymentSecret []byte) ([]byte, error) {
@@ -441,7 +513,11 @@ func (l *clnLNLeg) WaitHeld(paymentHash []byte, timeout time.Duration) (uint64, 
 		if time.Now().After(deadline) {
 			return 0, fmt.Errorf("%w: hold invoice not accepted within %s (last err: %v)", ErrLNLegTimeout, timeout, err)
 		}
-		time.Sleep(2 * time.Second)
+		// Hot path: the taker's HTLC lands within ~a commitment round trip of
+		// the terms exchange, and this poll sat between the two legs of every
+		// swap — a 2s interval alone put seconds on the clock. The lookup is a
+		// local unix-socket RPC; poll tight.
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -505,7 +581,21 @@ func (l *clnLNLeg) CreateInvoice(preimage []byte, amountMsat uint64, cltvExpiry 
 		PaymentHash string `json:"payment_hash"`
 	}
 	if err := l.rpc.call(&res, "invoice", params); err != nil {
-		return "", fmt.Errorf("invoice: %w", err)
+		// The explicit exposeprivatechannels list gets STRICTER validation than
+		// CLN's own hint selection: on a leaf node whose only channels are
+		// private, CLN rejects the whole list ("None of those hints were
+		// suitable local channels", error 902) even when a NORMAL, connected,
+		// sufficient-capacity channel is on it — seen live on a hosted per-user
+		// node, killing the swap before any HTLC existed. CLN's default
+		// selection only WARNS when it cannot hint, so retry without the list.
+		_, had := params["exposeprivatechannels"]
+		if !had || !strings.Contains(err.Error(), "hints were suitable") {
+			return "", fmt.Errorf("invoice: %w", err)
+		}
+		delete(params, "exposeprivatechannels")
+		if err2 := l.rpc.call(&res, "invoice", params); err2 != nil {
+			return "", fmt.Errorf("invoice: %w", err2)
+		}
 	}
 	// The created invoice's hash MUST equal SHA256(P) — otherwise the SEQ leg
 	// (gated on the same H) and the LN leg would not be bound by one secret.

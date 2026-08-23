@@ -35,9 +35,19 @@ func (c *Chain) RPC() *RPC { return c.rpc }
 // fall back to the native fee. Used to size an asset-denominated fee so its
 // native-equivalent value stays within the node's relay fee bounds (maxfeerate).
 func (c *Chain) FeeExchangeRate(assetHex string) (uint64, bool) {
+	rate, ok, _ := c.FeeExchangeRateErr(assetHex)
+	return rate, ok
+}
+
+// FeeExchangeRateErr is FeeExchangeRate that tells "the node could not be asked"
+// apart from "the node lists no positive rate for this asset". A fee sized on a
+// transient RPC failure as if the asset were unlisted would fall through to some
+// flat or 1:1 assumption, which for any asset, the native one included, is not its
+// value; callers that size fees must retry or refuse on err rather than guess.
+func (c *Chain) FeeExchangeRateErr(assetHex string) (rate uint64, listed bool, err error) {
 	var rates map[string]int64
 	if err := c.rpc.Call(&rates, "getfeeexchangerates"); err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	want := strings.ToLower(assetHex)
 	var labels map[string]string // label -> hex; nil if the node has no registry
@@ -47,13 +57,13 @@ func (c *Chain) FeeExchangeRate(assetHex string) (uint64, bool) {
 			continue
 		}
 		if strings.ToLower(key) == want {
-			return uint64(rate), true
+			return uint64(rate), true, nil
 		}
 		if hexForLabel, ok := labels[key]; ok && strings.ToLower(hexForLabel) == want {
-			return uint64(rate), true
+			return uint64(rate), true, nil
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // BlockCount returns the current chain height.
@@ -84,6 +94,39 @@ type FundedHTLC struct {
 	Vout    uint32
 	Amount  uint64 // atoms
 	AssetID string
+}
+
+// FindHTLCUTXO scans the confirmed UTXO set for an unspent output paying the
+// P2SH of `redeemScript` (scantxoutset: no wallet import, no address watching).
+// The resume uses it to DISCOVER a counterparty leg that was funded on-chain but
+// never announced over the courier (taker detached; maker already gave up).
+// Returns (nil, nil) when the scan completes and finds nothing.
+func (c *Chain) FindHTLCUTXO(redeemScript []byte) (*FundedHTLC, error) {
+	p2sh, err := c.P2SHAddress(redeemScript)
+	if err != nil {
+		return nil, err
+	}
+	var scan struct {
+		Success  bool `json:"success"`
+		Unspents []struct {
+			TxID   string  `json:"txid"`
+			Vout   uint32  `json:"vout"`
+			Amount float64 `json:"amount"`
+			Asset  string  `json:"asset"`
+		} `json:"unspents"`
+	}
+	if err := c.rpc.Call(&scan, "scantxoutset", "start", []interface{}{"addr(" + p2sh + ")"}); err != nil {
+		return nil, err
+	}
+	if !scan.Success {
+		return nil, fmt.Errorf("scantxoutset did not complete")
+	}
+	if len(scan.Unspents) == 0 {
+		return nil, nil
+	}
+	u := scan.Unspents[0]
+	return &FundedHTLC{TxID: u.TxID, Vout: u.Vout,
+		Amount: uint64(math.Round(u.Amount * 1e8)), AssetID: u.Asset}, nil
 }
 
 // LockHTLC pays `amountCoins` (a decimal string, e.g. "10") of the given asset

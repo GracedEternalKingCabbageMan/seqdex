@@ -17,14 +17,23 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/covenant"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"google.golang.org/protobuf/proto"
 )
+
+// MaxOfferBytes caps the wire size of one offer. An offer is a few hundred bytes of
+// signed terms; the relay stores and re-serves every accepted one verbatim, so an
+// unbounded offer_id or hint list would let one submitter fill relay memory and
+// every subscriber's snapshot at 120 offers per minute per IP.
+const MaxOfferBytes = 16 << 10
 
 // ErrReplay signals that the submitted offer is a byte-identical replay of an
 // offer already resting in the book (same maker_pubkey + offer_id + maker_sig):
@@ -95,6 +104,10 @@ type Validator struct {
 	mu      sync.Mutex
 	pubHits map[string][]time.Time
 	ipHits  map[string][]time.Time
+	// lastSweep is when the rate maps were last purged of keys whose window has
+	// emptied. A key is pruned only when it is hit again, so keys that are never
+	// seen twice (fresh pubkeys are free to mint) would otherwise accumulate forever.
+	lastSweep time.Time
 }
 
 // SetBook wires the live order book so ValidateOffer can recognize a byte-identical
@@ -135,6 +148,9 @@ func New(cfg Config, probe LivenessProbe) *Validator {
 func (v *Validator) ValidateOffer(ctx context.Context, o *seqobv1.Offer, ip string) error {
 	if err := v.checkIPRate(ip); err != nil {
 		return err
+	}
+	if n := proto.Size(o); n > MaxOfferBytes {
+		return fmt.Errorf("offer too large (%d bytes, max %d)", n, MaxOfferBytes)
 	}
 	if err := offer.VerifyOffer(o); err != nil {
 		return fmt.Errorf("signature: %w", err)
@@ -233,7 +249,76 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 	if o.GetLightning() != nil {
 		return v.checkLightning(o)
 	}
+	if o.GetCovenant() != nil {
+		return checkCovenant(o)
+	}
 	return nil
+}
+
+// checkCovenant ties the covenant's baked-in terms to the price the offer
+// advertises. Both are under the maker's signature, but takers price from the
+// offer fields and the chain enforces the terms: a covenant whose rate demands
+// more than want/offer would be paid whatever the leaf requires, and one whose
+// arithmetic overflows the leaf's signed 64-bit OP_MUL64 can never be filled at
+// all (the locked asset waits for REFUND). The relay refuses both up front.
+//
+// Asset A is the offer_asset and asset B the want_asset, in internal byte order;
+// that pairing is checked only when both sides are real 32-byte ids (fixtures use
+// placeholder names).
+func checkCovenant(o *seqobv1.Offer) error {
+	ct := o.GetCovenant()
+	if ct.GetRateNum() < 1 || ct.GetRateDen() < 1 {
+		return fmt.Errorf("covenant rate %d/%d: numerator and denominator must be >= 1", ct.GetRateNum(), ct.GetRateDen())
+	}
+	if ct.GetMinLot() < 1 {
+		return fmt.Errorf("covenant min_lot must be >= 1")
+	}
+	if ct.GetMinLot() > o.GetOfferAmount() {
+		return fmt.Errorf("covenant min_lot %d exceeds the locked amount %d", ct.GetMinLot(), o.GetOfferAmount())
+	}
+	// rate_num/rate_den == want_amount/offer_amount exactly, cross-multiplied in
+	// big.Int: the leaf prices filled*num/den, and a full fill must cost want_amount.
+	lhs := new(big.Int).Mul(new(big.Int).SetUint64(ct.GetRateNum()), new(big.Int).SetUint64(o.GetOfferAmount()))
+	rhs := new(big.Int).Mul(new(big.Int).SetUint64(ct.GetRateDen()), new(big.Int).SetUint64(o.GetWantAmount()))
+	if lhs.Cmp(rhs) != 0 {
+		return fmt.Errorf("covenant rate %d/%d does not equal the offer's want/offer %d/%d", ct.GetRateNum(), ct.GetRateDen(), o.GetWantAmount(), o.GetOfferAmount())
+	}
+	order := covenant.Order{RateNum: ct.GetRateNum(), RateDen: ct.GetRateDen()}
+	if err := order.CheckArithmetic(o.GetOfferAmount()); err != nil {
+		return fmt.Errorf("covenant: %w", err)
+	}
+	if a, ok := internalToDisplay(ct.GetAssetA()); ok {
+		if off, ok := asset32(o.GetOfferAsset()); ok && a != off {
+			return fmt.Errorf("covenant asset_a %s is not the offer_asset %s", a, off)
+		}
+	}
+	if b, ok := internalToDisplay(ct.GetAssetB()); ok {
+		if want, ok := asset32(o.GetWantAsset()); ok && b != want {
+			return fmt.Errorf("covenant asset_b %s is not the want_asset %s", b, want)
+		}
+	}
+	return nil
+}
+
+// asset32 normalises a 32-byte display-order asset id; ok=false for anything else.
+func asset32(s string) (string, bool) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return "", false
+	}
+	return strings.ToLower(s), true
+}
+
+// internalToDisplay converts a 32-byte internal-order asset id to display order.
+func internalToDisplay(s string) (string, bool) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return "", false
+	}
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return hex.EncodeToString(b), true
 }
 
 // checkConfidential enforces the blinded-book invariants on an offer flagged
@@ -439,6 +524,7 @@ func (v *Validator) checkIPRate(ip string) error {
 	cutoff := now.Add(-time.Minute)
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.sweepLocked(now, cutoff)
 	hits := prune(v.ipHits[ip], cutoff)
 	if len(hits) >= v.cfg.MaxOffersPerMinPerIP {
 		v.ipHits[ip] = hits
@@ -460,6 +546,7 @@ func (v *Validator) checkPubkeyRate(makerPubkey string) error {
 	cutoff := now.Add(-time.Minute)
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.sweepLocked(now, cutoff)
 	hits := prune(v.pubHits[makerPubkey], cutoff)
 	if len(hits) >= v.cfg.MaxOffersPerMinPerPubkey {
 		v.pubHits[makerPubkey] = hits
@@ -473,6 +560,25 @@ func (v *Validator) checkPubkeyRate(makerPubkey string) error {
 // is the offerstore's job, since it holds the per-key nonce high-water mark.)
 func (v *Validator) ValidateCancel(c *seqobv1.OfferCancel) error {
 	return offer.VerifyCancel(c)
+}
+
+// sweepLocked drops every rate-limit key whose window has emptied, at most once a
+// minute. The caller holds v.mu.
+func (v *Validator) sweepLocked(now, cutoff time.Time) {
+	if now.Sub(v.lastSweep) < time.Minute {
+		return
+	}
+	v.lastSweep = now
+	for k, hits := range v.ipHits {
+		if len(prune(hits, cutoff)) == 0 {
+			delete(v.ipHits, k)
+		}
+	}
+	for k, hits := range v.pubHits {
+		if len(prune(hits, cutoff)) == 0 {
+			delete(v.pubHits, k)
+		}
+	}
 }
 
 func prune(hits []time.Time, cutoff time.Time) []time.Time {

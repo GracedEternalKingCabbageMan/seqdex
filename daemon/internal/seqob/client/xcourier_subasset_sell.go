@@ -24,8 +24,16 @@ package client
 // Reuses the shared XcMsg fields (TakerBtcClaimPub, MakerRefundPub, BtcLocktime,
 // BtcAmount/SeqAmount, MakerLNNodeID, HashH, Bolt11, Leg, Preimage) — no new wire
 // fields.
+//
+// PARTIAL FILLS: the terms request carries SeqAmount = the asset-side slice the
+// taker will pay (atoms, JSON number; 0/absent = the whole offer, which is what an
+// older taker sends). The maker's terms echo SeqAmount = the granted slice and
+// BtcAmount = the slice priced at the SIGNED offer's ratio, rounded UP
+// (ProportionalBtc, the taker-receives-the-on-chain-leg direction), and Leg.Amount
+// carries exactly that priced slice — both sides derive the same ceil from the
+// same signed offer, so neither can re-price the other.
 const (
-	XcSubAsSellTermsRequest XcMsgType = "subassell_terms_request" // taker -> maker: request + the taker's BTC claim pubkey
-	XcSubAsSellTerms        XcMsgType = "subassell_terms"         // maker -> taker: asset hold invoice (bolt11 on H) + funded BTC HTLC leg + H
+	XcSubAsSellTermsRequest XcMsgType = "subassell_terms_request" // taker -> maker: request + the taker's BTC claim pubkey + the asset slice (SeqAmount)
+	XcSubAsSellTerms        XcMsgType = "subassell_terms"         // maker -> taker: asset hold invoice (bolt11 on H) + funded BTC HTLC leg (slice-sized) + H
 	XcSubAsSellSettled      XcMsgType = "subassell_settled"       // maker -> taker: settled the asset hold with P (informational)
 )
