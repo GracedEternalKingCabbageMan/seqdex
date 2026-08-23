@@ -75,7 +75,7 @@ func cmdXLift(args []string) {
 	asset := fs.String("asset", "", "Sequentia asset id (hex) to buy with BTC (required)")
 	offerID := fs.String("offer-id", "", "offer id to lift (empty: first verified forward cross offer for -asset)")
 	makerPub := fs.String("maker-pubkey", "", "maker pubkey of the offer (with -offer-id)")
-	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
+	priv := fs.String("priv", "", "DEPRECATED and ignored: the taker session key is minted fresh per run. A reused session key derives the same courier key with the same maker for every lift, which lets a relay replay one session's frames into another")
 	btcRPCURL := fs.String("btc-rpc", "", "bitcoind RPC URL http://user:pass@host:port (required)")
 	btcWallet := fs.String("btc-wallet", "", "bitcoind wallet funding the BTC leg")
 	btcChainName := fs.String("btc-chain", "testnet4", "parent chain params: testnet4 | regtest")
@@ -106,7 +106,12 @@ func cmdXLift(args []string) {
 	}
 	var target *seqobv1.Offer
 	for _, o := range book.GetOffers() {
-		if *offerID != "" && (o.GetOfferId() != *offerID || o.GetMakerPubkey() != *makerPub) {
+		// A named maker is honoured on its own (a retry must find "the same maker,
+		// whatever its offer id is now": the HTLC's claim key is that maker's).
+		if *makerPub != "" && o.GetMakerPubkey() != *makerPub {
+			continue
+		}
+		if *offerID != "" && o.GetOfferId() != *offerID {
 			continue
 		}
 		if o.GetCrossChain() == nil || o.GetCrossChain().GetDirection() != offer.DirBTCToAsset {
@@ -201,7 +206,8 @@ func cmdXLift(args []string) {
 
 	// 4. Open the lift session; E2E key from the SIGNED offer, echo cross-checked
 	// only (a relay substituting keys can only deny service).
-	takerKey := loadOrGenKey(*priv)
+	_ = priv // deprecated: never reuse a session key across lifts
+	takerKey := loadOrGenKey("")
 	wsURL := "ws" + strings.TrimPrefix(*relay, "http") + "/v1/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {

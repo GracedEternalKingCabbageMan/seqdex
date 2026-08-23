@@ -584,7 +584,7 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	if _, err := verifyLeg(); err != nil {
 		return res, fmt.Errorf("taker reverse: asset HTLC no longer verifies before paying: %w", err)
 	}
-	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, p.ExpectInvoiceMsat, leg.Locktime)
+	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, wantMsat, leg.Locktime)
 	if err != nil {
 		return res, fmt.Errorf("taker reverse pay invoice: %w", err)
 	}

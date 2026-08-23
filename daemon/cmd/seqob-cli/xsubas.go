@@ -261,6 +261,16 @@ func cmdXSubAs(args []string) {
 		fatal("asset lightning-rpc %s unreachable: %v", *assetLnSocket, err)
 	}
 
+	// Never clobber a prior session that may still hold a refundable BTC leg:
+	// overwriting its secret/keys/script would strand those coins forever (the guard
+	// xlift and xsell already have).
+	if raw, err := ioutil.ReadFile(*stateFile); err == nil {
+		var old xsubasState
+		if json.Unmarshal(raw, &old) == nil && old.Status != "" &&
+			old.Status != "settled" && !strings.HasPrefix(old.Status, "refunded") {
+			fatal("state file %s holds a session with status %q (possibly a refundable BTC leg); refund it or pass a different -state-file", *stateFile, old.Status)
+		}
+	}
 	// 3. Mint the secret P + the BTC refund key, and persist the session BEFORE
 	//    funding so a crash still leaves a recoverable refund record.
 	secret := make([]byte, 32)
