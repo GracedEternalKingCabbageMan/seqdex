@@ -184,12 +184,13 @@ func (s *Swap) VerifySEQLeg(
 	if !bytes.Equal(hashH, s.hash.Hash) {
 		return nil, fmt.Errorf("%w: seq-leg H=%x != quote H=%x", ErrSEQLegInvalid, hashH, s.hash.Hash)
 	}
-	want, err := s.seqLeg.HTLCScript(makerSeqClaimPub, takerSeqRefundPub, seqLocktime)
+	want, err := s.seqLeg.MatchHTLCScript(providedScript, makerSeqClaimPub, takerSeqRefundPub, seqLocktime)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(want, providedScript) {
-		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrSEQLegInvalid, want, providedScript)
+	if want == nil {
+		cur, _ := s.seqLeg.HTLCScript(makerSeqClaimPub, takerSeqRefundPub, seqLocktime)
+		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrSEQLegInvalid, cur, providedScript)
 	}
 	wantP2SH, err := s.seq.P2SHAddress(want)
 	if err != nil {

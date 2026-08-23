@@ -126,6 +126,11 @@ func (s *Swap) SEQHTLCScript(claimPub, refundPub []byte, locktime uint32) ([]byt
 	return s.seqLeg.HTLCScript(claimPub, refundPub, locktime)
 }
 
+// SEQHTLCScriptVariants lists every accepted SEQ-leg script form (current first).
+func (s *Swap) SEQHTLCScriptVariants(claimPub, refundPub []byte, locktime uint32) ([][]byte, error) {
+	return s.seqLeg.HTLCScriptVariants(claimPub, refundPub, locktime)
+}
+
 // LegLock records a funded HTLC leg.
 type LegLock struct {
 	Script   []byte

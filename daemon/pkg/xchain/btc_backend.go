@@ -1,7 +1,6 @@
 package xchain
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -111,12 +110,13 @@ func (b *elementsBTCBackend) VerifyBTCLeg(
 	txid string, vout uint32, amount uint64, assetID string,
 	minConf int,
 ) (*VerifiedBTCLeg, error) {
-	want, err := b.leg.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
+	want, err := b.leg.MatchHTLCScript(providedScript, makerClaimPub, takerRefundPub, btcLocktime)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(want, providedScript) {
-		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrBTCLegInvalid, want, providedScript)
+	if want == nil {
+		cur, _ := b.leg.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
+		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrBTCLegInvalid, cur, providedScript)
 	}
 	wantP2SH, err := b.chain.P2SHAddress(want)
 	if err != nil {
@@ -320,13 +320,15 @@ func (b *bitcoinBTCBackend) VerifyBTCLeg(
 	txid string, vout uint32, amount uint64, assetID string,
 	minConf int,
 ) (*VerifiedBTCLeg, error) {
-	// Recompute the canonical script and compare to what the taker sent.
-	want, err := b.leg.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
+	// The script the taker sent must be one of the accepted forms for these
+	// parameters (the guarded current form, or the legacy form an older peer built).
+	want, err := b.leg.MatchHTLCScript(providedScript, makerClaimPub, takerRefundPub, btcLocktime)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(want, providedScript) {
-		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrBTCLegInvalid, want, providedScript)
+	if want == nil {
+		cur, _ := b.leg.HTLCScript(makerClaimPub, takerRefundPub, btcLocktime)
+		return nil, fmt.Errorf("%w: redeemScript mismatch (want %x, got %x)", ErrBTCLegInvalid, cur, providedScript)
 	}
 	// Fetch the raw funding tx (Bitcoin format) + confirmations and verify it.
 	rawHex, confs, err := b.chain.RawTxAndConfirmations(txid)
@@ -338,7 +340,7 @@ func (b *bitcoinBTCBackend) VerifyBTCLeg(
 		}
 		return nil, fmt.Errorf("%w: fetch funding tx %s: %v", ErrBTCLegInvalid, txid, err)
 	}
-	funded, err := b.leg.VerifyFundedHTLC(rawHex, hashH, makerClaimPub, takerRefundPub, btcLocktime, amount, confs, minConf)
+	funded, err := b.leg.VerifyFundedHTLCScript(rawHex, want, hashH, amount, confs, minConf)
 	if err != nil {
 		return nil, err
 	}

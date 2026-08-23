@@ -51,6 +51,16 @@ func (l *ElementsLeg) HTLCScript(claimPub, refundPub []byte, locktime uint32) ([
 	return l.prim.LockScript(claimPub, refundPub, locktime)
 }
 
+// HTLCScriptVariants lists the accepted script forms for these parameters.
+func (l *ElementsLeg) HTLCScriptVariants(claimPub, refundPub []byte, locktime uint32) ([][]byte, error) {
+	return ScriptVariants(l.prim, claimPub, refundPub, locktime)
+}
+
+// MatchHTLCScript returns provided if it is an accepted form, else nil.
+func (l *ElementsLeg) MatchHTLCScript(provided, claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
+	return MatchScript(l.prim, provided, claimPub, refundPub, locktime)
+}
+
 // ElementsSpendInput identifies the HTLC output being spent on an Elements leg.
 type ElementsSpendInput struct {
 	TxID    string // funding txid (big-endian display order)

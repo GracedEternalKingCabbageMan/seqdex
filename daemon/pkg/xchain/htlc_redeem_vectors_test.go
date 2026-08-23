@@ -40,7 +40,11 @@ type htlcRedeemVector struct {
 	ClaimPub  string `json:"claim_pub"`  // 33-byte compressed hex (IF-branch key)
 	RefundPub string `json:"refund_pub"` // 33-byte compressed hex (ELSE/CLTV-branch key)
 	TBtc      uint32 `json:"t_btc"`      // CLTV locktime (block height)
-	RedeemHex string `json:"redeem_hex"` // canonical Go LockScript output
+	RedeemHex string `json:"redeem_hex"` // canonical Go LockScript output (with the OP_SIZE guard)
+	// LegacyRedeemHex is the pre-guard form (LegacyLockScript). Verifiers still
+	// accept it from an older counterparty; a second implementation must PARSE it
+	// and must never BUILD it.
+	LegacyRedeemHex string `json:"legacy_redeem_hex"`
 }
 
 // fixedPub returns the 33-byte compressed pubkey for a fixed 32-byte scalar, so
@@ -99,6 +103,11 @@ func computeHTLCRedeemVectors(t *testing.T) []htlcRedeemVector {
 			t.Fatalf("vector %d: LockScript(t=%d): %v", i, r.TBtc, err)
 		}
 		r.RedeemHex = hex.EncodeToString(script)
+		legacy, err := NewHashLockFromHash(hashB).LegacyLockScript(claimB, refundB, r.TBtc)
+		if err != nil {
+			t.Fatalf("vector %d: LegacyLockScript(t=%d): %v", i, r.TBtc, err)
+		}
+		r.LegacyRedeemHex = hex.EncodeToString(legacy)
 	}
 	return rows
 }
@@ -147,10 +156,39 @@ func TestGoldenHTLCRedeemVectors(t *testing.T) {
 		if g.RedeemHex != w.RedeemHex {
 			t.Fatalf("vector %d (t_btc=%d): fixture redeem_hex %s != Go LockScript output %s", i, w.TBtc, g.RedeemHex, w.RedeemHex)
 		}
+		if g.LegacyRedeemHex != w.LegacyRedeemHex {
+			t.Fatalf("vector %d (t_btc=%d): fixture legacy_redeem_hex %s != Go LegacyLockScript output %s", i, w.TBtc, g.LegacyRedeemHex, w.LegacyRedeemHex)
+		}
+		// Both forms are accepted by every verifier; the guarded form is what is built.
+		hashB, _ := hex.DecodeString(w.HashH)
+		claimB, _ := hex.DecodeString(w.ClaimPub)
+		refundB, _ := hex.DecodeString(w.RefundPub)
+		prim := NewHashLockFromHash(hashB)
+		for _, form := range []string{g.RedeemHex, g.LegacyRedeemHex} {
+			fb, _ := hex.DecodeString(form)
+			m, err := MatchScript(prim, fb, claimB, refundB, w.TBtc)
+			if err != nil || !bytes.Equal(m, fb) {
+				t.Fatalf("vector %d: MatchScript rejected accepted form %s (%v)", i, form, err)
+			}
+		}
+		if m, _ := MatchScript(prim, append([]byte{0x00}, []byte(g.RedeemHex)...), claimB, refundB, w.TBtc); m != nil {
+			t.Fatalf("vector %d: MatchScript accepted a foreign script", i)
+		}
+		if H, err := HashFromHTLCRedeemScript(mustHex(g.RedeemHex)); err != nil || !bytes.Equal(H, hashB) {
+			t.Fatalf("vector %d: HashFromHTLCRedeemScript does not read H from the guarded form", i)
+		}
 		// And the committed hex must genuinely parse back to the same inputs via a
 		// tokenizer, so a JS byte-match against it is a match against a real HTLC.
 		assertRedeemBindsInputs(t, i, g)
 	}
+}
+
+func mustHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 // assertRedeemBindsInputs re-parses a committed redeem_hex and confirms it embeds
