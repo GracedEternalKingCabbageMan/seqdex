@@ -24,3 +24,7 @@ datadir/
 
 # local build outputs (scp'd to the box)
 /dist/
+
+# Python bytecode from the regtest proofs
+__pycache__/
+*.py[cod]

@@ -112,7 +112,7 @@ message Offer {
   oneof settlement {
     SameChainTerms  same_chain  = 20;
     CrossChainTerms cross_chain = 21;
-    LightningTerms  lightning   = 22; // reserved; not implemented before LN phases
+    LightningTerms  lightning   = 22; // submarine, pure-LN and sub-asset rails (ln_direction)
     CovenantTerms   covenant    = 23; // funded, self-enforcing resting order (passive CLOB)
   }
 
@@ -123,7 +123,7 @@ message Offer {
 }
 
 message SameChainTerms {
-  string maker_recv_address = 1; // confidential address where the taker pays want_asset
+  string maker_recv_address = 1; // where the taker pays want_asset (blinded only for a confidential offer)
   string maker_blinding_pub = 2; // lets the taker blind the maker's output
 }
 
@@ -160,8 +160,8 @@ message LightningTerms {
 // order IS the coin, so oversell is impossible (first spend wins). maker_sig on
 // the enclosing Offer still authenticates the POSTER for relay rate-limiting /
 // cancel, but is not load-bearing for settlement correctness (the chain is
-// authoritative). Design: doc/sequentia/simplicity-dex-covenant-offers-design.md
-// section 4.
+// authoritative). Design: docs/simplicity-dex-covenant-offers-design.md
+// section 4 (the design space; the shipped leaf is tapscript, pkg/covenant).
 message CovenantTerms {
   string covenant_txid       = 1;  // the funded taproot UTXO (display txid hex)
   uint32 covenant_vout       = 2;
