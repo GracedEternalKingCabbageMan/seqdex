@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/aejkcs50/seqdex/daemon/internal/core/ports"
@@ -25,6 +26,14 @@ func (f fakeRates) FeeExchangeRate(asset string) (uint64, bool) {
 	return r, ok
 }
 
+// downRates is a fee-market view whose node cannot be reached.
+type downRates struct{}
+
+func (downRates) FeeExchangeRate(string) (uint64, bool) { return 0, false }
+func (downRates) FeeExchangeRateErr(string) (uint64, bool, error) {
+	return 0, false, errors.New("connection refused")
+}
+
 // THE NATIVE ASSET IS NOT 1:1.
 //
 // feeExchangeRate used to return exchange_rate_scale for the native asset
@@ -46,9 +55,9 @@ func TestNativeAssetUsesThePublishedRateNotPar(t *testing.T) {
 		rates:      fakeRates{m: map[string]uint64{native: livePolicyRate}},
 	}
 
-	rate, ok := s.feeExchangeRate(native)
-	if !ok {
-		t.Fatal("the native asset must stay fee-eligible when the node prices it")
+	rate, ok, err := s.feeExchangeRate(native)
+	if err != nil || !ok {
+		t.Fatalf("the native asset must stay fee-eligible when the node prices it (ok=%v err=%v)", ok, err)
 	}
 	if rate == exchangeRateScale {
 		t.Fatalf("native asset was valued at par (%d); it must use the PUBLISHED rate, "+
@@ -68,10 +77,10 @@ func TestNonNativeAssetIsRateGated(t *testing.T) {
 		staticInfo: staticInfoStub(native),
 		rates:      fakeRates{m: map[string]uint64{gold: 414_440_000_000}},
 	}
-	if rate, ok := s.feeExchangeRate(gold); !ok || rate != 414_440_000_000 {
-		t.Fatalf("gold: rate=%d ok=%v", rate, ok)
+	if rate, ok, err := s.feeExchangeRate(gold); err != nil || !ok || rate != 414_440_000_000 {
+		t.Fatalf("gold: rate=%d ok=%v err=%v", rate, ok, err)
 	}
-	if _, ok := s.feeExchangeRate("unlistedhex"); ok {
+	if _, ok, _ := s.feeExchangeRate("unlistedhex"); ok {
 		t.Fatal("an unlisted asset must not be fee-eligible")
 	}
 }
@@ -81,10 +90,10 @@ func TestParIsTheNoNodeRpcFallbackOnly(t *testing.T) {
 	const native = "policyassethex"
 
 	s := &Service{staticInfo: staticInfoStub(native), rates: nil}
-	if rate, ok := s.feeExchangeRate(native); !ok || rate != exchangeRateScale {
+	if rate, ok, _ := s.feeExchangeRate(native); !ok || rate != exchangeRateScale {
 		t.Fatalf("with no fee-market view the native asset must size at par: rate=%d ok=%v", rate, ok)
 	}
-	if _, ok := s.feeExchangeRate("goldhex"); ok {
+	if _, ok, _ := s.feeExchangeRate("goldhex"); ok {
 		t.Fatal("with no fee-market view nothing but the native asset is eligible")
 	}
 
@@ -92,10 +101,23 @@ func TestParIsTheNoNodeRpcFallbackOnly(t *testing.T) {
 	// a last resort, so a node whose sidecar is briefly down can still size a fee
 	// — but that is a fallback, never a privilege extended to other assets.
 	s2 := &Service{staticInfo: staticInfoStub(native), rates: fakeRates{m: map[string]uint64{}}}
-	if rate, ok := s2.feeExchangeRate(native); !ok || rate != exchangeRateScale {
+	if rate, ok, _ := s2.feeExchangeRate(native); !ok || rate != exchangeRateScale {
 		t.Fatalf("unlisted native: rate=%d ok=%v", rate, ok)
 	}
-	if _, ok := s2.feeExchangeRate("goldhex"); ok {
+	if _, ok, _ := s2.feeExchangeRate("goldhex"); ok {
 		t.Fatal("an unlisted non-native asset gets no such fallback")
+	}
+}
+
+// A node that cannot be asked is not "unlisted": the answer is an error, so the swap
+// path refuses to size the fee instead of silently switching to the native asset at
+// par from the fee account.
+func TestRpcFailureIsAnErrorNotAFallback(t *testing.T) {
+	const native = "policyassethex"
+	s := &Service{staticInfo: staticInfoStub(native), rates: downRates{}}
+	for _, asset := range []string{"goldhex", native} {
+		if _, ok, err := s.feeExchangeRate(asset); err == nil || ok {
+			t.Fatalf("%s: want an error with ok=false, got ok=%v err=%v", asset, ok, err)
+		}
 	}
 }

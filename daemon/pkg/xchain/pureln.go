@@ -3,6 +3,7 @@ package xchain
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -95,6 +96,13 @@ func makerFulfill(incoming, outgoing LNLeg, h []byte, outInvoice string, outAmtM
 	mstage("held")
 	p, err := outgoing.Pay(outInvoice, h, outAmtMsat)
 	if err != nil {
+		if errors.Is(err, ErrLNPayUnresolved) {
+			// The outgoing HTLC may still settle, and the incoming hold is the only thing
+			// that pays for it. Cancelling the hold here is the one way to lose the asset;
+			// leave it (it expires on its own CLTV) and let the operator settle from
+			// listpays if the payment completes.
+			return nil, fmt.Errorf("pay outgoing leg: %w (incoming hold LEFT IN PLACE)", err)
+		}
 		_ = incoming.CancelHold(h) // refund: nothing was delivered
 		return nil, fmt.Errorf("pay outgoing leg: %w", err)
 	}
