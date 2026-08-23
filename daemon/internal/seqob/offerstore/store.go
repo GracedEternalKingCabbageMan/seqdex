@@ -477,6 +477,15 @@ func (s *Store) Cancel(c *seqobv1.OfferCancel) error {
 		return fmt.Errorf("stale cancel nonce")
 	}
 	e, ok := s.entries[k]
+	// The nonce high-water mark is in memory, so it does not survive a relay restart
+	// while makers re-post the same offer ids. A captured cancel that predates the
+	// resting offer's post time is a replay from an earlier life of that id, whatever
+	// the mark says. Clock nonces (the Go maker's nanoseconds, the wallet's seconds)
+	// can be placed in time; an opaque counter cannot and is not judged here.
+	if ok && nonceBefore(c.GetNonce(), e.Offer.GetCreatedAtUnix()) {
+		s.mu.Unlock()
+		return fmt.Errorf("cancel nonce predates the resting offer")
+	}
 	// The high-water mark survives removal (a replayed cancel must stay stale after the
 	// offer is gone), but it is only ever CREATED for a key that rests or once rested:
 	// a valid signature over any (pubkey, offer_id) is free to mint, and recording every
@@ -766,13 +775,19 @@ func (s *Store) ApplyPartialFill(k Key, filledBase uint64, settleTxid string, an
 // (there is nothing to price or decrement); the nonce is still advanced so the stale copy
 // cannot later apply. Reorg retraction of the recorded trade is handled separately.
 func (s *Store) RecordSettledFill(k Key, fillBase uint64, settleTxid string, anchorConfs uint32, nonce uint64) error {
+	// A settled-trade record without a nonce cannot be told from a replay of
+	// itself; every signer in use (the Go maker) sends a clock nonce, so a zero is
+	// refused rather than admitted unguarded.
+	if nonce == 0 {
+		return fmt.Errorf("settled-trade nonce must be non-zero")
+	}
 	s.mu.Lock()
-	if nonce != 0 && nonce <= s.settledNonce[k] {
+	if nonce <= s.settledNonce[k] {
 		s.mu.Unlock()
 		return fmt.Errorf("stale settled-trade nonce")
 	}
 	e, ok := s.entries[k]
-	if _, seen := s.settledNonce[k]; nonce != 0 && (ok || seen) {
+	if _, seen := s.settledNonce[k]; ok || seen {
 		s.settledNonce[k] = nonce // same growth rule as the cancel nonce: only for keys that ever rested
 	}
 	if !ok {
@@ -878,6 +893,19 @@ func cancelledSince(n, createdAtUnix uint64) bool {
 		return n >= createdAtUnix*1e9
 	}
 	return n >= createdAtUnix && n >= 1e9 // a second-resolution clock, not a counter
+}
+
+// nonceBefore is the converse of cancelledSince: a clock nonce that lies BEFORE the
+// offer's post time. Opaque counters (below any unix-second clock) are never "before".
+func nonceBefore(n, createdAtUnix uint64) bool {
+	if n == 0 || createdAtUnix == 0 || n < 1e9 {
+		return false
+	}
+	const nanosFloor = 1e15
+	if n >= nanosFloor {
+		return n < createdAtUnix*1e9
+	}
+	return n < createdAtUnix
 }
 
 // SweepExpired removes offers whose expires_at_unix has passed, emitting EXPIRED

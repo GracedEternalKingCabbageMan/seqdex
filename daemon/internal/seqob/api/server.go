@@ -366,6 +366,22 @@ func (s *Server) handleLift(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// pruneDeadLifts drops lift-slot entries whose session is no longer live, so the
+// map stays proportional to offers with a lift actually in progress rather than
+// to every offer ever lifted.
+func (s *Server) pruneDeadLifts() {
+	s.liftMu.Lock()
+	defer s.liftMu.Unlock()
+	for k, sid := range s.liftActive {
+		if sid == liftReserving {
+			continue
+		}
+		if _, live := s.sessions.Get(sid); !live {
+			delete(s.liftActive, k)
+		}
+	}
+}
+
 // restLiftAttachGrace is how long a lift opened over REST may sit with no taker socket
 // attached before the relay aborts it. A REST lift holds the offer's single lift slot
 // (for a cross offer, up to the multi-hour cross deadline) yet binds to no connection,
@@ -432,6 +448,7 @@ func (s *Server) openLift(sl *seqobv1.StartLift) (*session.Session, error) {
 	// permissionless takers are safe.
 	isCovenant := e.Offer.GetCovenant() != nil
 	if !isCovenant {
+		s.pruneDeadLifts()
 		// Atomically RESERVE the offer's single lift slot with an in-progress sentinel,
 		// so a concurrent openLift sees it taken even before StartLift returns. The lock
 		// is NOT held across StartLift (which does a WS notify that could block on a slow

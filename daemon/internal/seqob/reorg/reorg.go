@@ -19,6 +19,17 @@ import (
 // ChainProbe reports whether a settling tx is still known to the node. It is the
 // small, total surface the reconciliation needs, so it can be driven by a fake in
 // tests. Every call reads the LIVE tip; there is no cache.
+// ReorgForgetDepth is the Sequentia confirmation depth past which a watched
+// settlement is dropped: about 2.4 hours of 60-second slots, some fourteen Bitcoin
+// blocks of anchoring, beyond any reorg the anchor-following design is built for.
+const ReorgForgetDepth = 144
+
+// confirmationsProber is the optional probe capability that lets the watcher expire
+// deeply buried settlements.
+type confirmationsProber interface {
+	TxConfirmations(txid string) (int64, error)
+}
+
 type ChainProbe interface {
 	// TxPresent reports whether txid is still known to the node at the current tip —
 	// in the best chain OR the mempool. A tx whose anchoring block was orphaned by a
@@ -128,6 +139,13 @@ func (w *Watcher) ReconcileOnce() int {
 			w.mu.Lock()
 			wt.seen = true
 			w.mu.Unlock()
+			// A settlement buried past any Bitcoin reorg worth modelling no longer needs
+			// watching; without this every settled lift cost one RPC per pass forever.
+			if cp, ok := w.probe.(confirmationsProber); ok {
+				if confs, err := cp.TxConfirmations(wt.txid); err == nil && confs >= ReorgForgetDepth {
+					w.Forget(id)
+				}
+			}
 			continue
 		}
 		if wt.seen {
