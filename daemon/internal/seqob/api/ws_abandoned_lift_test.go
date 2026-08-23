@@ -21,9 +21,9 @@ import (
 // re-quote them: the book looks full while becoming unusable, and each retry down the
 // book burns the next offer the same way.
 func TestAbandonedLiftFreesTheOfferSlot(t *testing.T) {
-	orig := takerReattachGrace
-	takerReattachGrace = 50 * time.Millisecond
-	defer func() { takerReattachGrace = orig }()
+	orig := takerReattachGrace.Get()
+	takerReattachGrace.Set(50 * time.Millisecond)
+	defer takerReattachGrace.Set(orig)
 
 	ts, _ := newServer(t)
 	mk := key(t)
@@ -76,9 +76,9 @@ func TestAbandonedLiftFreesTheOfferSlot(t *testing.T) {
 // A taker that RECONNECTS must not be aborted out from under: P3.8 re-attach exists
 // because a taker mid-swap with funds committed has to be able to come back.
 func TestReattachedTakerIsNotAborted(t *testing.T) {
-	orig := takerReattachGrace
-	takerReattachGrace = 50 * time.Millisecond
-	defer func() { takerReattachGrace = orig }()
+	orig := takerReattachGrace.Get()
+	takerReattachGrace.Set(50 * time.Millisecond)
+	defer takerReattachGrace.Set(orig)
 
 	ts, _ := newServer(t)
 	mk := key(t)

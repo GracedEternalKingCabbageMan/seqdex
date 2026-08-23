@@ -42,7 +42,8 @@ func runSettler(args []string) {
 	nodePass := fs.String("node-rpc-pass", env("SEQOB_NODE_RPC_PASS", ""), "node JSON-RPC pass (env SEQOB_NODE_RPC_PASS)")
 	feeWallet := fs.String("fee-wallet", env("SEQOB_SETTLER_WALLET", ""), "node wallet holding the settler's bitcoin for fee+gap (env SEQOB_SETTLER_WALLET)")
 	gapValue := fs.Uint64("gap-value", 10000, "atoms for each full-fill bitcoin gap output (settler-owned, returned to the settler)")
-	feeAtoms := fs.Uint64("fee", 5000, "explicit network fee per joint tx, in atoms (raise if the node rejects for low fee)")
+	feeAtoms := fs.Uint64("fee", 5000, "explicit network fee per joint tx, in atoms of the fee asset (raise if the node rejects for low fee)")
+	feeAsset := fs.String("fee-asset", env("SEQOB_SETTLER_FEE_ASSET", ""), "asset the settler pays fees and gap outputs in (display hex; default: the chain's pegged bitcoin asset). Any asset the node accepts for fees; the native asset is not privileged")
 	pollInterval := fs.Duration("poll-interval", 3*time.Second, "orderbook poll interval")
 	markets := fs.String("markets", env("SEQOB_SETTLER_MARKETS", ""), "comma-separated base/quote pairs to scope, e.g. gold/usdx,silvr/usdx (default: all relay markets)")
 	_ = fs.Parse(args)
@@ -68,6 +69,9 @@ func runSettler(args []string) {
 	if err != nil {
 		die("run: getsidechaininfo (pegged bitcoin asset): %v", err)
 	}
+	if *feeAsset != "" {
+		pegged = strings.ToLower(*feeAsset)
+	}
 	peggedInternal, err := internalAsset(pegged)
 	if err != nil {
 		die("run: pegged asset %q: %v", pegged, err)
@@ -84,7 +88,7 @@ func runSettler(args []string) {
 		bc:      settler.ChainBroadcaster{Chain: chain},
 		http:    &http.Client{Timeout: 15 * time.Second},
 		markets: parseMarkets(*markets),
-		settled: map[string]bool{},
+		settled: map[string]time.Time{},
 	}
 
 	fmt.Printf("seqob-settler run: relay=%s node=%s wallet=%s gap=%d fee=%d poll=%s\n",
@@ -114,8 +118,14 @@ type settlerLoop struct {
 	bc      settler.Broadcaster
 	http    *http.Client
 	markets []pair
-	settled map[string]bool
+	settled map[string]time.Time
 }
+
+// settledTTL is how long a pair stays skipped after a joint fill was broadcast:
+// long enough for gettxout to show both covenants spent, short enough that a
+// Bitcoin-driven reorg that un-happens the fill (both covenants unspent again,
+// re-opened by the relay) is picked up on a later pass rather than never.
+const settledTTL = 30 * time.Minute
 
 // run polls forever, escalating a backoff on relay/node I/O errors and resetting
 // it after a clean pass.
@@ -161,7 +171,7 @@ func (l *settlerLoop) tick() (int, error) {
 			return settledCount, fmt.Errorf("pair %s/%s: %w", p.base, p.quote, err)
 		}
 		for _, c := range cands {
-			if l.settled[c.key] {
+			if at, ok := l.settled[c.key]; ok && time.Since(at) < settledTTL {
 				continue
 			}
 			if l.handle(c) {
@@ -226,11 +236,14 @@ func (l *settlerLoop) handle(c candidate) bool {
 	lockedA, lockedB, err := settler.Resolve(c.match, l.view)
 	if err != nil {
 		// The advertised cross is stale or unverifiable (a covenant was spent, is a
-		// ghost, or does not match its terms). Not fatal — just not settleable now.
+		// ghost, or does not match its terms). Not fatal — just not settleable now —
+		// but say so once per pass, or an operator cannot tell why nothing settles.
+		fmt.Printf("settler: %s not resolvable now: %v\n", c.key, err)
 		return false
 	}
 	fillA, fillB, err := computeFills(c.match, lockedA, lockedB)
 	if err != nil {
+		fmt.Printf("settler: %s: %v\n", c.key, err)
 		return false
 	}
 	txid, err := settler.Handle(c.match, lockedA, fillA, lockedB, fillB, l.asm, l.bc)
@@ -238,37 +251,86 @@ func (l *settlerLoop) handle(c candidate) bool {
 		fmt.Printf("settler: %s not settled: %v\n", c.key, err)
 		return false
 	}
-	l.settled[c.key] = true
+	l.settled[c.key] = time.Now()
 	fmt.Printf("settler: SETTLED joint cross %s -> tx %s (A %d/%d, B %d/%d)\n",
 		c.key, txid, fillA, lockedA, fillB, lockedB)
 	return true
 }
 
 // computeFills picks the cross fills for two crossing covenants from their locked
-// amounts and on-chain rates. The smaller side fully fills; the larger side is
-// taken to exactly the counterparty's ceil-price floor (its remainder re-rests).
+// amounts and on-chain rates. Both leaves round in their own maker's favour, so
+// with reciprocal rates that do not divide evenly (A at 1/3, B at 3/1, 10 each:
+// B owes 4 for all of A's 10, but A then owes ceil(4*3)=12 > 10) the obvious
+// pick misses a floor by a rounding atom and the most common cross of all, equal
+// prices, was rejected on every pass. The fills are found by a bounded search
+// from the largest candidate down, each candidate checked against BOTH leaves'
+// ceil floors and the min-lot rule on both remainders. The smaller side fills in
+// full when it can; otherwise its remainder re-rests.
 // covenant.PlanJointSettlement re-validates every floor and min-lot, so this is
 // advisory — a bad pick is rejected there, never broadcast.
 func computeFills(m matcher.Match, lockedA, lockedB uint64) (fillA, fillB uint64, err error) {
 	numA, denA := m.RestingCovenant.GetRateNum(), m.RestingCovenant.GetRateDen()
 	numB, denB := m.IncomingCovenant.GetRateNum(), m.IncomingCovenant.GetRateDen()
+	minLotA, minLotB := m.RestingCovenant.GetMinLot(), m.IncomingCovenant.GetMinLot()
 	if denA == 0 || denB == 0 {
 		return 0, 0, fmt.Errorf("zero rate denominator")
 	}
-	// Y maker0 is owed to sell ALL its X.
-	reqB := covenant.CeilPrice(lockedA, numA, denA)
-	if lockedB >= reqB {
-		// A fully fills; take exactly the Y maker0 is owed. covB keeps the rest.
-		fillA, fillB = lockedA, reqB
-	} else {
-		// B fully fills; take exactly the X maker1 is owed. covA keeps the rest.
-		fillB = lockedB
-		fillA = covenant.CeilPrice(lockedB, numB, denB)
+	valid := func(fa, fb uint64) bool {
+		if fa == 0 || fb == 0 || fa > lockedA || fb > lockedB || fa < minLotA || fb < minLotB {
+			return false
+		}
+		if fb < covenant.CeilPrice(fa, numA, denA) || fa < covenant.CeilPrice(fb, numB, denB) {
+			return false
+		}
+		if r := lockedA - fa; r != 0 && r < minLotA {
+			return false
+		}
+		if r := lockedB - fb; r != 0 && r < minLotB {
+			return false
+		}
+		return true
 	}
-	if fillA == 0 || fillB == 0 || fillA > lockedA || fillB > lockedB {
-		return 0, 0, fmt.Errorf("no valid cross (fillA=%d/%d fillB=%d/%d)", fillA, lockedA, fillB, lockedB)
+	// Candidates, largest first: A's full lock and what B's lock can pay for, then
+	// stepping down; for each A candidate, B pays A's floor or its whole lock.
+	startA := lockedA
+	if c := largestFillCoveredBy(lockedB, numA, denA, lockedA); c < startA {
+		startA = c
 	}
-	return fillA, fillB, nil
+	for fa, tries := startA, 0; fa > 0 && tries < 256; fa, tries = fa-1, tries+1 {
+		for _, fb := range []uint64{covenant.CeilPrice(fa, numA, denA), lockedB} {
+			if valid(fa, fb) {
+				return fa, fb, nil
+			}
+		}
+	}
+	// Symmetric: B's side leads (B fills in full or steps down; A pays B's floor or all).
+	startB := lockedB
+	if c := largestFillCoveredBy(lockedA, numB, denB, lockedB); c < startB {
+		startB = c
+	}
+	for fb, tries := startB, 0; fb > 0 && tries < 256; fb, tries = fb-1, tries+1 {
+		for _, fa := range []uint64{covenant.CeilPrice(fb, numB, denB), lockedA} {
+			if valid(fa, fb) {
+				return fa, fb, nil
+			}
+		}
+	}
+	return 0, 0, fmt.Errorf("no valid cross for locked A=%d B=%d at rates %d/%d and %d/%d (min lots %d/%d)", lockedA, lockedB, numA, denA, numB, denB, minLotA, minLotB)
+}
+
+// largestFillCoveredBy is the largest fill f <= cur with CeilPrice(f, num, den) <= budget.
+func largestFillCoveredBy(budget, num, den, cur uint64) uint64 {
+	if num == 0 {
+		return cur
+	}
+	f := (budget * den) / num // floor(budget*den/num): ceil(f*num/den) <= budget
+	for f > 0 && covenant.CeilPrice(f, num, den) > budget {
+		f--
+	}
+	if f > cur {
+		f = cur
+	}
+	return f
 }
 
 // --- relay REST -------------------------------------------------------------

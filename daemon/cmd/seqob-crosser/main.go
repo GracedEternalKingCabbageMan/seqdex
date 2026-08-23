@@ -240,26 +240,22 @@ func executeCrossing(pair string, p *CrossPlan, ex *Executor, ledger *Ledger, jo
 		return false
 	}
 
-	rec.First.Status = "running"
-	_ = journal.Update(pair)
+	_ = journal.SetLeg(pair, false, "running", "", "")
 	logf("[%s] leg 1/2: %s %s %d base against %s on %s", pair, p.First.Side, p.First.Family, p.Take, short(p.First.ID()), p.First.Relay)
 	r1 := ex.RunLeg(p.First, p.Take)
-	rec.First.StateFile, rec.First.Resume = r1.StateFile, r1.Resume
 	if !r1.Settled {
-		rec.First.Status = "failed"
+		_ = journal.SetLeg(pair, false, "failed", r1.StateFile, r1.Resume)
 		_ = journal.End(pair, nil) // nothing executed: zero drift
 		logf("[%s] leg 1 FAILED (nothing executed, no exposure): %s", pair, r1.Err)
 		return false
 	}
-	rec.First.Status = "settled"
-	rec.Second.Status = "running"
-	_ = journal.Update(pair)
+	_ = journal.SetLeg(pair, false, "settled", r1.StateFile, r1.Resume)
+	_ = journal.SetLeg(pair, true, "running", "", "")
 	logf("[%s] leg 1 settled; leg 2/2: %s %s %d base against %s on %s", pair, p.Second.Side, p.Second.Family, p.Take, short(p.Second.ID()), p.Second.Relay)
 
 	r2 := ex.RunLeg(p.Second, p.Take)
-	rec.Second.StateFile, rec.Second.Resume = r2.StateFile, r2.Resume
 	if !r2.Settled {
-		rec.Second.Status = "failed"
+		_ = journal.SetLeg(pair, true, "failed", r2.StateFile, r2.Resume)
 		ledger.RecordResidue(p)
 		bd, qd := worstCase(p)
 		_ = journal.End(pair, map[string]int64{p.Bid.Base: bd, p.Bid.Quote: qd})
@@ -271,7 +267,7 @@ func executeCrossing(pair string, p *CrossPlan, ex *Executor, ledger *Ledger, jo
 		}
 		return false
 	}
-	rec.Second.Status = "settled"
+	_ = journal.SetLeg(pair, true, "settled", r2.StateFile, r2.Resume)
 	_ = journal.End(pair, nil)
 	logf("[%s] CROSSING SETTLED: took %d base both ways, kept %d quote gross (est costs %d)", pair, p.Take, p.Gross, p.EstCost)
 	return true
