@@ -117,6 +117,14 @@ type LegResult struct {
 type Executor struct {
 	Caps Caps
 	Logf func(string, ...interface{})
+
+	// liftMu serialises same-chain lifts. seqob-cli lift spends from the keyed
+	// taker address, a single UTXO pool with no coin locking, so two lifts built
+	// at the same moment pick the same coins and every broadcast after the first
+	// fails bad-txns-inputs-missingorspent. The pairs run concurrently; only this
+	// leg kind queues. Cross-chain and covenant legs draw on node wallets that
+	// lock their own coins and stay parallel.
+	liftMu sync.Mutex
 }
 
 // takeArg is the -amount value: the CLIs treat 0 as "the whole offer".
@@ -142,6 +150,10 @@ func (e *Executor) RunLeg(n *NormOrder, take uint64) LegResult {
 		return LegResult{Err: err.Error()}
 	}
 	res := LegResult{StateFile: state, Resume: resume}
+	if n.Family == FamSameChain {
+		e.liftMu.Lock()
+		defer e.liftMu.Unlock()
+	}
 	settled, runErr := e.runCLI(args)
 	res.Settled = settled
 	if runErr != nil {
