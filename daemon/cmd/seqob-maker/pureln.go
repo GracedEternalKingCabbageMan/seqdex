@@ -204,6 +204,7 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 	filled := false
 	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
 	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
+	setBusyFn(func() int { mu.Lock(); defer mu.Unlock(); return inFlight })
 
 	dir, _ := cfg.plnDirection()
 	newOps := func() client.PlnMakerOps {
@@ -284,6 +285,13 @@ func servePureLN(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg pureLNMakerCon
 			}
 			if busy {
 				refuse(sid, cr, "busy", "another swap is in flight (whole-swap, one at a time)")
+				continue
+			}
+			if refuseIfDraining(sid, cr, refuse) {
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
 				continue
 			}
 			fmt.Printf("pure-LN swap requested: session %s offer %s\n", sid, lr.GetOfferId())

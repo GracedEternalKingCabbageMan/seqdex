@@ -196,6 +196,15 @@ type MakerReverseSubmarineParams struct {
 	InvoiceCLTV      uint32
 	Timing           XcTiming
 	Log              func(format string, args ...interface{})
+
+	// SeqRefundKey reclaims the locked asset after T_seq when the taker never pays.
+	// nil mints a fresh key for this swap, which then exists ONLY in this process;
+	// a caller that may be restarted mid-swap must supply a key it can rebuild.
+	SeqRefundKey *xchain.Key
+	// OnUpdate is invoked with the running result at every value transition — first
+	// the moment the asset is locked, before the taker is even told — so the caller
+	// can persist the leg and refund material ahead of any wait.
+	OnUpdate func(*MakerReverseSubmarineResult)
 }
 
 type MakerReverseSubmarineResult struct {
@@ -286,9 +295,12 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 	if _, err := rand.Read(secret); err != nil {
 		return res, err
 	}
-	makerSeqRefund, err := xchain.NewKey()
-	if err != nil {
-		return res, err
+	makerSeqRefund := p.SeqRefundKey
+	if makerSeqRefund == nil {
+		var err error
+		if makerSeqRefund, err = xchain.NewKey(); err != nil {
+			return res, err
+		}
 	}
 	res.SeqRefundKey = makerSeqRefund
 	seqTip, err := p.SeqTip()
@@ -313,14 +325,17 @@ func RunMakerReverseSubmarine(p MakerReverseSubmarineParams, in <-chan []byte, s
 	})
 	if offer != nil {
 		res.SeqLeg = offer.SeqLeg
+		res.HashH = offer.HashH
+		res.Bolt11 = offer.Bolt11
+		res.Label = label
+	}
+	if res.SeqLeg != nil && p.OnUpdate != nil {
+		p.OnUpdate(res) // the asset is locked: persist before anything else can interrupt
 	}
 	if err != nil {
 		sendXcFail(p.Crypter, send, "LOCK_FAILED", err.Error())
 		return res, fmt.Errorf("maker reverse submarine offer: %w", err)
 	}
-	res.HashH = offer.HashH
-	res.Bolt11 = offer.Bolt11
-	res.Label = label
 
 	// 3. Announce the locked asset + the invoice to pay.
 	if err := sendXc(&XcMsg{
