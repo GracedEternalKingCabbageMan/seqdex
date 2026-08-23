@@ -476,8 +476,14 @@ func (s *Store) Cancel(c *seqobv1.OfferCancel) error {
 		s.mu.Unlock()
 		return fmt.Errorf("stale cancel nonce")
 	}
-	s.cancelNonce[k] = c.GetNonce()
 	e, ok := s.entries[k]
+	// The high-water mark survives removal (a replayed cancel must stay stale after the
+	// offer is gone), but it is only ever CREATED for a key that rests or once rested:
+	// a valid signature over any (pubkey, offer_id) is free to mint, and recording every
+	// one would let a single key grow the map without bound.
+	if _, seen := s.cancelNonce[k]; ok || seen {
+		s.cancelNonce[k] = c.GetNonce()
+	}
 	if !ok {
 		s.mu.Unlock()
 		return fmt.Errorf("offer %s/%s not found", k.MakerPubkey, k.OfferID)
@@ -590,17 +596,34 @@ func (s *Store) SnapshotMaker(makerPubkey string) []*Entry {
 }
 
 // Markets summarizes every pair currently in the book.
-func (s *Store) Markets() []*seqobv1.Market {
+func (s *Store) Markets() []*seqobv1.Market { return s.MarketsFiltered(nil) }
+
+// MarketsFiltered summarizes the book as Markets does, counting only the offers
+// keep accepts (nil keeps all). The relay passes its liftability filter so the
+// summary agrees with the orderbook it serves: a pair whose offers are all
+// unliftable ghosts must not advertise a best price and an order count that the
+// book itself comes back empty for.
+//
+// The transparent and blinded books of one pair are DISJOINT namespaces
+// (SnapshotPair, the matcher, the delta stream all split on the offer's
+// confidential flag), so they are summarized as two markets, and the emitted
+// pair carries the namespace in AssetPair.confidential. A client selecting the
+// blinded book by that flag would otherwise never see it: makers post pair
+// structs with the flag unset and the flag on the offer.
+func (s *Store) MarketsFiltered(keep func(*seqobv1.Offer) bool) []*seqobv1.Market {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	type agg struct {
+		pair             *seqobv1.AssetPair
+		bestBid, bestAsk float64
+		n                uint64
+	}
 	out := make([]*seqobv1.Market, 0, len(s.pairs))
 	for pk, set := range s.pairs {
 		if len(set) == 0 {
 			continue
 		}
-		var pair *seqobv1.AssetPair
-		var bestBid, bestAsk float64
-		var n uint64
+		var books [2]*agg // [0] transparent, [1] confidential
 		for k := range set {
 			e, ok := s.entries[k]
 			if !ok {
@@ -609,21 +632,32 @@ func (s *Store) Markets() []*seqobv1.Market {
 			if e.ActiveAmount == 0 {
 				continue // B-7: a held/zeroed entry isn't fillable — don't count it or advertise its price
 			}
-			if pair == nil {
-				pair = e.Offer.GetPair()
+			if keep != nil && !keep(e.Offer) {
+				continue
 			}
-			n++
+			ns := 0
+			if e.Offer.GetConfidential() {
+				ns = 1
+			}
+			a := books[ns]
+			if a == nil {
+				pair := proto.Clone(e.Offer.GetPair()).(*seqobv1.AssetPair)
+				pair.Confidential = e.Offer.GetConfidential()
+				a = &agg{pair: pair}
+				books[ns] = a
+			}
+			a.n++
 			price, isBid := displayPrice(e.Offer)
 			if price <= 0 {
 				continue
 			}
 			if isBid {
-				if price > bestBid {
-					bestBid = price
+				if price > a.bestBid {
+					a.bestBid = price
 				}
 			} else {
-				if bestAsk == 0 || price < bestAsk {
-					bestAsk = price
+				if a.bestAsk == 0 || price < a.bestAsk {
+					a.bestAsk = price
 				}
 			}
 		}
@@ -631,19 +665,21 @@ func (s *Store) Markets() []*seqobv1.Market {
 		if t := s.trades[pk]; len(t) > 0 {
 			last = t[len(t)-1].Price // newest recorded cross
 		}
-		if pair == nil || n == 0 {
-			// Every entry in this pair is held/zeroed (ActiveAmount==0): there is no fillable
-			// market to advertise. Skip rather than emit a Market with a nil Pair (blank ticker
-			// + stale last price) that a UI renders as garbage.
-			continue
+		for _, a := range books {
+			if a == nil || a.n == 0 {
+				// Every entry in this namespace is held/zeroed or filtered out: there is no
+				// fillable market to advertise. Skip rather than emit a Market with a nil
+				// Pair (blank ticker + stale last price) that a UI renders as garbage.
+				continue
+			}
+			out = append(out, &seqobv1.Market{
+				Pair:      a.pair,
+				BestBid:   a.bestBid,
+				BestAsk:   a.bestAsk,
+				LastPrice: last,
+				NOrders:   a.n,
+			})
 		}
-		out = append(out, &seqobv1.Market{
-			Pair:      pair,
-			BestBid:   bestBid,
-			BestAsk:   bestAsk,
-			LastPrice: last,
-			NOrders:   n,
-		})
 	}
 	return out
 }
@@ -735,10 +771,10 @@ func (s *Store) RecordSettledFill(k Key, fillBase uint64, settleTxid string, anc
 		s.mu.Unlock()
 		return fmt.Errorf("stale settled-trade nonce")
 	}
-	if nonce != 0 {
-		s.settledNonce[k] = nonce
-	}
 	e, ok := s.entries[k]
+	if _, seen := s.settledNonce[k]; nonce != 0 && (ok || seen) {
+		s.settledNonce[k] = nonce // same growth rule as the cancel nonce: only for keys that ever rested
+	}
 	if !ok {
 		s.mu.Unlock()
 		return nil // offer already gone (a prior fill removed it): nothing to price or decrement
@@ -815,11 +851,33 @@ func (s *Store) Reopen(o *seqobv1.Offer, restoreActive uint64) error {
 		status = seqobv1.OfferStatus_OFFER_STATUS_PARTIAL
 	}
 	s.mu.Lock()
+	// Un-happening a fill restores the order the maker had resting at the time; it must
+	// not resurrect one the maker has since withdrawn. (An expired copy needs no guard:
+	// the sweeper removes it again within its interval.)
+	if cancelledSince(s.cancelNonce[k], o.GetCreatedAtUnix()) {
+		s.mu.Unlock()
+		return fmt.Errorf("offer %s/%s was cancelled by its maker; not reopened", k.MakerPubkey, k.OfferID)
+	}
 	e := &Entry{Offer: o, Status: status, ActiveAmount: restoreActive, CreatedAt: s.now()}
 	s.put(k, e)
 	s.mu.Unlock()
 	s.broadcast(Event{Type: EventCreated, Pair: o.GetPair(), Confidential: o.GetConfidential(), Offer: o})
 	return nil
+}
+
+// cancelledSince reports whether a cancel with nonce n was signed after an offer
+// created at createdAtUnix. Makers use a clock as the nonce — the Go maker in
+// nanoseconds, the JS wallet in seconds — so the unit is inferred from magnitude;
+// an opaque small nonce cannot be placed in time and is treated as not-after.
+func cancelledSince(n, createdAtUnix uint64) bool {
+	if n == 0 || createdAtUnix == 0 {
+		return false
+	}
+	const nanosFloor = 1e15 // any unix-nanosecond clock this century; far above any unix-second one
+	if n >= nanosFloor {
+		return n >= createdAtUnix*1e9
+	}
+	return n >= createdAtUnix && n >= 1e9 // a second-resolution clock, not a counter
 }
 
 // SweepExpired removes offers whose expires_at_unix has passed, emitting EXPIRED
@@ -1231,11 +1289,9 @@ func (s *Store) Unsubscribe(id int) {
 	sub, ok := s.subs[id]
 	if ok {
 		delete(s.subs, id)
+		close(sub.ch) // under the write lock, so no broadcast (which sends under RLock) is mid-send
 	}
 	s.mu.Unlock()
-	if ok {
-		close(sub.ch)
-	}
 }
 
 // --- locked helpers ---
@@ -1296,7 +1352,10 @@ func (s *Store) broadcast(ev Event) {
 			subs = append(subs, sub)
 		}
 	}
-	s.mu.RUnlock()
+	// Deliver while still holding the read lock: Unsubscribe closes the channel under
+	// the write lock, so a send can never race a close (a send on a closed channel
+	// panics, and broadcast runs on the expiry sweeper and watcher goroutines, where
+	// nothing recovers it). The sends are non-blocking, so the lock is held briefly.
 	for _, sub := range subs {
 		// Stamp a per-subscriber sequence number and increment for EVERY routed event
 		// (P3.8), so a dropped delta (buffer full -> default) leaves a hole the
@@ -1310,4 +1369,5 @@ func (s *Store) broadcast(ev Event) {
 			// Dropped: the seq is consumed, so the next delivered delta shows a gap.
 		}
 	}
+	s.mu.RUnlock()
 }

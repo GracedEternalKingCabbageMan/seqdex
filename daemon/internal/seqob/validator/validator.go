@@ -24,7 +24,14 @@ import (
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"google.golang.org/protobuf/proto"
 )
+
+// MaxOfferBytes caps the wire size of one offer. An offer is a few hundred bytes of
+// signed terms; the relay stores and re-serves every accepted one verbatim, so an
+// unbounded offer_id or hint list would let one submitter fill relay memory and
+// every subscriber's snapshot at 120 offers per minute per IP.
+const MaxOfferBytes = 16 << 10
 
 // ErrReplay signals that the submitted offer is a byte-identical replay of an
 // offer already resting in the book (same maker_pubkey + offer_id + maker_sig):
@@ -95,6 +102,10 @@ type Validator struct {
 	mu      sync.Mutex
 	pubHits map[string][]time.Time
 	ipHits  map[string][]time.Time
+	// lastSweep is when the rate maps were last purged of keys whose window has
+	// emptied. A key is pruned only when it is hit again, so keys that are never
+	// seen twice (fresh pubkeys are free to mint) would otherwise accumulate forever.
+	lastSweep time.Time
 }
 
 // SetBook wires the live order book so ValidateOffer can recognize a byte-identical
@@ -135,6 +146,9 @@ func New(cfg Config, probe LivenessProbe) *Validator {
 func (v *Validator) ValidateOffer(ctx context.Context, o *seqobv1.Offer, ip string) error {
 	if err := v.checkIPRate(ip); err != nil {
 		return err
+	}
+	if n := proto.Size(o); n > MaxOfferBytes {
+		return fmt.Errorf("offer too large (%d bytes, max %d)", n, MaxOfferBytes)
 	}
 	if err := offer.VerifyOffer(o); err != nil {
 		return fmt.Errorf("signature: %w", err)
@@ -439,6 +453,7 @@ func (v *Validator) checkIPRate(ip string) error {
 	cutoff := now.Add(-time.Minute)
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.sweepLocked(now, cutoff)
 	hits := prune(v.ipHits[ip], cutoff)
 	if len(hits) >= v.cfg.MaxOffersPerMinPerIP {
 		v.ipHits[ip] = hits
@@ -460,6 +475,7 @@ func (v *Validator) checkPubkeyRate(makerPubkey string) error {
 	cutoff := now.Add(-time.Minute)
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.sweepLocked(now, cutoff)
 	hits := prune(v.pubHits[makerPubkey], cutoff)
 	if len(hits) >= v.cfg.MaxOffersPerMinPerPubkey {
 		v.pubHits[makerPubkey] = hits
@@ -473,6 +489,25 @@ func (v *Validator) checkPubkeyRate(makerPubkey string) error {
 // is the offerstore's job, since it holds the per-key nonce high-water mark.)
 func (v *Validator) ValidateCancel(c *seqobv1.OfferCancel) error {
 	return offer.VerifyCancel(c)
+}
+
+// sweepLocked drops every rate-limit key whose window has emptied, at most once a
+// minute. The caller holds v.mu.
+func (v *Validator) sweepLocked(now, cutoff time.Time) {
+	if now.Sub(v.lastSweep) < time.Minute {
+		return
+	}
+	v.lastSweep = now
+	for k, hits := range v.ipHits {
+		if len(prune(hits, cutoff)) == 0 {
+			delete(v.ipHits, k)
+		}
+	}
+	for k, hits := range v.pubHits {
+		if len(prune(hits, cutoff)) == 0 {
+			delete(v.pubHits, k)
+		}
+	}
 }
 
 func prune(hits []time.Time, cutoff time.Time) []time.Time {
