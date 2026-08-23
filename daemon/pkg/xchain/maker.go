@@ -36,6 +36,9 @@ import (
 // before accepting it, so a malformed extraction can never produce a wrong-key
 // claim. After this, Swap.ClaimBTCLeg can build the BTC redeem.
 func (s *Swap) InjectSecret(secret []byte) error {
+	if len(secret) != PreimageLen {
+		return fmt.Errorf("%w: %d bytes", ErrBadPreimageLen, len(secret))
+	}
 	h := sha256.Sum256(secret)
 	if !bytes.Equal(h[:], s.hash.Hash) {
 		return fmt.Errorf("xchain: injected secret hashes to %x, want H=%x", h[:], s.hash.Hash)
@@ -194,6 +197,12 @@ func (s *Swap) VerifySEQLeg(
 	}
 	out, err := s.seq.OutputAt(txid, vout)
 	if err != nil {
+		// A txid the node has not seen yet is propagation lag, not a mismatch: the
+		// counterparty announces at 0-conf. Only a tx that IS found and disagrees is
+		// invalid. Mirrors the BTC backends' not-seen split.
+		if isTxNotFoundRPC(err) {
+			return nil, fmt.Errorf("%w: funding tx %s not yet seen by this node: %v", ErrSEQLegUnconfirmed, txid, err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrSEQLegInvalid, err)
 	}
 	wantSPK, err := s.seq.AddressScriptPubKey(wantP2SH)

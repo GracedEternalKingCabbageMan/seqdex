@@ -2,6 +2,7 @@ package xchain
 
 import (
 	"encoding/hex"
+	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
@@ -101,6 +102,9 @@ func (l *ElementsLeg) Refund(redeemScript []byte, in ElementsSpendInput, locktim
 // recipient output and an explicit Elements fee output (empty scriptPubKey),
 // both denominated in the input's asset.
 func (l *ElementsLeg) buildSpendTx(in ElementsSpendInput, locktime uint32, refund bool) (*transaction.Transaction, error) {
+	if in.Fee >= in.Amount {
+		return nil, fmt.Errorf("xchain/elements: fee %d >= amount %d", in.Fee, in.Amount)
+	}
 	prevHash, err := elementsutil.TxIDToBytes(in.TxID)
 	if err != nil {
 		return nil, err
@@ -120,11 +124,11 @@ func (l *ElementsLeg) buildSpendTx(in ElementsSpendInput, locktime uint32, refun
 
 	tx := transaction.NewTx(2)
 	input := transaction.NewTxInput(prevHash, in.Vout)
+	// 0xfffffffd is non-final (CLTV takes effect on the refund) AND signals RBF on
+	// both spends, so a claim or refund stuck under the relay floor can be replaced.
+	input.Sequence = 0xfffffffd
 	if refund {
-		input.Sequence = 0xfffffffe // non-final: lets nLockTime/CLTV take effect
 		tx.Locktime = locktime
-	} else {
-		input.Sequence = 0xffffffff
 	}
 	tx.AddInput(input)
 	tx.AddOutput(transaction.NewTxOutput(asset, recvVal, in.DestSPK))

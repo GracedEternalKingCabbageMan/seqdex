@@ -262,7 +262,7 @@ func (m *SubmarineSwap) RunNormal(p NormalParams, makerClaimKey *Key, seqClaimFe
 	if err := m.requireSeqClaimWindow(p.SeqLocktime, p.MinClaimWindow); err != nil {
 		return &NormalResult{Anchor: anchor}, err
 	}
-	preimage, err := m.ln.Pay(p.Bolt11, p.HashH, p.InvoiceMsat)
+	preimage, err := m.payBefore(p.Bolt11, p.HashH, p.InvoiceMsat, p.SeqLocktime)
 	if err != nil {
 		return &NormalResult{Anchor: anchor}, fmt.Errorf("pay BOLT11: %w", err)
 	}
@@ -383,19 +383,37 @@ func (m *SubmarineSwap) RunReverse(p ReverseParams) (*ReverseResult, error) {
 	res.SeqClaimTxID = claimTxid
 	res.Preimage = secret
 
+	// From here on the maker HOLDS P and the taker HOLDS THE ASSET. Cancelling the
+	// hold now would refund the taker's BTC as well: the one outcome that loses
+	// money, and the maker has no incentive to enforce the anchor gate in this
+	// direction (it protects the taker). So past this point the hold is never
+	// cancelled on a timeout; it is settled once the claim is deep enough, or left
+	// to the caller (which keeps P) if that takes longer than the wait allows. The
+	// hold is cancelled only if the claim is reorged out AND the asset is back.
+
 	// 5. THE anchor-depth gate: wait until the taker's SEQ claim is anchor-buried.
-	claimBlock, err := m.seq.BlockHashOfTx(claimTxid)
-	if err != nil {
-		return res, fmt.Errorf("locate SEQ-claim block: %w", err)
+	// WatchSEQClaim can return a claim still in the mempool, so its block may not
+	// exist yet; poll for it rather than treating "not confirmed" as a failure.
+	var claimBlock string
+	for deadline := time.Now().Add(p.AnchorTimeout); ; {
+		claimBlock, err = m.seq.BlockHashOfTx(claimTxid)
+		if err == nil && claimBlock != "" {
+			break
+		}
+		if utxo, uerr := m.seq.OutputUnspent(seqLeg.Funded.TxID, seqLeg.Funded.Vout); uerr == nil && utxo {
+			// The claim vanished and the asset is ours again: nothing was taken.
+			_ = m.ln.CancelHold(p.HashH)
+			return res, fmt.Errorf("taker's SEQ claim %s was reorged out and the asset is unspent again; hold cancelled", claimTxid)
+		}
+		if time.Now().After(deadline) {
+			return res, fmt.Errorf("SEQ claim %s not yet confirmed within %s; maker holds P, settle the hold once it is anchor-deep (hold left in place)", claimTxid, p.AnchorTimeout)
+		}
+		time.Sleep(10 * time.Second)
 	}
 	anchor, err := m.waitSeqAnchorBuried(claimBlock, p.MinAnchorDepth, p.AnchorTimeout)
 	res.Anchor = anchor
 	if err != nil {
-		// The claim is not (yet) anchor-deep. Do NOT settle: the maker must not take
-		// the BTC-LN while the SEQ claim could still reorg out. Cancel the hold and
-		// let the maker reclaim the asset via RefundSEQLeg if the claim reverts.
-		_ = m.ln.CancelHold(p.HashH)
-		return res, fmt.Errorf("SEQ claim not anchor-buried, refusing to settle BTC-LN: %w", err)
+		return res, fmt.Errorf("SEQ claim not yet anchor-buried (maker holds P; hold LEFT IN PLACE, settle once buried): %w", err)
 	}
 
 	// 6. Settle the held invoice with P (collect the BTC-LN). Safe now: the SEQ
@@ -541,4 +559,47 @@ func (m *SubmarineSwap) AwaitInvoicePaid(label string, timeout time.Duration) (u
 // invoice not bound to the swap H. Delegates to the LN leg's Pay.
 func (m *SubmarineSwap) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
 	return m.ln.Pay(bolt11, wantHash, amountMsat)
+}
+
+// PayInvoiceBefore is PayInvoice with the route's timelock capped so the payment
+// resolves before the Sequentia HTLC at seqLocktime can be refunded by the
+// counterparty. Every Lightning payment made against an on-chain SEQ leg must
+// go through here: a counterparty who holds the invoice's HTLC could otherwise
+// refund the asset at T_seq and settle the payment afterwards.
+func (m *SubmarineSwap) PayInvoiceBefore(bolt11 string, wantHash []byte, amountMsat uint64, seqLocktime uint32) ([]byte, error) {
+	return m.payBefore(bolt11, wantHash, amountMsat, seqLocktime)
+}
+
+// SeqLegClaimMarginSecs is the time kept between the latest a Lightning payment
+// against a SEQ leg may resolve and that leg's refund height: enough to build,
+// broadcast and confirm the on-chain claim with the learned preimage.
+const SeqLegClaimMarginSecs = 30 * 60
+
+// payBefore caps the LN route below the SEQ leg's refund deadline.
+func (m *SubmarineSwap) payBefore(bolt11 string, wantHash []byte, amountMsat uint64, seqLocktime uint32) ([]byte, error) {
+	capped, ok := m.ln.(interface {
+		PayCapped(string, []byte, uint64, uint32) ([]byte, error)
+	})
+	lnTiming, terr := timingOf(m.ln, "lightning")
+	if !ok || terr != nil || m.seq == nil {
+		if m.seq == nil && !ok {
+			return m.ln.Pay(bolt11, wantHash, amountMsat) // unit tests: no chain, no cap
+		}
+		if terr != nil {
+			return nil, terr
+		}
+		return nil, fmt.Errorf("%w: lightning leg cannot cap its timelock", ErrCltvUncapped)
+	}
+	tip, err := m.seq.BlockCount()
+	if err != nil {
+		return nil, fmt.Errorf("seq tip before paying: %w", err)
+	}
+	if int64(seqLocktime) <= tip {
+		return nil, fmt.Errorf("%w: SEQ leg T_seq=%d already reachable at tip %d", ErrLNLegTimeout, seqLocktime, tip)
+	}
+	maxDelay := CapDelay(uint32(int64(seqLocktime)-tip), SeqTiming, lnTiming, SeqLegClaimMarginSecs)
+	if maxDelay == 0 {
+		return nil, fmt.Errorf("%w: T_seq=%d leaves no Lightning timelock room at tip %d", ErrLNLegTimeout, seqLocktime, tip)
+	}
+	return capped.PayCapped(bolt11, wantHash, amountMsat, maxDelay)
 }

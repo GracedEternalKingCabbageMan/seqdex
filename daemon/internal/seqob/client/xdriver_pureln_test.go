@@ -43,7 +43,8 @@ func (o *fakePlnMakerOps) RegisterHold(h []byte, btcAmtMsat uint64) error {
 	o.st.holdAmtMsat = btcAmtMsat
 	return nil
 }
-func (o *fakePlnMakerOps) Fulfill(h []byte, assetInvoice string, assetAmtMsat uint64, holdTimeout time.Duration) ([]byte, error) {
+func (o *fakePlnMakerOps) HoldCltvFor(string, time.Duration) (uint32, error) { return 0, nil }
+func (o *fakePlnMakerOps) Fulfill(h []byte, assetInvoice string, assetAmtMsat, holdAmtMsat uint64, holdTimeout time.Duration) ([]byte, error) {
 	o.st.mu.Lock()
 	// The hold H must match the taker's secret (as the shared payment_hash would).
 	want := sha256.Sum256(o.st.secret)
