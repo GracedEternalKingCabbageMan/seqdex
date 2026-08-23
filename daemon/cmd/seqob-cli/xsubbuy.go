@@ -219,6 +219,7 @@ func cmdXSubBuy(args []string) {
 		MinAnchorDepth:    *minAnchor,
 		Max0ConfAmount:    effMax0conf,
 		SpendFeeAtoms:     *spendFee,
+		SeqTip:            seqChain.BlockCount,
 		Timing:            client.XcTiming{AnchorWait: *anchorWait},
 		Log:               func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) },
 		// Persist P the instant it is learned (BEFORE the claim): a crash after

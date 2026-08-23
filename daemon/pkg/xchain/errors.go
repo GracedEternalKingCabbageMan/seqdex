@@ -77,6 +77,14 @@ var (
 	// ErrLNLegTimeout means a Lightning-leg wait (e.g. a hold invoice never
 	// reaching "accepted") exceeded its deadline; fall back to the refund path.
 	ErrLNLegTimeout = errors.New("xchain: submarine LN leg timed out")
+
+	// ErrLNPayUnresolved means an outgoing Lightning payment could be neither
+	// confirmed complete nor confirmed failed: the node still reports it pending
+	// after the bounded wait. The HTLC may settle later and the node would then
+	// hold the preimage. A caller holding an INCOMING leg against it must not
+	// cancel that hold on this error — that is the one outcome that loses money —
+	// but treat the swap as in flight and resolve it from listpays.
+	ErrLNPayUnresolved = errors.New("xchain: outgoing Lightning payment still pending (neither complete nor failed)")
 )
 
 // isTxNotFoundRPC reports whether err is the node's "transaction not found"

@@ -55,12 +55,25 @@ func newNodeFeeRates(rawURL string) (*nodeFeeRates, error) {
 // a missing asset, or a non-positive rate yields (0, false) so callers fall back
 // to the native fee asset.
 func (n *nodeFeeRates) FeeExchangeRate(assetHex string) (uint64, bool) {
+	rate, ok, _ := n.FeeExchangeRateErr(assetHex)
+	return rate, ok
+}
+
+// feeRateErrProvider is the optional richer form of feeRateProvider: it tells an
+// RPC failure ("the node could not be asked") apart from "not listed". The swap
+// path refuses to size a fee on the former rather than silently switching assets.
+type feeRateErrProvider interface {
+	FeeExchangeRateErr(assetHex string) (rate uint64, listed bool, err error)
+}
+
+// FeeExchangeRateErr queries the node and reports (rate, listed, err).
+func (n *nodeFeeRates) FeeExchangeRateErr(assetHex string) (uint64, bool, error) {
 	if n == nil || n.rpc == nil {
-		return 0, false
+		return 0, false, nil
 	}
 	var rates map[string]int64
 	if err := n.rpc.Call(&rates, "getfeeexchangerates"); err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	want := strings.ToLower(assetHex)
 	// Best-effort label -> hex map; nil if the node has no labels (the rate keys
@@ -72,13 +85,13 @@ func (n *nodeFeeRates) FeeExchangeRate(assetHex string) (uint64, bool) {
 			continue
 		}
 		if strings.ToLower(key) == want {
-			return uint64(rate), true
+			return uint64(rate), true, nil
 		}
 		if hexForLabel, ok := labels[key]; ok && strings.ToLower(hexForLabel) == want {
-			return uint64(rate), true
+			return uint64(rate), true, nil
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // feeExchangeRate returns the open-fee-market rate for asset (atoms-of-asset per
@@ -104,18 +117,35 @@ func (n *nodeFeeRates) FeeExchangeRate(assetHex string) (uint64, bool) {
 // The published rate is now the authority for every asset, the native one
 // included. The 1:1 assumption survives ONLY as the no-node-RPC fallback, where
 // there is no table to consult and the native asset is the sole option.
-func (s *Service) feeExchangeRate(asset string) (uint64, bool) {
+//
+// The third result is set when the node could not be asked at all. That is not
+// "unlisted": a transient RPC failure used to make every non-native swap silently
+// re-route its fee through the native asset at par from the fee account, the very
+// path that under-pays by ~2.66x on the live testnet and that references a
+// fee-account UTXO index known to go stale. A caller sizing a fee must refuse on
+// err rather than guess.
+func (s *Service) feeExchangeRate(asset string) (uint64, bool, error) {
 	native := asset == s.staticInfo.GetNativeAsset()
 	if s.rates == nil {
 		// No fee-market view: the native asset at par is the only thing we can
 		// size against, and every other asset is ineligible.
 		if native {
-			return exchangeRateScale, true
+			return exchangeRateScale, true, nil
 		}
-		return 0, false
+		return 0, false, nil
 	}
-	if rate, ok := s.rates.FeeExchangeRate(asset); ok && rate > 0 {
-		return rate, true
+	var rate uint64
+	var ok bool
+	if p, has := s.rates.(feeRateErrProvider); has {
+		var err error
+		if rate, ok, err = p.FeeExchangeRateErr(asset); err != nil {
+			return 0, false, fmt.Errorf("fee exchange rates unavailable from the node: %w", err)
+		}
+	} else {
+		rate, ok = s.rates.FeeExchangeRate(asset)
+	}
+	if ok && rate > 0 {
+		return rate, true, nil
 	}
 	// Unlisted. For the native asset this is a real state the node now enforces
 	// (an unlisted policy asset is refused like any other), but refusing to size
@@ -123,9 +153,9 @@ func (s *Service) feeExchangeRate(asset string) (uint64, bool) {
 	// the last resort — and only for the native asset, never as a privilege
 	// extended to anything else.
 	if native {
-		return exchangeRateScale, true
+		return exchangeRateScale, true, nil
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // feeInAsset converts a native-denominated network fee (atoms) into feeAssetNet,
