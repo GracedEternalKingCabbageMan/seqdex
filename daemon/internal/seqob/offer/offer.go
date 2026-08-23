@@ -16,6 +16,7 @@
 package offer
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -37,12 +38,25 @@ func deterministic(m proto.Message) ([]byte, error) {
 
 // CanonicalOfferBytes returns the deterministic encoding of o with maker_sig
 // cleared. This is the exact byte string the maker signs and verifiers re-derive.
+//
+// For covenant offers the resting outpoint (covenant_txid/covenant_vout) is
+// also cleared: it is chain-derived state that the relay's watcher rewrites on
+// every partial-fill re-rest (the remainder self-replicates at a new outpoint)
+// while the maker is offline and cannot re-sign. The signature authenticates
+// maker INTENT (assets, rate, program, keys, merkle path); funding is
+// separately authenticated by trustlessly re-deriving the covenant spk from the
+// signed terms plus a live gettxout on the claimed outpoint, so excluding the
+// outpoint from the signed bytes cedes nothing.
 func CanonicalOfferBytes(o *seqobv1.Offer) ([]byte, error) {
 	if o == nil {
 		return nil, errors.New("nil offer")
 	}
 	c := proto.Clone(o).(*seqobv1.Offer)
 	c.MakerSig = nil
+	if ct := c.GetCovenant(); ct != nil {
+		ct.CovenantTxid = ""
+		ct.CovenantVout = 0
+	}
 	return deterministic(c)
 }
 
@@ -88,9 +102,9 @@ func VerifyOffer(o *seqobv1.Offer) error {
 	if err != nil {
 		return err
 	}
-	sig, err := ecdsa.ParseDERSignature(o.MakerSig)
+	sig, err := parseCanonicalSig(o.MakerSig, "maker_sig")
 	if err != nil {
-		return fmt.Errorf("bad maker_sig encoding: %w", err)
+		return err
 	}
 	h, err := OfferHash(o)
 	if err != nil {
@@ -155,9 +169,9 @@ func VerifyCancel(c *seqobv1.OfferCancel) error {
 	if err != nil {
 		return err
 	}
-	sig, err := ecdsa.ParseDERSignature(c.Sig)
+	sig, err := parseCanonicalSig(c.Sig, "cancel sig")
 	if err != nil {
-		return fmt.Errorf("bad cancel sig encoding: %w", err)
+		return err
 	}
 	h, err := CancelHash(c)
 	if err != nil {
@@ -228,9 +242,9 @@ func VerifySettledTrade(st *seqobv1.SettledTrade) error {
 	if err != nil {
 		return err
 	}
-	sig, err := ecdsa.ParseDERSignature(st.Sig)
+	sig, err := parseCanonicalSig(st.Sig, "settled_trade sig")
 	if err != nil {
-		return fmt.Errorf("bad settled_trade sig encoding: %w", err)
+		return err
 	}
 	h, err := SettledTradeHash(st)
 	if err != nil {
@@ -267,15 +281,33 @@ func VerifyReattach(sessionID, role string, pubkey, sig []byte) error {
 	if err != nil {
 		return fmt.Errorf("bad session pubkey: %w", err)
 	}
-	s, err := ecdsa.ParseDERSignature(sig)
+	s, err := parseCanonicalSig(sig, "reattach sig")
 	if err != nil {
-		return fmt.Errorf("bad reattach sig encoding: %w", err)
+		return err
 	}
 	h := ReattachHash(sessionID, role)
 	if !s.Verify(h[:], pub) {
 		return errors.New("reattach sig verification failed")
 	}
 	return nil
+}
+
+// parseCanonicalSig parses a DER signature and accepts only its one canonical
+// encoding: minimal DER with S in the low half of the curve order. secp256k1
+// ECDSA is malleable — (r, s) and (r, N-s) verify equally — and the relay keys
+// defences on the signature BYTES (the no-budget replay gate, who may edit or
+// re-own a resting offer), so a non-canonical variant of a public signature
+// must never count as a different, fresh signature. Serialize re-encodes
+// minimally with S normalised, so any difference from the input is non-canonical.
+func parseCanonicalSig(der []byte, what string) (*ecdsa.Signature, error) {
+	sig, err := ecdsa.ParseDERSignature(der)
+	if err != nil {
+		return nil, fmt.Errorf("bad %s encoding: %w", what, err)
+	}
+	if !bytes.Equal(sig.Serialize(), der) {
+		return nil, fmt.Errorf("non-canonical %s (high-S or non-minimal DER)", what)
+	}
+	return sig, nil
 }
 
 func parsePubkeyHex(s string) (*btcec.PublicKey, error) {

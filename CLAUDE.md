@@ -6,18 +6,18 @@ The Sequentia DEX: a non-custodial order-book and atomic-swap system, in Go. For
 Everything here is testnet software. Node and consensus conventions live in the
 [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) repo.
 
-## Branches: read this first
+## Branches
 
-The remote default is `main`. Active development has been on `phase3-pure-ln`, and the two have
-**diverged** — each carries commits the other does not, including the same fix landed twice under
-the same commit title.
+The remote default is `main`, and it is the trunk: branch from it, open pull requests against
+it. `phase3-pure-ln` was the development branch for most of 2026 and diverged from `main` (each
+carried commits the other lacked, including the same fix landed twice under one title). The two
+were merged on 2026-08-23 and `main` was fast-forwarded to the result, so they now point at the
+same history; `phase3-pure-ln` stays only so old checkouts and the box still resolve it. Do not
+branch from it.
 
-The documentation rewrite lives only on `main`. `README.md`, `docs/ARCHITECTURE.md` and
-`docs/DEV.md` on `phase3-pure-ln` are the older, much shorter pre-rewrite versions, and
-`wallet/README.md` there is still verbatim upstream Ocean. **When you want to know how something
-works, read the docs on `main`** (`git show main:docs/DEV.md`), then verify against code. They
-were brought up to date on 2026-08-22; `docs/ARCHITECTURE.md` is kept as a 2026-07-08 snapshot
-with a header listing what has changed since.
+The docs (`README.md`, `docs/ARCHITECTURE.md`, `docs/DEV.md`) were brought up to date on
+2026-08-22; `docs/ARCHITECTURE.md` is kept as a 2026-07-08 snapshot with a header listing what
+has changed since. Read them, then verify against code.
 
 ## Modules and layout
 
@@ -65,16 +65,21 @@ over an `xchain` proto that no longer existed, and its file-existence guard hid 
 |---|---|
 | `seqobd` | The relay. Stores signed offers, serves the book over REST and WS, couriers opaque end-to-end-encrypted swap messages. **Holds no wallet, no keys and no funds.** The chain watcher runs as a goroutine inside it when given `-node-rpc`. |
 | `seqob-maker` | The maker. Modes: `samechain`, `cross`, `lightning`, `pureln`, `subasset`, `subasset-sell`. |
-| `seqob-crosser` | Crossing agent; polls every relay and takes both sides. **Not on `main`**: it exists only on `phase3-pure-ln`, so if it runs on the box it is built from that branch. |
+| `seqob-crosser` | Crossing agent; polls every relay and takes both sides. |
 | `seqob-settler` | Always-online non-custodial settler for the passive covenant CLOB (`plan`, `run`). |
 | `seqob-bridge` | Cross-rail settlement bridge; the only seqob component holding its own inventory and LN node. |
 | `tdexd` | The forked LP daemon. Deployed under the name `seqdexd` — there is no `cmd/seqdexd`. |
 | `oceand` | The wallet daemon, from the `wallet/` module. |
 
 The box runs **several `seqobd` relay instances**, one per rail; the `seqob-crosser` `-relays`
-default (on `phase3-pure-ln`) documents the fleet (9955 cross, 9965 pure-LN and submarine, 9966
-sub-asset buy, 9971 sub-asset sell, plus the covenant relay). Publicly they are the
-`/seqob`, `/seqob-pln` and `/seqob-conf` mounts.
+default documents the fleet (9955 cross, 9965 pure-LN and submarine, 9966 sub-asset buy, 9971
+sub-asset sell, plus the confidential relay on 9975). Publicly they are the `/seqob`,
+`/seqob-pln` and `/seqob-conf` mounts.
+
+The relay holds its book in memory (only the trade log is durable, via `-trade-log`). Restarting
+a relay empties its book until every maker re-posts, which the Go makers do on reconnect; an
+offer posted by something that is not running at the time (a wallet's covenant order) comes
+back only when that client re-posts it.
 
 Everything else in `cmd/` is a one-shot CLI or a regtest helper.
 

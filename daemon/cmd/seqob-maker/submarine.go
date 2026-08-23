@@ -50,6 +50,7 @@ type submarineMakerConfig struct {
 	max0conf    uint64 // 0-conf LP-fronting cap (asset atoms): trades <= it settle instantly
 	reverse     bool   // true = SELL the asset for BTC-LN (maker-secret REVERSE); false = BUY (NORMAL)
 	requote     bool   // true = re-post a fresh offer after each settled fill instead of exiting
+	stateDir    string // per-lift session persistence (keys/legs; the recovery material)
 }
 
 // buildSubmarineOffer builds a Lightning offer (base=asset, quote=the BTC
@@ -163,6 +164,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 	filled := false
 	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
 	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
+	setBusyFn(func() int { mu.Lock(); defer mu.Unlock(); return inFlight })
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -227,6 +229,13 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 			}
 			if busy {
 				refuse(sid, cr, "busy", "another lift is in flight (whole-HTLC, one at a time)")
+				continue
+			}
+			if refuseIfDraining(sid, cr, refuse) {
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
 				continue
 			}
 			fmt.Printf("submarine lift requested: session %s offer %s\n", sid, lr.GetOfferId())
@@ -320,13 +329,21 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 						SeqLocktimeDelta: cfg.seqDelta,
 						InvoiceCLTV:      client.SubReverseInvoiceCLTV,
 						Log:              logf,
+						// The refund key is derived from the identity key and the leg is persisted
+						// the moment it is locked: a per-swap random key that lived only in this
+						// process took the locked asset with it whenever the supervisor re-quoted
+						// or killed the maker before the taker paid.
+						SeqRefundKey: derivedRefundKey(cfg.makerKey, "submarine-reverse"),
+						OnUpdate: func(r *client.MakerReverseSubmarineResult) {
+							persistXSessionSubmarineReverse(cfg.stateDir, sid, o.GetOfferId(), r)
+						},
 					}
 					res, err := client.RunMakerReverseSubmarine(p, in, send)
 					if err != nil {
 						fmt.Printf("session %s: reverse submarine lift ended: %v\n", sid, err)
 						if res != nil && res.SeqLeg != nil {
-							fmt.Printf("session %s: asset %s:%d refundable after T_seq=%d if unpaid\n",
-								sid, res.SeqLeg.Funded.TxID, res.SeqLeg.Funded.Vout, res.SeqLocktime)
+							fmt.Printf("session %s: asset %s:%d refundable after T_seq=%d if unpaid (refund key derived from -maker-priv; leg persisted under %s)\n",
+								sid, res.SeqLeg.Funded.TxID, res.SeqLeg.Funded.Vout, res.SeqLocktime, cfg.stateDir)
 						}
 						return
 					}
@@ -354,6 +371,12 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 					Max0ConfAmount:   cfg.max0conf,
 					SpendFeeAtoms:    cfg.spendFee,
 					Log:              logf,
+					// Persist at every value transition. Without this a requote-killed
+					// submarine maker took its per-lift claim key to the grave and a
+					// funded taker leg became permanently unspendable (2026-08-11).
+					OnUpdate: func(r *client.MakerSubmarineResult) {
+						persistXSessionSubmarine(cfg.stateDir, sid, o.GetOfferId(), r)
+					},
 				}
 				res, err := client.RunMakerSubmarineNormal(p, in, send)
 				if err != nil {

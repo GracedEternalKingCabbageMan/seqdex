@@ -47,7 +47,10 @@ type SubmarineSwap struct {
 func (m *SubmarineSwap) ClaimSEQLeg(leg *LegLock, claimKey *Key, targetNativeFee uint64) (string, error) {
 	fee := targetNativeFee
 	if leg != nil && leg.Funded != nil {
-		fee = m.sizeSeqSpendFee(leg.Funded.AssetID, leg.Funded.Amount, targetNativeFee)
+		var err error
+		if fee, err = m.sizeSeqSpendFee(leg.Funded.AssetID, leg.Funded.Amount, targetNativeFee); err != nil {
+			return "", err
+		}
 	}
 	return m.Swap.ClaimSEQLeg(leg, claimKey, fee)
 }
@@ -88,6 +91,14 @@ type SubAnchorEvidence struct {
 // minAnchorDepth). This is the cross-leg safety point; minAnchorDepth MUST be
 // > 1 for submarine swaps (1 is unsafe, design §3.2).
 func (m *SubmarineSwap) VerifySeqAnchorBuried(seqBlockHash string, minAnchorDepth int64) (*SubAnchorEvidence, error) {
+	// A header is served for a disconnected block too; its anchorheight then commits
+	// nothing. Establish the block is still on the active chain before reading it,
+	// every pass: this is polled across a wait during which Bitcoin can reorg.
+	if active, err := m.seq.BlockOnActiveChain(seqBlockHash); err != nil {
+		return nil, err
+	} else if !active {
+		return nil, fmt.Errorf("%w (submarine gate: seq block %s is not on the active chain)", ErrAnchorOrdering, seqBlockHash)
+	}
 	anchor, err := m.seq.BlockAnchorHeight(seqBlockHash)
 	if err != nil {
 		return nil, err
@@ -117,6 +128,29 @@ func (m *SubmarineSwap) VerifySeqAnchorBuried(seqBlockHash string, minAnchorDept
 			ErrAnchorOrdering, seqBlockHash, anchor, status.AnchorHeight, depth, minAnchorDepth, status.AnchorStatus, certified)
 	}
 	return ev, nil
+}
+
+// DefaultSeqClaimWindow is the Sequentia-block margin a payer keeps before the
+// counterparty's refund CLTV on the leg it is about to claim.
+const DefaultSeqClaimWindow = 24
+
+// requireSeqClaimWindow refuses to take an irreversible action against a SEQ HTLC
+// whose refund locktime is within minWindow blocks of the tip (0 = default).
+func (m *SubmarineSwap) requireSeqClaimWindow(seqLocktime, minWindow uint32) error {
+	if m.seq == nil {
+		return nil
+	}
+	if minWindow == 0 {
+		minWindow = DefaultSeqClaimWindow
+	}
+	tip, err := m.seq.BlockCount()
+	if err != nil {
+		return fmt.Errorf("seq tip before paying: %w", err)
+	}
+	if int64(seqLocktime) <= tip+int64(minWindow) {
+		return fmt.Errorf("%w: SEQ leg T_seq=%d leaves fewer than %d blocks past tip %d; refusing to pay against a leg the counterparty can refund", ErrLNLegTimeout, seqLocktime, minWindow, tip)
+	}
+	return nil
 }
 
 // waitSeqAnchorBuried polls VerifySeqAnchorBuried until it passes or the deadline.
@@ -163,6 +197,12 @@ type NormalParams struct {
 	InvoiceMsat    uint64 // expected invoice amount (0 = don't cross-check)
 	MinAnchorDepth int64  // Bitcoin-anchor depth required before paying (> 1)
 	AnchorTimeout  time.Duration
+	// MinClaimWindow is how many Sequentia blocks must remain before SeqLocktime at
+	// the moment the maker pays. The taker chose when to fund and announce, and the
+	// anchor wait can consume most of a window, so the check is made again right
+	// before the irreversible LN payment: paying at or past T_seq lets the taker
+	// refund the asset and keep the BTC. 0 = the default (24 blocks).
+	MinClaimWindow uint32
 	// Max0ConfAmount is the 0-conf LP-fronting cap (asset atoms). When > 0 and the
 	// SEQ-leg value is <= it, the maker SKIPS the anchor-bury wait and pays the LN
 	// leg at 0-conf, fronting the Bitcoin-reorg risk on this small amount (instant
@@ -217,7 +257,11 @@ func (m *SubmarineSwap) RunNormal(p NormalParams, makerClaimKey *Key, seqClaimFe
 		}
 	}
 	// 3. Pay the invoice -> learn P. This is the irreversible LN action; it only
-	// happens after the SEQ funding is anchor-deep.
+	// happens after the SEQ funding is anchor-deep AND while T_seq still leaves room
+	// to claim: the wait above can eat the window the leg had at verify time.
+	if err := m.requireSeqClaimWindow(p.SeqLocktime, p.MinClaimWindow); err != nil {
+		return &NormalResult{Anchor: anchor}, err
+	}
 	preimage, err := m.ln.Pay(p.Bolt11, p.HashH, p.InvoiceMsat)
 	if err != nil {
 		return &NormalResult{Anchor: anchor}, fmt.Errorf("pay BOLT11: %w", err)

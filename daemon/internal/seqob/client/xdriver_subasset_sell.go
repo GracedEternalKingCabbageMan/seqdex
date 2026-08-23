@@ -141,8 +141,8 @@ type MakerSubAssetSellParams struct {
 	// BTC-leg hashlock KNOWS P, and the asset hold invoice is on H = SHA256(P)).
 	NewMakerOps    func(preimage []byte) SubAssetSellMakerOps
 	Crypter        *Crypter
-	BtcAmount      uint64        // sats the maker locks on-chain (the taker claims)
-	AssetAmount    uint64        // asset atoms the maker receives over LN
+	BtcAmount      uint64        // sats a WHOLE fill locks on-chain (the taker claims); a partial locks the priced slice
+	AssetAmount    uint64        // asset atoms a WHOLE fill receives over LN (the taker may name a smaller slice)
 	BtcLocktime    uint32        // T_btc: CLTV for the MAKER's refund branch
 	MinBTCConf     int           // confs the maker waits on its own BTC funding before advertising (default 1)
 	SpendFeeSats   uint64        // BTC refund fee target (native sats; default 1000)
@@ -159,6 +159,11 @@ type MakerSubAssetSellResult struct {
 	// For the refund path if the taker never pays.
 	BtcLeg      *xchain.LegLock
 	BtcLocktime uint32
+	// Partial fills: the asset atoms + BTC sats this lift ACTUALLY settled (<= the
+	// offer). For a whole-offer lift these equal the offer amounts; the maker's serve
+	// loop re-rests the remainder (offer - filled) when they are smaller.
+	FilledAsset uint64
+	FilledBtc   uint64
 }
 
 func (p *MakerSubAssetSellParams) logf(f string, a ...interface{}) {
@@ -214,12 +219,32 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 		sendXcFail(p.Crypter, send, "bad_pubkey", "malformed taker_btc_claim_pub")
 		return res, fmt.Errorf("subasset-sell maker: bad taker claim pubkey")
 	}
+	// Partial fills: the request NAMES the asset-side slice the taker will pay
+	// (SeqAmount atoms; 0 = the whole offer, which is also what an older taker
+	// sends). The BTC we lock is the slice priced at the SIGNED offer's own rate,
+	// rounded UP (ProportionalBtc) — the taker RECEIVES the on-chain leg and
+	// derives the identical ceil from the same signed offer, so both sides agree
+	// on the number and neither can re-price the other. We lock ONLY what the
+	// slice requires; the serve loop re-rests the remainder after settlement.
+	takeAsset := req.SeqAmount
+	if takeAsset == 0 {
+		takeAsset = p.AssetAmount
+	}
+	if takeAsset > p.AssetAmount {
+		sendXcFail(p.Crypter, send, "amount_too_large", "requested more asset than the offer")
+		return res, fmt.Errorf("subasset-sell maker: take %d > offer %d", takeAsset, p.AssetAmount)
+	}
+	sliceBtc := ProportionalBtc(p.BtcAmount, takeAsset, p.AssetAmount)
+	if sliceBtc == 0 {
+		sendXcFail(p.Crypter, send, "dust", "that slice prices to zero")
+		return res, fmt.Errorf("subasset-sell maker: take %d of %d prices to 0 sats (dust)", takeAsset, p.AssetAmount)
+	}
 	ops := p.NewMakerOps(secret)
 
 	// 2. Fund the BTC HTLC (claim=taker with P, refund=maker after T_btc) from the
 	//    maker's OWN BTC wallet, and wait out our own confirmation.
-	p.logf("subasset-sell maker: locking BTC HTLC %d sats, T_btc=%d (claim=taker, refund=maker)", p.BtcAmount, p.BtcLocktime)
-	btcLeg, hp, err := ops.LockBTCLeg(takerClaimPub, refundKey.PubKey(), atomsToCoins(p.BtcAmount), p.BtcLocktime)
+	p.logf("subasset-sell maker: locking BTC HTLC %d sats (take %d of %d asset), T_btc=%d (claim=taker, refund=maker)", sliceBtc, takeAsset, p.AssetAmount, p.BtcLocktime)
+	btcLeg, hp, err := ops.LockBTCLeg(takerClaimPub, refundKey.PubKey(), atomsToCoins(sliceBtc), p.BtcLocktime)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "btc_lock_failed", err.Error())
 		return res, fmt.Errorf("subasset-sell maker: lock BTC leg: %w", err)
@@ -242,9 +267,10 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 	}
 	p.logf("subasset-sell maker: BTC HTLC %s confirmed", btcLeg.Funded.TxID)
 
-	// 3. Register the asset HOLD on H and advertise both legs. The holdinvoice plugin
-	//    holds by hash (no bolt11), so the taker pays the bare hash to our node id.
-	if err := ops.CreateAssetHold(hashH, p.AssetAmount*1000); err != nil {
+	// 3. Register the asset HOLD on H (sized to the SLICE) and advertise both legs.
+	//    The holdinvoice plugin holds by hash (no bolt11), so the taker pays the
+	//    bare hash to our node id.
+	if err := ops.CreateAssetHold(hashH, takeAsset*1000); err != nil {
 		sendXcFail(p.Crypter, send, "asset_hold", err.Error())
 		return res, fmt.Errorf("subasset-sell maker: register asset hold (reclaim BTC at T_btc): %w", err)
 	}
@@ -257,8 +283,8 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 		Type:           XcSubAsSellTerms,
 		HashH:          hex.EncodeToString(hashH),
 		MakerLNNodeID:  nodeID,
-		BtcAmount:      p.BtcAmount,
-		SeqAmount:      p.AssetAmount,
+		BtcAmount:      sliceBtc,  // the priced slice, not the whole offer
+		SeqAmount:      takeAsset, // the slice the taker named (echoed so it can verify)
 		MakerRefundPub: hex.EncodeToString(refundKey.PubKey()),
 		Leg: &XcLeg{
 			Txid:         btcLeg.Funded.TxID,
@@ -282,6 +308,8 @@ func RunMakerSubAssetSell(p MakerSubAssetSellParams, in <-chan []byte, send XcSe
 		return res, fmt.Errorf("subasset-sell maker: settle asset hold (payment held!): %w", err)
 	}
 	res.Settled = true
+	res.FilledAsset = takeAsset
+	res.FilledBtc = sliceBtc
 	_ = sendXc(&XcMsg{Type: XcSubAsSellSettled}, p.Crypter, send)
 	p.logf("subasset-sell maker: settled the asset hold with P; took the asset (taker now claims the BTC with P)")
 	return res, nil
@@ -321,10 +349,18 @@ type SubAssetSellState struct {
 type TakerSubAssetSellParams struct {
 	// NewTakerOps binds the settlement engine to the maker's H once Terms arrive — the
 	// BTC-leg hashlock must embed H for VerifyBTCLeg/ClaimBTCLeg to recompute + match it.
-	NewTakerOps    func(hashH []byte) SubAssetSellTakerOps
-	Crypter        *Crypter
-	BtcAmount      uint64      // sats to receive on-chain (must match the offer)
-	AssetAmount    uint64      // asset atoms to pay over LN (must match the offer)
+	NewTakerOps func(hashH []byte) SubAssetSellTakerOps
+	Crypter     *Crypter
+	BtcAmount   uint64 // the WHOLE signed offer's on-chain side (sats a whole fill receives)
+	AssetAmount uint64 // the WHOLE signed offer's asset side (atoms a whole fill pays over LN)
+	// TakeAssetAmount is the asset-side slice to take (atoms). 0 or >= the offer
+	// takes the WHOLE offer, reducing to the classic lift. For a partial, the
+	// on-chain BTC side is derived from the SIGNED offer's ratio, rounded UP
+	// (ProportionalBtc — the taker RECEIVES the on-chain leg, so the ceil is in
+	// its favour, mirroring the pure-LN SELL), named in the terms request, and the
+	// maker's terms + funded HTLC must match it exactly or the taker refuses
+	// before paying anything.
+	TakeAssetAmount uint64
 	MinBTCConf     int         // confs required on the maker's BTC HTLC before paying (default 1)
 	MinClaimWindow uint32      // require T_btc at least this many blocks past tip before paying (default 6)
 	SpendFeeSats   uint64      // BTC claim fee target (native sats; default 1000)
@@ -361,6 +397,10 @@ type TakerSubAssetSellResult struct {
 	BtcVout        uint32
 	BtcRedeemHex   string
 	BtcLocktime    uint32
+	// Partial fills: what THIS lift agreed to move — FilledAsset atoms paid over LN
+	// for FilledBtc sats on-chain. For a whole lift these equal the offer amounts.
+	FilledAsset uint64
+	FilledBtc   uint64
 }
 
 func (p *TakerSubAssetSellParams) logf(f string, a ...interface{}) {
@@ -394,6 +434,21 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if p.SpendFeeSats == 0 {
 		p.SpendFeeSats = 1000
 	}
+	// Partial fills: decide the slice, price it OURSELVES from the signed offer, and
+	// name it in the terms request; the maker sizes the HTLC + hold to it and re-rests
+	// the rest. Rounding mirror of the maker (and of the pure-LN SELL): the taker
+	// RECEIVES the on-chain leg, so the BTC side ceils — both sides derive the same
+	// number from the same SIGNED offer, so the maker cannot re-price a slice.
+	takeAsset := p.TakeAssetAmount
+	if takeAsset == 0 || takeAsset > p.AssetAmount {
+		takeAsset = p.AssetAmount // 0 or over-ask = the whole offer
+	}
+	sliceBtc := ProportionalBtc(p.BtcAmount, takeAsset, p.AssetAmount)
+	if sliceBtc == 0 {
+		// Dust guard: a slice that prices to zero sats must be refused BEFORE anything
+		// moves (nothing has been sent yet, so nothing is at risk).
+		return nil, fmt.Errorf("%w: take %d of %d prices to 0 sats (dust)", ErrXcBadTerms, takeAsset, p.AssetAmount)
+	}
 	// Device-claim (LSP-side) mode: the wallet supplies its claim PUBKEY; we never hold the
 	// privkey, so we cannot (and must not) claim the BTC — we return P + terms for the wallet.
 	deviceClaim := len(p.ExternalClaimPub) > 0
@@ -410,10 +465,12 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 		}
 		claimPub = claimKey.PubKey()
 	}
-	res := &TakerSubAssetSellResult{TakerClaimPub: claimPub}
+	res := &TakerSubAssetSellResult{TakerClaimPub: claimPub, FilledAsset: takeAsset, FilledBtc: sliceBtc}
 
-	// 1. Request terms, offering our BTC claim pubkey (the HTLC claim branch = us).
-	if err := sendXc(&XcMsg{Type: XcSubAsSellTermsRequest, TakerBtcClaimPub: hex.EncodeToString(claimPub)}, p.Crypter, send); err != nil {
+	// 1. Request terms, offering our BTC claim pubkey (the HTLC claim branch = us)
+	//    and NAMING the asset-side slice we will pay (SeqAmount atoms; the whole
+	//    offer sends the whole amount, which an older maker simply serves whole).
+	if err := sendXc(&XcMsg{Type: XcSubAsSellTermsRequest, TakerBtcClaimPub: hex.EncodeToString(claimPub), SeqAmount: takeAsset}, p.Crypter, send); err != nil {
 		return res, err
 	}
 	terms, err := recvXcType(recv, p.Crypter, XcSubAsSellTerms, p.Timing.BtcFundWait)
@@ -434,11 +491,25 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if terms.Leg == nil || terms.MakerLNNodeID == "" {
 		return res, fmt.Errorf("%w: terms missing BTC leg or maker asset node id", ErrXcBadTerms)
 	}
-	if terms.BtcAmount != 0 && terms.BtcAmount != p.BtcAmount {
-		return res, fmt.Errorf("%w: maker BTC amount %d != expected %d", ErrXcBadTerms, terms.BtcAmount, p.BtcAmount)
+	// Both sides of the slice must match what WE derived from the signed offer, so a
+	// maker cannot re-price the slice it was asked to fill. (An older, whole-only
+	// maker echoes the WHOLE offer here; for a partial take that mismatches and is
+	// refused right now, before anything is paid.)
+	if terms.BtcAmount != 0 && terms.BtcAmount != sliceBtc {
+		return res, fmt.Errorf("%w: maker BTC amount %d != the %d the offer's ratio gives for taking %d of %d", ErrXcBadTerms, terms.BtcAmount, sliceBtc, takeAsset, p.AssetAmount)
 	}
-	if terms.SeqAmount != 0 && terms.SeqAmount != p.AssetAmount {
-		return res, fmt.Errorf("%w: maker asset amount %d != expected %d", ErrXcBadTerms, terms.SeqAmount, p.AssetAmount)
+	if terms.SeqAmount != 0 && terms.SeqAmount != takeAsset {
+		return res, fmt.Errorf("%w: maker asset amount %d != the %d we asked for", ErrXcBadTerms, terms.SeqAmount, takeAsset)
+	}
+	// A maker that quotes no amounts at all is only safe on a whole lift: there is
+	// no price to disagree about when the slice IS the offer.
+	if terms.SeqAmount == 0 && takeAsset != p.AssetAmount {
+		return res, fmt.Errorf("%w: maker did not price the partial slice", ErrXcBadTerms)
+	}
+	// The funded HTLC itself must carry EXACTLY the priced slice — the on-chain
+	// verify below binds to this number, not to the offer's whole.
+	if terms.Leg.Amount != sliceBtc {
+		return res, fmt.Errorf("subasset-sell taker: btc leg %d != priced slice %d (take %d of %d); nothing paid", terms.Leg.Amount, sliceBtc, takeAsset, p.AssetAmount)
 	}
 	script, err := hex.DecodeString(terms.Leg.RedeemScript)
 	if err != nil {
@@ -454,13 +525,13 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	// against it; PayAsset learns P by paying the invoice on H).
 	ops := p.NewTakerOps(hashH)
 
-	// 2. Verify the maker's on-chain BTC HTLC (H, claim=us, refund=maker, amount, confs)
-	//    and a T_btc far enough out to claim after we learn P.
+	// 2. Verify the maker's on-chain BTC HTLC (H, claim=us, refund=maker, the SLICE
+	//    amount, confs) and a T_btc far enough out to claim after we learn P.
 	var verified *xchain.VerifiedBTCLeg
 	verifyDeadline := time.Now().Add(p.Timing.SeqLockWait)
 	for {
 		verified, err = ops.VerifyBTCLeg(hashH, claimPub, makerRefundPub, script,
-			tBtc, terms.Leg.Txid, terms.Leg.Vout, terms.Leg.Amount, p.MinBTCConf)
+			tBtc, terms.Leg.Txid, terms.Leg.Vout, sliceBtc, p.MinBTCConf)
 		if err == nil {
 			break
 		}
@@ -470,9 +541,6 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 		}
 		time.Sleep(p.Timing.Poll)
 	}
-	if terms.Leg.Amount != p.BtcAmount {
-		return res, fmt.Errorf("subasset-sell taker: btc leg %d != quote %d", terms.Leg.Amount, p.BtcAmount)
-	}
 	tip, err := ops.BtcTip()
 	if err != nil {
 		return res, fmt.Errorf("subasset-sell taker: btc tip: %w", err)
@@ -480,7 +548,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if tBtc <= uint32(tip) || tBtc-uint32(tip) < p.MinClaimWindow {
 		return res, fmt.Errorf("subasset-sell taker: T_btc %d within %d of tip %d; not paying", tBtc, p.MinClaimWindow, tip)
 	}
-	p.logf("subasset-sell taker: maker BTC HTLC %s verified (%d sats, T_btc=%d); paying the asset over LN", terms.Leg.Txid, p.BtcAmount, tBtc)
+	p.logf("subasset-sell taker: maker BTC HTLC %s verified (%d sats for %d asset atoms, T_btc=%d); paying the asset over LN", terms.Leg.Txid, sliceBtc, takeAsset, tBtc)
 
 	// Crash-recovery checkpoints: snapshot the full BTC HTLC terms now (asset NOT yet paid),
 	// and again with P once the asset is paid. All res.* terms are populated by this point.
@@ -493,7 +561,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 			Preimage:       preimage,
 			BtcTxid:        res.BtcTxid,
 			BtcVout:        res.BtcVout,
-			BtcAmount:      p.BtcAmount,
+			BtcAmount:      sliceBtc, // the SLICE the HTLC actually carries (what the wallet claims)
 			BtcRedeemHex:   res.BtcRedeemHex,
 			BtcLocktime:    res.BtcLocktime,
 			TakerClaimPub:  res.TakerClaimPub,
@@ -506,7 +574,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	// 3. Pay the maker's held asset by bare hash over LN (device co-signs). Blocks until
 	//    the maker settles, returning P. If the maker never settles, the LN payment fails
 	//    back and nothing is lost.
-	preimage, err := ops.PayAsset(terms.MakerLNNodeID, hashH, p.AssetAmount*1000)
+	preimage, err := ops.PayAsset(terms.MakerLNNodeID, hashH, takeAsset*1000)
 	if err != nil {
 		return res, fmt.Errorf("subasset-sell taker: pay asset invoice (nothing lost, LN returns): %w", err)
 	}
@@ -528,7 +596,7 @@ func RunTakerSubAssetSell(p TakerSubAssetSellParams, send XcSend, recv XcRecv) (
 	if err := ops.InjectSecret(preimage); err != nil {
 		return res, fmt.Errorf("subasset-sell taker: inject secret (RETRYABLE, taker holds P): %w", err)
 	}
-	claimTxid, err := ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, p.BtcAmount))
+	claimTxid, err := ops.ClaimBTCLeg(verified.Leg, claimKey, xcSafeFee(p.SpendFeeSats, sliceBtc))
 	if err != nil {
 		return res, fmt.Errorf("subasset-sell taker: claim BTC HTLC (RETRYABLE, taker holds P): %w", err)
 	}

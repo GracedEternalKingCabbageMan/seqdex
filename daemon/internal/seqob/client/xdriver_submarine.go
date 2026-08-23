@@ -105,6 +105,14 @@ type MakerSubmarineParams struct {
 	AnchorTimeout    time.Duration
 	Timing           XcTiming
 	Log              func(format string, args ...interface{})
+	// OnUpdate is invoked at every value-relevant transition (terms minted, taker
+	// leg received, paid/claimed) so the caller can PERSIST the session. Without
+	// it a requote-killed submarine maker took its per-lift claim key to the
+	// grave: with the taker's HTLC already funded, the redeem script became
+	// unreconstructable by anyone and the locked asset was burned outright
+	// (seen live 2026-08-11, 6.42 USDX). The cross rail has persisted sessions
+	// from the start; this is the submarine rail catching up.
+	OnUpdate func(*MakerSubmarineResult)
 }
 
 // MakerSubmarineResult is returned even alongside an error, carrying whatever was
@@ -116,6 +124,13 @@ type MakerSubmarineResult struct {
 	Preimage     []byte
 	SeqClaimTxid string
 	Settled      bool
+	// The taker's refund pub + funded leg, recorded the moment they arrive: with
+	// these persisted the asset-leg script is reconstructable after any crash.
+	TakerSeqRefundPub []byte
+	SeqLeg            *xchain.LegLock
+	Bolt11            string
+	InvoiceMsat       uint64
+	AssetHex          string
 
 	// FilledSeq / FilledMsat are what THIS lift settled: the asset atoms received
 	// and the invoice msat paid. For a whole-HTLC lift they equal the offer.
@@ -220,6 +235,11 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 	}
 	p.logf("submarine maker: sent terms (seq_amount=%d of %d, invoice_msat=%d, seq_locktime=%d, min_anchor_depth=%d)",
 		takeSeq, p.SeqAmount, invoiceMsat, seqLocktime, p.MinAnchorDepth)
+	res.AssetHex = p.AssetHex
+	res.InvoiceMsat = invoiceMsat
+	if p.OnUpdate != nil {
+		p.OnUpdate(res) // the claim key is minted: from here a crash must never lose it
+	}
 
 	// 2. Receive the taker's funded asset HTLC + the BOLT11 to pay.
 	funded, err := recvXcType(recv, p.Crypter, XcSubAssetFunded, p.Timing.BtcFundWait)
@@ -259,6 +279,15 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		return res, errors.New("submarine maker: bad redeem_script")
 	}
 
+	res.TakerSeqRefundPub = takerSeqRefundPub
+	res.SeqLeg = &xchain.LegLock{Script: script,
+		Funded:   &xchain.FundedHTLC{TxID: leg.Txid, Vout: leg.Vout, Amount: leg.Amount, AssetID: p.AssetHex},
+		Locktime: seqLocktime}
+	res.Bolt11 = funded.Bolt11
+	if p.OnUpdate != nil {
+		p.OnUpdate(res) // the taker's leg is known: a crash between here and the claim is now recoverable
+	}
+
 	// 3. Settle: verify -> wait anchor-buried -> pay -> claim.
 	ops := p.NewMakerOps(hashH)
 	nr, err := ops.RunNormal(xchain.NormalParams{
@@ -285,11 +314,17 @@ func RunMakerSubmarineNormal(p MakerSubmarineParams, in <-chan []byte, send XcSe
 		res.Preimage = nr.Preimage
 		res.SeqClaimTxid = nr.SeqClaimTxID
 	}
+	if p.OnUpdate != nil {
+		p.OnUpdate(res) // paid/claimed material (P, claim txid) — persist before any further wait
+	}
 	if err != nil {
 		sendXcFail(p.Crypter, send, "SETTLE_FAILED", err.Error())
 		return res, fmt.Errorf("submarine maker settle: %w", err)
 	}
 	res.Settled = true
+	if p.OnUpdate != nil {
+		p.OnUpdate(res)
+	}
 	p.logf("submarine maker: settled, claimed asset in %s", nr.SeqClaimTxID)
 
 	// 4. Courtesy notice (the taker already has its BTC-LN).

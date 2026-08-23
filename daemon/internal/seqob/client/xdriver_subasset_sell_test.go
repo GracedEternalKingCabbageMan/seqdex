@@ -10,6 +10,7 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -202,6 +203,17 @@ func TestSubAssetSellHandshake(t *testing.T) {
 	if hex.EncodeToString(st.btcClaimedBy) != hex.EncodeToString(takerRes.Preimage) {
 		t.Fatalf("BTC claimed with the wrong preimage")
 	}
+	// A whole lift (TakeAssetAmount unset = 0) fills the whole offer on both sides.
+	if takerRes.FilledAsset != assetAtoms || takerRes.FilledBtc != btcSats {
+		t.Fatalf("whole lift changed shape: filled %d asset / %d sats, want %d / %d",
+			takerRes.FilledAsset, takerRes.FilledBtc, assetAtoms, btcSats)
+	}
+	if makerRes.FilledAsset != assetAtoms || makerRes.FilledBtc != btcSats {
+		t.Fatalf("maker whole lift changed shape: %+v", makerRes)
+	}
+	if st.btcAmt != btcSats {
+		t.Fatalf("whole lift locked %d sats, want %d", st.btcAmt, btcSats)
+	}
 }
 
 // TestSubAssetSellOnState pins the crash-recovery callback: OnState must fire exactly twice —
@@ -279,5 +291,234 @@ func TestSubAssetSellOnState(t *testing.T) {
 	}
 	if p.BtcTxid != v.BtcTxid || p.BtcAmount != v.BtcAmount || p.BtcLocktime != v.BtcLocktime {
 		t.Fatalf("paid snapshot BTC terms drifted from verified: %+v vs %+v", p, v)
+	}
+}
+
+// --- PARTIAL FILLS on the sub-asset SELL rail ---------------------------------
+//
+// The mirror of the pure-LN slice tests (xdriver_pureln_test.go): the taker NAMES
+// the asset-side slice in the terms request, both sides derive the on-chain BTC
+// side from the SIGNED offer with the taker-receives-BTC rounding (ceil), and the
+// maker locks ONLY what the slice requires.
+
+// A genuine slice: deliberately non-divisible amounts so floor and ceil differ.
+// Both derivations must agree on the ceil, and the maker's HTLC must carry exactly
+// the priced slice (not the offer's whole).
+func TestSubAssetSellPartialFill(t *testing.T) {
+	P := sha256.Sum256([]byte("sell-partial-secret"))
+	st := &sellState{secret: P[:]}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const wholeAsset = uint64(3_000_000)
+	const wholeBtc = uint64(1_000_001)
+	const take = wholeAsset / 3
+	const wantBtc = uint64(333_334) // ceil(1000001/3): the taker RECEIVES the on-chain leg
+	const tBtc = uint32(200)
+
+	var makerRes *MakerSubAssetSellResult
+	var makerErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, makerErr = RunMakerSubAssetSell(MakerSubAssetSellParams{
+			NewMakerOps: func(preimage []byte) SubAssetSellMakerOps { return &fakeSellMakerOps{st: st} },
+			Crypter:     mc,
+			BtcAmount:   wholeBtc,
+			AssetAmount: wholeAsset,
+			BtcLocktime: tBtc,
+			MinBTCConf:  1,
+			HoldTimeout: 3 * time.Second,
+			Preimage:    P[:],
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerSubAssetSell(TakerSubAssetSellParams{
+		NewTakerOps:     func(hashH []byte) SubAssetSellTakerOps { return &fakeSellTakerOps{st: st} },
+		Crypter:         tc,
+		BtcAmount:       wholeBtc,
+		AssetAmount:     wholeAsset,
+		TakeAssetAmount: take,
+		MinBTCConf:      1,
+		Timing:          XcTiming{TermsWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if makerErr != nil {
+		t.Fatalf("maker: %v", makerErr)
+	}
+	if takerRes.FilledAsset != take || takerRes.FilledBtc != wantBtc {
+		t.Fatalf("taker filled %d asset / %d sats, want %d / %d",
+			takerRes.FilledAsset, takerRes.FilledBtc, take, wantBtc)
+	}
+	if makerRes.FilledAsset != take || makerRes.FilledBtc != wantBtc {
+		t.Fatalf("maker settled %d asset / %d sats, want the %d / %d slice (it used to lock the whole offer)",
+			makerRes.FilledAsset, makerRes.FilledBtc, take, wantBtc)
+	}
+	// Fund-safety: the maker locked ONLY the slice on-chain, and the taker's verify
+	// bound to that same slice (a whole-offer HTLC would have been refused).
+	if st.btcAmt != wantBtc {
+		t.Fatalf("maker locked %d sats on-chain, want the %d slice", st.btcAmt, wantBtc)
+	}
+	if !makerRes.Settled || !takerRes.Received {
+		t.Fatalf("partial did not settle: maker %+v taker %+v", makerRes, takerRes)
+	}
+}
+
+// Take >= the offer clamps to the whole offer (the documented "0 or >= offer =
+// whole" contract), so an over-ask never fails and never over-locks.
+func TestSubAssetSellOverAskClampsToWhole(t *testing.T) {
+	P := sha256.Sum256([]byte("sell-overask-secret"))
+	st := &sellState{secret: P[:]}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const assetAtoms = uint64(50_000)
+	const btcSats = uint64(2_000)
+	const tBtc = uint32(200)
+
+	var makerRes *MakerSubAssetSellResult
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		makerRes, _ = RunMakerSubAssetSell(MakerSubAssetSellParams{
+			NewMakerOps: func(preimage []byte) SubAssetSellMakerOps { return &fakeSellMakerOps{st: st} },
+			Crypter:     mc,
+			BtcAmount:   btcSats,
+			AssetAmount: assetAtoms,
+			BtcLocktime: tBtc,
+			MinBTCConf:  1,
+			HoldTimeout: 3 * time.Second,
+			Preimage:    P[:],
+			Timing:      XcTiming{TermsReqWait: 2 * time.Second, BtcFundWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+		}, net.toMaker, net.makerSend)
+	}()
+
+	takerRes, takerErr := RunTakerSubAssetSell(TakerSubAssetSellParams{
+		NewTakerOps:     func(hashH []byte) SubAssetSellTakerOps { return &fakeSellTakerOps{st: st} },
+		Crypter:         tc,
+		BtcAmount:       btcSats,
+		AssetAmount:     assetAtoms,
+		TakeAssetAmount: assetAtoms * 2, // over-ask: clamps to the whole offer
+		MinBTCConf:      1,
+		Timing:          XcTiming{TermsWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr != nil {
+		t.Fatalf("taker: %v", takerErr)
+	}
+	if takerRes.FilledAsset != assetAtoms || takerRes.FilledBtc != btcSats {
+		t.Fatalf("over-ask did not clamp to the whole: %+v", takerRes)
+	}
+	if makerRes == nil || !makerRes.Settled || makerRes.FilledAsset != assetAtoms {
+		t.Fatalf("maker did not settle the whole on an over-ask: %+v", makerRes)
+	}
+}
+
+// A maker that re-prices the slice (quotes a BTC amount other than the one the
+// SIGNED offer's ratio gives) is refused BEFORE the taker binds ops or pays
+// anything — the taker trusts only its own derivation from the signed offer.
+func TestSubAssetSellMakerRepricedSliceRefused(t *testing.T) {
+	st := &sellState{secret: []byte("unused")}
+	tc, mc := testCrypters(t)
+	net := newFakeXcNet()
+
+	const wholeAsset = uint64(3_000_000)
+	const wholeBtc = uint64(1_000_001)
+	const take = wholeAsset / 3
+	const wantBtc = uint64(333_334) // the honest ceil price of the slice
+
+	// Hand-rolled dishonest maker: answers the terms request with the taker's own
+	// slice but a re-priced BTC side (+7 sats), leg sized to match its lie.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recv := chanRecv(net.toMaker)
+		req, err := recvXcType(recv, mc, XcSubAsSellTermsRequest, 2*time.Second)
+		if err != nil {
+			t.Errorf("fake maker: %v", err)
+			return
+		}
+		if req.SeqAmount != take {
+			t.Errorf("terms request named slice %d, want %d", req.SeqAmount, take)
+		}
+		h := sha256.Sum256([]byte("reprice"))
+		_ = sendXc(&XcMsg{
+			Type:           XcSubAsSellTerms,
+			HashH:          hex.EncodeToString(h[:]),
+			MakerLNNodeID:  "02" + hex.EncodeToString(make([]byte, 32)),
+			BtcAmount:      wantBtc + 7, // the re-price
+			SeqAmount:      req.SeqAmount,
+			MakerRefundPub: hex.EncodeToString([]byte{0x02, 0xbb}),
+			Leg:            &XcLeg{Txid: "reprice-htlc", Vout: 0, Amount: wantBtc + 7, RedeemScript: "51", Locktime: 200},
+		}, mc, net.makerSend)
+	}()
+
+	opsBound := false
+	takerRes, takerErr := RunTakerSubAssetSell(TakerSubAssetSellParams{
+		NewTakerOps: func(hashH []byte) SubAssetSellTakerOps {
+			opsBound = true
+			return &fakeSellTakerOps{st: st}
+		},
+		Crypter:         tc,
+		BtcAmount:       wholeBtc,
+		AssetAmount:     wholeAsset,
+		TakeAssetAmount: take,
+		MinBTCConf:      1,
+		Timing:          XcTiming{TermsWait: 2 * time.Second, BtcFundWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+	wg.Wait()
+
+	if takerErr == nil {
+		t.Fatalf("taker accepted a re-priced slice: %+v", takerRes)
+	}
+	if !errors.Is(takerErr, ErrXcBadTerms) {
+		t.Fatalf("want ErrXcBadTerms, got: %v", takerErr)
+	}
+	if opsBound {
+		t.Fatalf("taker bound settlement ops for a re-priced slice (must refuse before anything moves)")
+	}
+	if st.takerPaid {
+		t.Fatalf("taker paid the asset on a re-priced slice")
+	}
+}
+
+// A slice that prices to zero sats (only possible when the offer's BTC side is
+// itself zero — ceil never rounds a funded offer to nothing) is refused before a
+// single frame leaves the taker.
+func TestSubAssetSellDustSliceRefused(t *testing.T) {
+	st := &sellState{}
+	tc, _ := testCrypters(t)
+	net := newFakeXcNet()
+
+	_, takerErr := RunTakerSubAssetSell(TakerSubAssetSellParams{
+		NewTakerOps:     func(hashH []byte) SubAssetSellTakerOps { return &fakeSellTakerOps{st: st} },
+		Crypter:         tc,
+		BtcAmount:       0, // a zero-priced offer: any slice is dust
+		AssetAmount:     1_000,
+		TakeAssetAmount: 10,
+		MinBTCConf:      1,
+		Timing:          XcTiming{TermsWait: 50 * time.Millisecond, Poll: 5 * time.Millisecond},
+	}, net.takerSend, net.takerRecv)
+
+	if takerErr == nil {
+		t.Fatalf("taker accepted a slice priced to 0 sats")
+	}
+	if !errors.Is(takerErr, ErrXcBadTerms) {
+		t.Fatalf("want ErrXcBadTerms (dust), got: %v", takerErr)
+	}
+	if len(net.toMaker) != 0 {
+		t.Fatalf("dust refusal must happen before anything is sent; %d frame(s) left the taker", len(net.toMaker))
+	}
+	if st.takerPaid {
+		t.Fatalf("taker paid the asset on a dust slice")
 	}
 }

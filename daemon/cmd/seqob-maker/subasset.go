@@ -194,6 +194,7 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 	filled := false
 	idle := func() bool { mu.Lock(); defer mu.Unlock(); return inFlight == 0 }
 	armRequoteExit(o, idle) // retire for a fresh re-quote before the offer expires
+	setBusyFn(func() int { mu.Lock(); defer mu.Unlock(); return inFlight })
 
 	refuse := func(sid string, cr *client.Crypter, code, msg string) {
 		m := &client.XcMsg{Type: client.XcFail, Code: code, Message: msg}
@@ -258,6 +259,13 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 			}
 			if busy {
 				refuse(sid, cr, "busy", "another swap is in flight (whole-swap, one at a time)")
+				continue
+			}
+			if refuseIfDraining(sid, cr, refuse) {
+				mu.Lock()
+				inFlight--
+				delete(inboxes, sid)
+				mu.Unlock()
 				continue
 			}
 			fmt.Printf("sub-asset swap requested: session %s offer %s\n", sid, lr.GetOfferId())
