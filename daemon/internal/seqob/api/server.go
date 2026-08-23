@@ -234,7 +234,15 @@ func (s *Server) handleMarkets(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeProto(w, &seqobv1.MarketList{Markets: s.store.Markets()})
+	writeProto(w, &seqobv1.MarketList{Markets: s.markets()})
+}
+
+// markets is the market summary filtered exactly like the orderbook: an offer the
+// book would hide as an unliftable ghost must not count toward n_orders or set the
+// best price, or a market reads as deep and quoted while its book comes back empty.
+func (s *Server) markets() []*seqobv1.Market {
+	now := time.Now().Unix()
+	return s.store.MarketsFiltered(func(o *seqobv1.Offer) bool { return s.offerLiftable(o, now) })
 }
 
 // handleOrderbook serves /v1/market/{base}/{quote}/{orderbook|trades|candles}.
@@ -351,9 +359,39 @@ func (s *Server) handleLift(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusConflict, err.Error())
 		return
 	}
+	s.expireUnattachedLift(sess.ID, offerstore.Key{MakerPubkey: sl.GetMakerPubkey(), OfferID: sl.GetOfferId()})
 	writeProto(w, &seqobv1.LiftAccepted{
 		SessionId:          sess.ID,
 		MakerSessionPubkey: makerPubkeyBytes(sl.GetMakerPubkey()),
+	})
+}
+
+// restLiftAttachGrace is how long a lift opened over REST may sit with no taker socket
+// attached before the relay aborts it. A REST lift holds the offer's single lift slot
+// (for a cross offer, up to the multi-hour cross deadline) yet binds to no connection,
+// so the abandoned-lift release that protects WS lifts never fires for it: one
+// unauthenticated POST per offer would keep the whole interactive book "lift in
+// progress". A real taker opens its socket and re-attaches within seconds.
+var restLiftAttachGrace = 30 * time.Second
+
+// expireUnattachedLift aborts a REST-opened lift on a non-covenant offer if no taker
+// has attached to the session by the grace deadline. Covenant lifts hold no slot.
+func (s *Server) expireUnattachedLift(sid string, k offerstore.Key) {
+	if e, ok := s.store.Get(k); !ok || e.Offer.GetCovenant() != nil {
+		return
+	}
+	time.AfterFunc(restLiftAttachGrace, func() {
+		s.takerMu.Lock()
+		_, attached := s.takerConns[sid]
+		s.takerMu.Unlock()
+		if attached {
+			return
+		}
+		if _, live := s.sessions.Get(sid); !live {
+			return
+		}
+		s.sessions.Abort(sid)
+		s.notifyMakerTakerGone(sid)
 	})
 }
 
@@ -451,10 +489,14 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
+// maxBodyBytes bounds a REST request body. Offers, cancels and lifts are each well
+// under a kilobyte; the JSON decoder would otherwise buffer whatever a client sends.
+const maxBodyBytes = 256 << 10
+
 func readProto(r *http.Request, m proto.Message) error {
 	defer r.Body.Close()
 	var raw json.RawMessage
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBodyBytes))
 	if err := dec.Decode(&raw); err != nil {
 		return err
 	}
@@ -537,22 +579,26 @@ func (s *Server) liftableOffers(offers []*seqobv1.Offer) []*seqobv1.Offer {
 	now := time.Now().Unix()
 	out := offers[:0:0]
 	for _, o := range offers {
-		if !needsLiveMaker(o) {
-			out = append(out, o)
-			continue
-		}
-		if _, ok := s.makerConns.get(o.GetMakerPubkey()); ok {
-			out = append(out, o)
-			continue
-		}
-		// GRACE. Posting an offer and then connecting to serve it is a legitimate order: a maker may
-		// REST-submit and open its socket a moment later. Only an offer that has sat unserved for
-		// longer than any such gap is a ghost, so young ones are still shown.
-		if created := o.GetCreatedAtUnix(); created > 0 && now-int64(created) < ghostGraceSecs {
+		if s.offerLiftable(o, now) {
 			out = append(out, o)
 		}
 	}
 	return out
+}
+
+// offerLiftable is the per-offer rule behind liftableOffers.
+func (s *Server) offerLiftable(o *seqobv1.Offer, now int64) bool {
+	if s.makerConns == nil || !needsLiveMaker(o) {
+		return true
+	}
+	if _, ok := s.makerConns.get(o.GetMakerPubkey()); ok {
+		return true
+	}
+	// GRACE. Posting an offer and then connecting to serve it is a legitimate order: a maker may
+	// REST-submit and open its socket a moment later. Only an offer that has sat unserved for
+	// longer than any such gap is a ghost, so young ones are still shown.
+	created := o.GetCreatedAtUnix()
+	return created > 0 && now-int64(created) < ghostGraceSecs
 }
 
 // How long an interactive offer may rest with no connected maker before the book stops advertising
