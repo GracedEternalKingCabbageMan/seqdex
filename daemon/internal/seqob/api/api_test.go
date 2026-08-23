@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -468,7 +469,7 @@ func mkSignedCovSell(t *testing.T, k *btcec.PrivateKey, id string) *seqobv1.Offe
 	}
 	o := mkSignedOffer(t, k, id)
 	o.Settlement = &seqobv1.Offer_Covenant{Covenant: &seqobv1.CovenantTerms{
-		CovenantTxid: "cov" + id, CovenantVout: 0,
+		CovenantTxid: strings.Repeat("c0", 30) + fmt.Sprintf("%04x", len(id)), CovenantVout: 0,
 		AssetA: "aa", AssetB: "bb", RateNum: 45, RateDen: 100,
 		MinLot: 1, MakerProgVer: 1, ExpiryLocktime: 400, MakerProg: b32(0xc3), MakerX: b32(0xd4),
 	}}

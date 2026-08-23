@@ -60,8 +60,27 @@ func TestReplayOverWSDoesNotRegisterMaker(t *testing.T) {
 	if st := readFrom(t, maker); st.GetOrderStatus() == nil {
 		t.Fatalf("re-signed submit should be acked, got %+v", st)
 	}
-	if _, ok := srv.makerConns.get(o.GetMakerPubkey()); !ok {
+	makerConn, ok := srv.makerConns.get(o.GetMakerPubkey())
+	if !ok {
 		t.Fatal("the maker's own re-signed submit did not register its connection")
+	}
+
+	// A maker-signed variant from the SAME second (a captured earlier edit) edits the
+	// book but does not move the registration: only a strictly newer copy does.
+	variant := proto.Clone(fresh).(*seqobv1.Offer)
+	variant.ExpiresAtUnix++
+	variant.MakerSig = nil
+	if err := offer.SignOffer(variant, mk); err != nil {
+		t.Fatal(err)
+	}
+	attacker2 := dialWS(t, ts)
+	defer attacker2.Close()
+	sendTo(t, attacker2, &seqobv1.To{Msg: &seqobv1.To_OfferSubmit{OfferSubmit: variant}})
+	if st := readFrom(t, attacker2); st.GetOrderStatus() == nil {
+		t.Fatalf("same-second variant should still be acked, got %+v", st)
+	}
+	if cur, _ := srv.makerConns.get(o.GetMakerPubkey()); cur != makerConn {
+		t.Fatal("a same-second variant moved the maker registration to another socket")
 	}
 }
 
