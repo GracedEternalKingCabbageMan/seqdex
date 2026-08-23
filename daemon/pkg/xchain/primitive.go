@@ -30,6 +30,7 @@
 package xchain
 
 import (
+	"bytes"
 	"crypto/sha256"
 
 	"github.com/btcsuite/btcd/txscript"
@@ -115,9 +116,35 @@ func NewHashLockFromHash(hash []byte) *HashLock {
 
 func (h *HashLock) Kind() string { return "hashlock" }
 
-// LockScript renders the Design-A HTLC redeemScript. It is identical to
-// contrib/sequentia/swap-demo.py's htlc_script() and to a real BTC<->SEQ HTLC.
+// LockScript renders the Design-A HTLC redeemScript:
+//
+//	OP_IF OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <H> OP_EQUALVERIFY <claimPub> OP_CHECKSIG
+//	OP_ELSE <T> OP_CHECKLOCKTIMEVERIFY OP_DROP <refundPub> OP_CHECKSIG OP_ENDIF
+//
+// The OP_SIZE guard pins the preimage to the 32 bytes Lightning settles. Without
+// it the claim branch accepted ANY length whose sha256 matched, so in a flow where
+// the counterparty picks P and reveals it on-chain before the other side settles a
+// Lightning hold with it, a 33-byte P claimed the chain leg and could never settle
+// the hold. The JS/WASM builders (SWK lwk_wasm, the LSP) emit the same bytes;
+// LegacyLockScript is the pre-guard form that verifiers still accept from older
+// counterparties.
 func (h *HashLock) LockScript(claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
+	b := txscript.NewScriptBuilder()
+	b.AddOp(txscript.OP_IF)
+	b.AddOp(txscript.OP_SIZE).AddInt64(32).AddOp(txscript.OP_EQUALVERIFY)
+	b.AddOp(txscript.OP_SHA256).AddData(h.Hash).AddOp(txscript.OP_EQUALVERIFY)
+	b.AddData(claimPub).AddOp(txscript.OP_CHECKSIG)
+	b.AddOp(txscript.OP_ELSE)
+	b.AddInt64(int64(locktime)).AddOp(txscript.OP_CHECKLOCKTIMEVERIFY).AddOp(txscript.OP_DROP)
+	b.AddData(refundPub).AddOp(txscript.OP_CHECKSIG)
+	b.AddOp(txscript.OP_ENDIF)
+	return b.Script()
+}
+
+// LegacyLockScript is the pre-guard Design-A script (no OP_SIZE), identical to
+// contrib/sequentia/swap-demo.py's htlc_script(). Verifiers accept it from a
+// counterparty that has not upgraded; nothing new is built with it.
+func (h *HashLock) LegacyLockScript(claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
 	b := txscript.NewScriptBuilder()
 	b.AddOp(txscript.OP_IF)
 	b.AddOp(txscript.OP_SHA256).AddData(h.Hash).AddOp(txscript.OP_EQUALVERIFY)
@@ -127,6 +154,41 @@ func (h *HashLock) LockScript(claimPub, refundPub []byte, locktime uint32) ([]by
 	b.AddData(refundPub).AddOp(txscript.OP_CHECKSIG)
 	b.AddOp(txscript.OP_ENDIF)
 	return b.Script()
+}
+
+// legacyLocker is implemented by primitives that still accept an older script form.
+type legacyLocker interface {
+	LegacyLockScript(claimPub, refundPub []byte, locktime uint32) ([]byte, error)
+}
+
+// ScriptVariants returns every script form a verifier accepts for these
+// parameters, current form first.
+func ScriptVariants(p LockPrimitive, claimPub, refundPub []byte, locktime uint32) ([][]byte, error) {
+	cur, err := p.LockScript(claimPub, refundPub, locktime)
+	if err != nil {
+		return nil, err
+	}
+	out := [][]byte{cur}
+	if ll, ok := p.(legacyLocker); ok {
+		if old, err := ll.LegacyLockScript(claimPub, refundPub, locktime); err == nil {
+			out = append(out, old)
+		}
+	}
+	return out, nil
+}
+
+// MatchScript returns provided if it equals one of the accepted variants, else nil.
+func MatchScript(p LockPrimitive, provided, claimPub, refundPub []byte, locktime uint32) ([]byte, error) {
+	vs, err := ScriptVariants(p, claimPub, refundPub, locktime)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range vs {
+		if bytes.Equal(v, provided) {
+			return v, nil
+		}
+	}
+	return nil, nil
 }
 
 // RedeemUnlockItems: <sig> <preimage> OP_TRUE — selects the IF branch and
