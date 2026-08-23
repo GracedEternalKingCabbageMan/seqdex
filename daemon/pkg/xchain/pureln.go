@@ -80,21 +80,102 @@ func makerRegisterHold(incoming LNLeg, h []byte, inAmtMsat uint64) error {
 	return nil
 }
 
-// makerFulfill: wait for the incoming leg to be held, pay the taker's outgoing
-// invoice (LEARNING P and delivering value), then settle the held incoming with
-// P. On any failure before the settle it cancels the hold (the taker's incoming
-// is refunded and neither leg completes). Returns the preimage.
-func makerFulfill(incoming, outgoing LNLeg, h []byte, outInvoice string, outAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
+// MakerSettleMarginSecs is the time a maker keeps between the latest its
+// outgoing payment may resolve and the expiry of the incoming hold it settles
+// with the learned preimage: room for the settle itself and for a slow pass.
+const MakerSettleMarginSecs = 20 * 60
+
+// HoldCltvFor is the final-hop timelock, in blocks of the INCOMING leg's chain,
+// that a taker must pay the maker's hold with for the maker to be able to pay
+// outInvoice safely: it covers the invoice's own final delay plus the route
+// allowance on the outgoing chain, the hold wait, and the settle margin. The maker
+// tells the taker this number before the taker pays.
+func holdCltvFor(incoming, outgoing LNLeg, outInvoice string, holdTimeout time.Duration) (uint32, error) {
+	in, err := timingOf(incoming, "incoming")
+	if err != nil {
+		return 0, err
+	}
+	out, err := timingOf(outgoing, "outgoing")
+	if err != nil {
+		return 0, err
+	}
+	dec, ok := outgoing.(interface {
+		InvoiceMinFinalCltv(string) (uint32, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("%w: outgoing leg cannot decode invoices", ErrCltvUncapped)
+	}
+	minFinal, err := dec.InvoiceMinFinalCltv(outInvoice)
+	if err != nil {
+		return 0, err
+	}
+	margin := uint32(holdTimeout/time.Second) + MakerSettleMarginSecs
+	return CoverDelay(minFinal+RouteAllowance(out), out, in, margin), nil
+}
+
+// capFor is the outgoing timelock cap for a hold that was actually accepted:
+// the blocks left on the incoming chain before the held HTLC expires, converted
+// with the incoming chain fast and the outgoing slow, less the settle margin.
+func capFor(incoming, outgoing LNLeg, info HeldInfo) (uint32, error) {
+	in, err := timingOf(incoming, "incoming")
+	if err != nil {
+		return 0, err
+	}
+	out, err := timingOf(outgoing, "outgoing")
+	if err != nil {
+		return 0, err
+	}
+	if info.CltvExpiry == 0 || info.Tip == 0 {
+		return 0, fmt.Errorf("%w: the hold did not report its expiry (plugin predates cltv_expiry?)", ErrCltvUncapped)
+	}
+	if info.CltvExpiry <= info.Tip {
+		return 0, nil
+	}
+	return CapDelay(info.CltvExpiry-info.Tip, in, out, MakerSettleMarginSecs), nil
+}
+
+// makerFulfill: wait for the incoming leg to be held, check what was held, pay the
+// taker's outgoing invoice (LEARNING P and delivering value) with its timelock
+// capped below the hold's expiry, then settle the held incoming with P. On any
+// failure before the pay it cancels the hold (the taker's incoming is refunded and
+// neither leg completes). Returns the preimage.
+func makerFulfill(incoming, outgoing LNLeg, h []byte, outInvoice string, outAmtMsat, inAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
 	// Maker-side stage stopwatch (stdout): splits the taker's opaque PayHold
 	// wait into held / paid / settled so the latency is attributable.
 	start := time.Now()
 	mstage := func(name string) { fmt.Printf("MSTAGE %s +%dms\n", name, time.Since(start).Milliseconds()) }
-	if _, err = incoming.WaitHeld(h, holdTimeout); err != nil {
+	var info HeldInfo
+	if wi, ok := incoming.(interface {
+		WaitHeldInfo([]byte, time.Duration) (HeldInfo, error)
+	}); ok {
+		info, err = wi.WaitHeldInfo(h, holdTimeout)
+	} else {
+		info.ReceivedMsat, err = incoming.WaitHeld(h, holdTimeout)
+	}
+	if err != nil {
 		_ = incoming.CancelHold(h)
 		return nil, fmt.Errorf("wait held: %w", err)
 	}
 	mstage("held")
-	p, err := outgoing.Pay(outInvoice, h, outAmtMsat)
+	// The plugin holds whatever arrives; the amount is checked HERE, by the party
+	// about to pay out against it.
+	if inAmtMsat != 0 && info.ReceivedMsat < inAmtMsat {
+		_ = incoming.CancelHold(h)
+		return nil, fmt.Errorf("%w: held %d msat, expected %d", ErrLNLegInvalid, info.ReceivedMsat, inAmtMsat)
+	}
+	maxDelay, err := capFor(incoming, outgoing, info)
+	if err != nil {
+		_ = incoming.CancelHold(h)
+		return nil, err
+	}
+	capped, ok := outgoing.(interface {
+		PayCapped(string, []byte, uint64, uint32) ([]byte, error)
+	})
+	if !ok {
+		_ = incoming.CancelHold(h)
+		return nil, fmt.Errorf("%w: outgoing leg cannot cap its timelock", ErrCltvUncapped)
+	}
+	p, err := capped.PayCapped(outInvoice, h, outAmtMsat, maxDelay)
 	if err != nil {
 		if errors.Is(err, ErrLNPayUnresolved) {
 			// The outgoing HTLC may still settle, and the incoming hold is the only thing
@@ -136,10 +217,17 @@ func (s *PureLNSwap) MakerRegisterHold(h []byte, btcAmtMsat uint64) error {
 	return makerRegisterHold(s.btcLeg, h, btcAmtMsat)
 }
 
-// MakerFulfill (maker) waits for the held BTC, pays the taker's asset invoice
-// (learning P), and settles the held BTC.
-func (s *PureLNSwap) MakerFulfill(h []byte, assetInvoice string, assetAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
-	return makerFulfill(s.btcLeg, s.assetLeg, h, assetInvoice, assetAmtMsat, holdTimeout)
+// MakerFulfill (maker) waits for the held BTC (at least btcAmtMsat), pays the
+// taker's asset invoice (learning P) with its timelock capped below the hold's
+// expiry, and settles the held BTC.
+func (s *PureLNSwap) MakerFulfill(h []byte, assetInvoice string, assetAmtMsat, btcAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
+	return makerFulfill(s.btcLeg, s.assetLeg, h, assetInvoice, assetAmtMsat, btcAmtMsat, holdTimeout)
+}
+
+// HoldCltvForBuy is the final-hop timelock (BTC-leg blocks) a taker must pay the
+// BTC hold with so the maker can pay assetInvoice safely.
+func (s *PureLNSwap) HoldCltvForBuy(assetInvoice string, holdTimeout time.Duration) (uint32, error) {
+	return holdCltvFor(s.btcLeg, s.assetLeg, assetInvoice, holdTimeout)
 }
 
 // RunTakerBuy (taker) pays the maker's BTC hold by bare hash; blocks until settle.
@@ -159,10 +247,17 @@ func (s *PureLNSwap) MakerRegisterHoldSell(h []byte, assetAmtMsat uint64) error 
 	return makerRegisterHold(s.assetLeg, h, assetAmtMsat)
 }
 
-// MakerFulfillSell (maker) waits for the held asset, pays the taker's BTC invoice
-// (learning P), and settles the held asset.
-func (s *PureLNSwap) MakerFulfillSell(h []byte, btcInvoice string, btcAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
-	return makerFulfill(s.assetLeg, s.btcLeg, h, btcInvoice, btcAmtMsat, holdTimeout)
+// MakerFulfillSell (maker) waits for the held asset (at least assetAmtMsat), pays
+// the taker's BTC invoice (learning P) with its timelock capped below the hold's
+// expiry, and settles the held asset.
+func (s *PureLNSwap) MakerFulfillSell(h []byte, btcInvoice string, btcAmtMsat, assetAmtMsat uint64, holdTimeout time.Duration) (preimage []byte, err error) {
+	return makerFulfill(s.assetLeg, s.btcLeg, h, btcInvoice, btcAmtMsat, assetAmtMsat, holdTimeout)
+}
+
+// HoldCltvForSell is the final-hop timelock (asset-leg blocks) a taker must pay
+// the asset hold with so the maker can pay btcInvoice safely.
+func (s *PureLNSwap) HoldCltvForSell(btcInvoice string, holdTimeout time.Duration) (uint32, error) {
+	return holdCltvFor(s.assetLeg, s.btcLeg, btcInvoice, holdTimeout)
 }
 
 // RunTakerSell (taker) pays the maker's ASSET hold by bare hash; blocks until settle.

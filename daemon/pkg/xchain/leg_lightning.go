@@ -110,16 +110,30 @@ type clnLNLeg struct {
 	// PayHash route in this asset via SeqLN's Step-1 `asset=` param, so the same
 	// leg abstraction serves both the BTC leg and a Sequentia asset leg.
 	assetID string
+	// timing is the chain this leg's HTLCs expire on: Bitcoin for the policy-asset
+	// leg of a real BTC-LN node, Sequentia slots for an issued-asset leg. Every
+	// timelock this leg pays with or holds against is converted through it.
+	timing ChainTiming
 }
 
 // clnLNLeg must satisfy LNLeg.
 var _ LNLeg = (*clnLNLeg)(nil)
 
+// Timing reports the chain this leg's HTLCs expire on.
+func (l *clnLNLeg) Timing() ChainTiming { return l.timing }
+
 // NewCLNLNLeg builds a Lightning leg backed by the CLN node whose lightning-rpc
 // socket is at socketPath (e.g. <lightning-dir>/<network>/lightning-rpc). It is
 // denominated in the policy asset (BTC on a --network=bitcoin/testnet4 node).
 func NewCLNLNLeg(socketPath string) *clnLNLeg {
-	return &clnLNLeg{rpc: &lnRPC{socketPath: socketPath, timeout: 120 * time.Second}}
+	return &clnLNLeg{rpc: &lnRPC{socketPath: socketPath, timeout: 120 * time.Second}, timing: BTCTiming}
+}
+
+// NewCLNLNLegOn is NewCLNLNLeg for a policy-asset node on a chain other than
+// Bitcoin (a SeqLN node's own policy asset): the timelocks expire in that chain's
+// blocks.
+func NewCLNLNLegOn(socketPath string, timing ChainTiming) *clnLNLeg {
+	return &clnLNLeg{rpc: &lnRPC{socketPath: socketPath, timeout: 120 * time.Second}, timing: timing}
 }
 
 // NewCLNAssetLNLeg builds a Lightning leg denominated in a Sequentia issued
@@ -129,6 +143,7 @@ func NewCLNAssetLNLeg(socketPath, assetIDHex string) *clnLNLeg {
 	return &clnLNLeg{
 		rpc:     &lnRPC{socketPath: socketPath, timeout: 120 * time.Second},
 		assetID: assetIDHex,
+		timing:  SeqTiming,
 	}
 }
 
@@ -179,31 +194,82 @@ func (l *clnLNLeg) ReconnectPeers() (int, error) {
 	return reconnected, firstErr
 }
 
-func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
-	// Decode first so we never pay an invoice whose hash is not the swap secret,
-	// and to sanity-check the amount. CLN's decoder command is `decode` (the older
-	// `decodepay` is not present on all builds); it takes the invoice as `string`.
-	var dec struct {
-		Type        string `json:"type"`
-		Valid       bool   `json:"valid"`
-		PaymentHash string `json:"payment_hash"`
-		AmountMsat  uint64 `json:"amount_msat"`
-		// Only for the unannounced-channel fallback below; absent fields simply disable it.
-		Payee         string `json:"payee"`
-		PaymentSecret string `json:"payment_secret"`
-		MinFinalCltv  uint32 `json:"min_final_cltv_expiry"`
-	}
+// decodedInvoice is the subset of CLN's `decode` output the legs act on.
+type decodedInvoice struct {
+	Type        string `json:"type"`
+	Valid       bool   `json:"valid"`
+	PaymentHash string `json:"payment_hash"`
+	AmountMsat  uint64 `json:"amount_msat"`
+	// Only for the unannounced-channel fallback; absent fields simply disable it.
+	Payee         string `json:"payee"`
+	PaymentSecret string `json:"payment_secret"`
+	MinFinalCltv  uint32 `json:"min_final_cltv_expiry"`
+}
+
+// decode runs CLN's `decode` (the older `decodepay` is not on all builds).
+func (l *clnLNLeg) decode(bolt11 string) (*decodedInvoice, error) {
+	var dec decodedInvoice
 	if err := l.rpc.call(&dec, "decode", map[string]interface{}{"string": bolt11}); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	if !dec.Valid {
 		return nil, fmt.Errorf("%w: invoice does not decode as valid (%s)", ErrLNLegInvalid, dec.Type)
 	}
+	return &dec, nil
+}
+
+// InvoiceMinFinalCltv returns the final-hop timelock the invoice demands, in
+// blocks of this leg's chain. A payer's route adds its hops' deltas on top.
+func (l *clnLNLeg) InvoiceMinFinalCltv(bolt11 string) (uint32, error) {
+	dec, err := l.decode(bolt11)
+	if err != nil {
+		return 0, err
+	}
+	if dec.MinFinalCltv == 0 {
+		return 18, nil // the BOLT11 default when the field is absent
+	}
+	return dec.MinFinalCltv, nil
+}
+
+func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
+	return l.pay(bolt11, wantHash, amountMsat, 0)
+}
+
+// PayCapped is Pay with an upper bound on the route's total timelock, in blocks of
+// this leg's chain: CLN refuses any route whose delay exceeds it (maxdelay), and
+// the direct-hop fallback is refused when the invoice's own final delay does not
+// fit. A maker pays its outgoing leg against an incoming hold that expires at a
+// known height; a route that outlasts that hold lets a counterparty who holds the
+// outgoing HTLC be paid after the incoming one was failed back.
+func (l *clnLNLeg) PayCapped(bolt11 string, wantHash []byte, amountMsat uint64, maxDelay uint32) ([]byte, error) {
+	if maxDelay == 0 {
+		return nil, fmt.Errorf("%w: zero maxdelay", ErrCltvUncapped)
+	}
+	return l.pay(bolt11, wantHash, amountMsat, maxDelay)
+}
+
+func (l *clnLNLeg) pay(bolt11 string, wantHash []byte, amountMsat uint64, maxDelay uint32) ([]byte, error) {
+	// Decode first so we never pay an invoice whose hash is not the swap secret,
+	// and to sanity-check the amount.
+	dec, err := l.decode(bolt11)
+	if err != nil {
+		return nil, err
+	}
 	if !hexEq(dec.PaymentHash, wantHash) {
 		return nil, fmt.Errorf("%w: invoice payment_hash %s != swap hash %x", ErrLNLegInvalid, dec.PaymentHash, wantHash)
 	}
+	if amountMsat == 0 && dec.AmountMsat == 0 {
+		return nil, fmt.Errorf("%w: amountless invoice with no quoted amount", ErrLNLegInvalid)
+	}
 	if amountMsat != 0 && dec.AmountMsat != 0 && dec.AmountMsat != amountMsat {
 		return nil, fmt.Errorf("%w: invoice amount %d msat != quoted %d", ErrLNLegInvalid, dec.AmountMsat, amountMsat)
+	}
+	minFinal := dec.MinFinalCltv
+	if minFinal == 0 {
+		minFinal = 18
+	}
+	if maxDelay != 0 && minFinal > maxDelay {
+		return nil, fmt.Errorf("%w: invoice min_final_cltv %d exceeds the %d-block cap", ErrLNLegInvalid, minFinal, maxDelay)
 	}
 	var res struct {
 		Status       string `json:"status"`
@@ -218,6 +284,9 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 	}
 	if l.assetID != "" {
 		params["asset"] = l.assetID // route in this leg's Sequentia asset (Step 1)
+	}
+	if maxDelay != 0 {
+		params["maxdelay"] = maxDelay
 	}
 	if err := l.rpc.call(&res, "pay", params); err != nil {
 		// AN ERROR FROM `pay` IS NOT A FAILED PAYMENT. The socket read is deadline-bound
@@ -253,7 +322,9 @@ func (l *clnLNLeg) Pay(bolt11 string, wantHash []byte, amountMsat uint64) ([]byt
 		if !ok {
 			return nil, fmt.Errorf("pay: %w", err)
 		}
-		pre, perr := l.PayHash(payee, wantHash, amt, dec.MinFinalCltv, secret)
+		// The direct hop uses exactly the invoice's final delay, already checked
+		// against the cap above.
+		pre, perr := l.PayHash(payee, wantHash, amt, minFinal, secret)
 		if perr != nil {
 			return nil, fmt.Errorf("pay: %w (direct-hop fallback: %v)", err, perr)
 		}
@@ -499,29 +570,69 @@ func (l *clnLNLeg) CreateHoldInvoice(paymentHash []byte, amountMsat uint64, cltv
 }
 
 func (l *clnLNLeg) WaitHeld(paymentHash []byte, timeout time.Duration) (uint64, error) {
-	deadline := time.Now().Add(timeout)
+	info, err := l.WaitHeldInfo(paymentHash, timeout)
+	if err != nil {
+		return 0, err
+	}
+	return info.ReceivedMsat, nil
+}
+
+// HeldInfo is what the holder learns about a held incoming payment: what actually
+// arrived (the plugin's received sum, not the registered expectation) and the
+// payer-chosen absolute expiry of the earliest held HTLC, with the tip it is
+// measured against. CltvExpiry is 0 when the plugin predates the field.
+type HeldInfo struct {
+	ReceivedMsat uint64
+	CltvExpiry   uint32
+	Tip          uint32
+}
+
+// WaitHeldInfo blocks until the hold on paymentHash is accepted and returns what
+// was held. The poll starts tight (the taker's HTLC lands within a commitment
+// round trip of the terms exchange) and backs off to a second after the first
+// second, so a multi-minute wait is not twenty socket dials a second through
+// lightningd's single RPC thread.
+func (l *clnLNLeg) WaitHeldInfo(paymentHash []byte, timeout time.Duration) (HeldInfo, error) {
+	start := time.Now()
+	deadline := start.Add(timeout)
 	for {
 		var res struct {
-			State      string `json:"state"`
-			AmountMsat uint64 `json:"amount_msat"`
+			State        string `json:"state"`
+			AmountMsat   uint64 `json:"amount_msat"`
+			ReceivedMsat uint64 `json:"received_msat"`
+			CltvExpiry   uint32 `json:"cltv_expiry"`
 		}
 		err := l.rpc.call(&res, "holdinvoicelookup",
 			map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
 		if err == nil && res.State == "accepted" {
-			return res.AmountMsat, nil
+			info := HeldInfo{ReceivedMsat: res.ReceivedMsat, CltvExpiry: res.CltvExpiry}
+			if info.ReceivedMsat == 0 {
+				info.ReceivedMsat = res.AmountMsat // a plugin without the received field
+			}
+			var gi struct {
+				Blockheight uint32 `json:"blockheight"`
+			}
+			if err := l.rpc.call(&gi, "getinfo", map[string]interface{}{}); err != nil {
+				return info, fmt.Errorf("getinfo: %w", err)
+			}
+			info.Tip = gi.Blockheight
+			return info, nil
 		}
 		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w: hold invoice not accepted within %s (last err: %v)", ErrLNLegTimeout, timeout, err)
+			return HeldInfo{}, fmt.Errorf("%w: hold invoice not accepted within %s (last err: %v)", ErrLNLegTimeout, timeout, err)
 		}
-		// Hot path: the taker's HTLC lands within ~a commitment round trip of
-		// the terms exchange, and this poll sat between the two legs of every
-		// swap — a 2s interval alone put seconds on the clock. The lookup is a
-		// local unix-socket RPC; poll tight.
-		time.Sleep(50 * time.Millisecond)
+		if time.Since(start) < time.Second {
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			time.Sleep(time.Second)
+		}
 	}
 }
 
 func (l *clnLNLeg) SettleHold(paymentHash, preimage []byte) error {
+	if len(preimage) != PreimageLen {
+		return fmt.Errorf("%w: %d bytes", ErrBadPreimageLen, len(preimage))
+	}
 	if !hashEqualsPreimage(paymentHash, preimage) {
 		return fmt.Errorf("%w: preimage does not hash to the invoice payment_hash", ErrLNLegInvalid)
 	}

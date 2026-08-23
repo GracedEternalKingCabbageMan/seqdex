@@ -40,9 +40,14 @@ type PlnMakerOps interface {
 	HoldNodeID() (string, error)
 	// RegisterHold registers the incoming hold on h for holdAmtMsat.
 	RegisterHold(h []byte, holdAmtMsat uint64) error
-	// Fulfill waits for the held incoming leg, pays the taker's invoice for
-	// payAmtMsat (learning P), and settles the hold. Cancels on failure. Returns P.
-	Fulfill(h []byte, takerInvoice string, payAmtMsat uint64, holdTimeout time.Duration) ([]byte, error)
+	// Fulfill waits for the held incoming leg (at least holdAmtMsat), pays the
+	// taker's invoice for payAmtMsat (learning P) with its timelock capped below the
+	// hold's expiry, and settles the hold. Cancels on failure. Returns P.
+	Fulfill(h []byte, takerInvoice string, payAmtMsat, holdAmtMsat uint64, holdTimeout time.Duration) ([]byte, error)
+	// HoldCltvFor is the final-hop timelock (incoming-leg blocks) the taker must pay
+	// the hold with for Fulfill to be able to pay takerInvoice safely. 0 = unknown
+	// (a test double); the taker then pays with its own default.
+	HoldCltvFor(takerInvoice string, holdTimeout time.Duration) (uint32, error)
 }
 
 // PlnTakerOps is the settlement seam the taker driver runs against.
@@ -64,8 +69,11 @@ func (o *LivePlnMakerBuyOps) HoldNodeID() (string, error) { return o.Swap.BtcLeg
 func (o *LivePlnMakerBuyOps) RegisterHold(h []byte, amt uint64) error {
 	return o.Swap.MakerRegisterHold(h, amt)
 }
-func (o *LivePlnMakerBuyOps) Fulfill(h []byte, inv string, amt uint64, to time.Duration) ([]byte, error) {
-	return o.Swap.MakerFulfill(h, inv, amt, to)
+func (o *LivePlnMakerBuyOps) Fulfill(h []byte, inv string, amt, hold uint64, to time.Duration) ([]byte, error) {
+	return o.Swap.MakerFulfill(h, inv, amt, hold, to)
+}
+func (o *LivePlnMakerBuyOps) HoldCltvFor(inv string, to time.Duration) (uint32, error) {
+	return o.Swap.HoldCltvForBuy(inv, to)
 }
 
 type LivePlnTakerBuyOps struct{ Swap *xchain.PureLNSwap }
@@ -84,8 +92,11 @@ func (o *LivePlnMakerSellOps) HoldNodeID() (string, error) { return o.Swap.Asset
 func (o *LivePlnMakerSellOps) RegisterHold(h []byte, amt uint64) error {
 	return o.Swap.MakerRegisterHoldSell(h, amt)
 }
-func (o *LivePlnMakerSellOps) Fulfill(h []byte, inv string, amt uint64, to time.Duration) ([]byte, error) {
-	return o.Swap.MakerFulfillSell(h, inv, amt, to)
+func (o *LivePlnMakerSellOps) Fulfill(h []byte, inv string, amt, hold uint64, to time.Duration) ([]byte, error) {
+	return o.Swap.MakerFulfillSell(h, inv, amt, hold, to)
+}
+func (o *LivePlnMakerSellOps) HoldCltvFor(inv string, to time.Duration) (uint32, error) {
+	return o.Swap.HoldCltvForSell(inv, to)
 }
 
 type LivePlnTakerSellOps struct{ Swap *xchain.PureLNSwap }
@@ -214,17 +225,26 @@ func RunMakerPureLN(p MakerPlnParams, in <-chan []byte, send XcSend) (*MakerPlnR
 		return res, fmt.Errorf("pureln maker: bad hash_h %q", inv.HashH)
 	}
 	res.HashH = hashH
-	p.logf("pureln maker: registering hold on H=%s", inv.HashH[:12])
+	// The hold's lifetime is whatever the TAKER pays it with, and the outgoing
+	// invoice's timelock is whatever the taker minted. Derive the hold timelock that
+	// lets us pay that invoice and settle before the hold can expire, and tell the
+	// taker; Fulfill then caps the outgoing route against the hold as actually paid.
+	holdCltv, err := ops.HoldCltvFor(inv.Bolt11, p.HoldTimeout)
+	if err != nil {
+		sendXcFail(p.Crypter, send, "invoice", err.Error())
+		return res, fmt.Errorf("hold cltv for the taker's invoice: %w", err)
+	}
+	p.logf("pureln maker: registering hold on H=%s (taker must pay with final cltv >= %d)", inv.HashH[:12], holdCltv)
 	if err := ops.RegisterHold(hashH, holdAmt); err != nil {
 		sendXcFail(p.Crypter, send, "hold", err.Error())
 		return res, fmt.Errorf("register hold: %w", err)
 	}
-	if err := sendXc(&XcMsg{Type: XcPlnHoldReady, HashH: inv.HashH}, p.Crypter, send); err != nil {
+	if err := sendXc(&XcMsg{Type: XcPlnHoldReady, HashH: inv.HashH, HoldCltv: holdCltv}, p.Crypter, send); err != nil {
 		return res, err
 	}
 
 	// Wait for the taker to lock the incoming leg, pay its invoice (learn P), settle.
-	pre, err := ops.Fulfill(hashH, inv.Bolt11, payAmt, p.HoldTimeout)
+	pre, err := ops.Fulfill(hashH, inv.Bolt11, payAmt, holdAmt, p.HoldTimeout)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "fulfill", err.Error())
 		return res, fmt.Errorf("fulfill: %w", err)
@@ -259,7 +279,8 @@ type TakerPlnParams struct {
 	// offer, reducing to the classic pure-LN lift. For a partial the BTC side is
 	// derived from the signed offer's ratio and required exactly.
 	TakeSeqMsat   uint64
-	FinalCltv     uint32 // final-hop cltv delta for paying the hold (default 18)
+	FinalCltv     uint32 // final-hop cltv delta for paying the hold (default 18); raised to what the maker requires
+	MaxHoldCltv   uint32 // refuse a maker that requires a longer hold than this (default 1440 blocks of the hold leg's chain)
 	PaymentSecret []byte // onion TLV secret; random if nil
 	Timing        XcTiming
 	Log           func(format string, args ...interface{})
@@ -293,6 +314,9 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 	}
 	if p.FinalCltv == 0 {
 		p.FinalCltv = 18
+	}
+	if p.MaxHoldCltv == 0 {
+		p.MaxHoldCltv = 1440
 	}
 	// The taker mints an invoice for its INCOMING leg and pays HOLD into the
 	// maker on its OUTGOING leg. For BUY it receives the asset (invoice=asset) and
@@ -363,10 +387,22 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 	if err := sendXc(&XcMsg{Type: XcPlnAssetInvoice, HashH: hex.EncodeToString(hashH), Bolt11: invoice}, p.Crypter, send); err != nil {
 		return nil, err
 	}
-	if _, err := recvXcType(recv, p.Crypter, XcPlnHoldReady, p.Timing.SeqLockWait); err != nil {
+	ready, err := recvXcType(recv, p.Crypter, XcPlnHoldReady, p.Timing.SeqLockWait)
+	if err != nil {
 		return nil, err
 	}
 	stage("hold-ready")
+	// The maker names the hold timelock it needs to pay our invoice safely. Our
+	// exposure is exactly that long if the maker stalls, so it is honoured up to a
+	// ceiling and refused beyond it (the swap costs nothing to abandon here).
+	finalCltv := p.FinalCltv
+	if ready.HoldCltv > finalCltv {
+		if ready.HoldCltv > p.MaxHoldCltv {
+			sendXcFail(p.Crypter, send, "hold_cltv", fmt.Sprintf("maker asks for a %d-block hold, above our %d ceiling", ready.HoldCltv, p.MaxHoldCltv))
+			return nil, fmt.Errorf("%w: maker requires hold cltv %d > max %d", ErrXcBadTerms, ready.HoldCltv, p.MaxHoldCltv)
+		}
+		finalCltv = ready.HoldCltv
+	}
 
 	// Pay the maker's hold by bare hash; blocks until the maker settles.
 	// Emit H at the moment we commit funds so a caller that is killed mid-pay (e.g. an LSP whose
@@ -375,7 +411,7 @@ func RunTakerPureLN(p TakerPlnParams, send XcSend, recv XcRecv) (*TakerPlnResult
 	if p.Log != nil {
 		p.Log("pureln taker: paying maker hold on H=%s (funds now committed)", hex.EncodeToString(hashH))
 	}
-	revealed, err := p.Ops.PayHold(hashH, terms.MakerLNNodeID, holdAmt, p.FinalCltv, secret)
+	revealed, err := p.Ops.PayHold(hashH, terms.MakerLNNodeID, holdAmt, finalCltv, secret)
 	if err != nil {
 		sendXcFail(p.Crypter, send, "pay_hold", err.Error())
 		return nil, fmt.Errorf("pay hold: %w", err)

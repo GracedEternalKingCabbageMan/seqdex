@@ -155,7 +155,10 @@ func (l *BitcoinLeg) buildSpendTx(in BitcoinSpendInput, locktime uint32, refund 
 		txin.Sequence = 0xfffffffd // non-final (lets nLockTime/CLTV take effect) AND RBF-signalling (BIP125) so the refund is fee-bumpable
 		tx.LockTime = locktime
 	} else {
-		txin.Sequence = 0xffffffff
+		// The claim is the time-critical spend (it must confirm before the
+		// counterparty's CLTV); with nLockTime 0 an RBF-signalling sequence weakens
+		// nothing and lets a stuck claim be fee-bumped.
+		txin.Sequence = 0xfffffffd
 	}
 	tx.AddTxIn(txin)
 	tx.AddTxOut(wire.NewTxOut(int64(in.Amount-in.Fee), in.DestPK))
@@ -496,6 +499,9 @@ func ClassifyBTCHTLCSpendScriptSig(sigScript, redeemScript []byte) (BTCHTLCSpend
 	for _, it := range items {
 		if !it.isData || len(it.data) == 0 {
 			continue
+		}
+		if len(it.data) != PreimageLen {
+			continue // a sha256 match of another length cannot settle a Lightning hold
 		}
 		h := sha256.Sum256(it.data)
 		if bytes.Equal(h[:], hashH) {
