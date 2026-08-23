@@ -58,6 +58,26 @@ func FromConfidential(addr string, net *network.Network) (*AddressInfo, error) {
 	return &AddressInfo{Script: script, BlindingKey: b58.PublicKey}, nil
 }
 
+// FromAny decodes a confidential OR transparent Sequentia address into its output
+// script, with the blinding key present only for the confidential form. Sequentia
+// is transparent by default: a wallet account derives bech32 addresses unless
+// asked for blinded ones, and a decoder that only understood the blinded form
+// returned nil for every transparent address the maker's own account handed it.
+func FromAny(addr string, net *network.Network) (*AddressInfo, error) {
+	conf, err := IsConfidential(addr, net)
+	if err != nil {
+		return nil, err
+	}
+	if conf {
+		return FromConfidential(addr, net)
+	}
+	script, err := ToOutputScript(addr, net)
+	if err != nil {
+		return nil, err
+	}
+	return &AddressInfo{Address: addr, Script: script}, nil
+}
+
 // ToOutputScript builds the output script for any (confidential or not)
 // Sequentia address. It is the network-aware replacement for
 // address.ToOutputScript.
