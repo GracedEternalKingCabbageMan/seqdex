@@ -240,11 +240,27 @@ func (s *Service) CompleteSwap(
 	// swap (the maker's own outputs carry no blinding key and BlindPset is
 	// skipped). blind=true reproduces today's fully-confidential behavior
 	// byte-for-byte; the Elements network fee output is always explicit.
+	// The maker's posture follows its coins, not only the flag: a confidential
+	// input carries blinding factors that only a blinded output can absorb, so
+	// once a selected coin is confidential the maker's own outputs must be
+	// blinded or the tx can never balance (the node rejects it value in != value
+	// out). An account that derives blinded addresses has the key; one that does
+	// not cannot hold such a coin. makerOutKeys remembers each maker output's
+	// available key so a late flip (a confidential FEE coin) can still apply it.
 	outBlindKey := func(bk []byte) string {
 		if !blind {
 			return ""
 		}
 		return hex.EncodeToString(bk)
+	}
+	var makerOutKeys []string
+	spendsConfidential := func(us []ports.Utxo) bool {
+		for _, u := range us {
+			if isConfidentialBlinder(u.GetAssetBlinder()) || isConfidentialBlinder(u.GetValueBlinder()) {
+				return true
+			}
+		}
+		return false
 	}
 	net := s.Network()
 	txManager := s.wallet.Transaction()
@@ -326,6 +342,9 @@ func (s *Service) CompleteSwap(
 		return "", nil, -1, err
 	}
 	giveChange := change
+	if !blind && spendsConfidential(utxos) {
+		blind = true
+	}
 
 	for _, u := range utxos {
 		txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
@@ -354,12 +373,16 @@ func (s *Service) CompleteSwap(
 	if swapRequest.GetFeeAsset() == swapRequest.GetAssetP() && feesToAdd {
 		amountP += swapRequest.GetFeeAmount()
 	}
+	if blind && len(info.BlindingKey) == 0 {
+		return "", nil, -1, fmt.Errorf("account %s spends a confidential coin but derives no blinding key for %s", account, addresses[0])
+	}
 	outputs := []ports.TxOutput{
 		output{
 			swapRequest.GetAssetP(), amountP,
 			hex.EncodeToString(info.Script), outBlindKey(info.BlindingKey),
 		},
 	}
+	makerOutKeys = append(makerOutKeys, hex.EncodeToString(info.BlindingKey))
 	if change > 0 {
 		addresses, err := accountManager.DeriveChangeAddresses(ctx, account, 1)
 		if err != nil {
@@ -373,6 +396,7 @@ func (s *Service) CompleteSwap(
 			swapRequest.GetAssetR(), change, hex.EncodeToString(info.Script),
 			outBlindKey(info.BlindingKey),
 		})
+		makerOutKeys = append(makerOutKeys, hex.EncodeToString(info.BlindingKey))
 	}
 
 	allInputs := append(existingInputs, inputs...)
@@ -507,6 +531,21 @@ func (s *Service) CompleteSwap(
 			txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
 			inputs = append(inputs, input{txid, u.GetIndex(), u.GetScript(), 0, 0})
 		}
+		// A confidential fee coin flips the maker to blinded after its outputs
+		// were built: re-key them from the keys remembered at derivation.
+		if !blind && spendsConfidential(feeUtxos) {
+			blind = true
+			for i := range outputs {
+				if i >= len(makerOutKeys) {
+					break
+				}
+				if makerOutKeys[i] == "" {
+					return "", nil, -1, fmt.Errorf("account %s spends a confidential fee coin but derives no blinding key", feeFundAccount)
+				}
+				o := outputs[i].(output)
+				outputs[i] = output{o.asset, o.amount, o.script, makerOutKeys[i]}
+			}
+		}
 		feeAmount := dummyFeeAmount     // native-equivalent fee (atoms)
 		feeNetAmount := dummyFeeInAsset // fee vout value, denominated in feeAssetNet
 		if change > 0 {
@@ -579,6 +618,20 @@ func (s *Service) CompleteSwap(
 	utxos = append(utxos, feeUtxos...)
 
 	return signedPset, utxos, unlockTime, nil
+}
+
+// isConfidentialBlinder reports whether a utxo blinder (hex) is a real blinding
+// factor. Ocean reports an explicit coin's blinders empty or all zero.
+func isConfidentialBlinder(hexBlinder string) bool {
+	if hexBlinder == "" {
+		return false
+	}
+	for _, c := range hexBlinder {
+		if c != '0' {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) RegisterHandlerForTxEvent(
