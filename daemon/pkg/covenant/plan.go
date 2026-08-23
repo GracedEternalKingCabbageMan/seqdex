@@ -41,6 +41,9 @@ func (o Order) PlanFill(locked, filled uint64, k uint32) (*FillPlan, error) {
 	if remainder != 0 && remainder < o.MinLot {
 		return nil, fmt.Errorf("remainder %d below min_lot %d (would be dust-griefing)", remainder, o.MinLot)
 	}
+	if err := o.CheckArithmetic(locked); err != nil {
+		return nil, err
+	}
 	tap, err := o.Derive()
 	if err != nil {
 		return nil, err

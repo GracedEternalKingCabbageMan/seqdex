@@ -3,6 +3,8 @@ package covenant
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"math/bits"
 )
 
 // Order captures everything a taker needs to (a) verify a resting covenant
@@ -128,7 +130,41 @@ func (o Order) VerifyAgainstSPK(onchainSPK []byte, makerCancellableOK bool) (*Ta
 }
 
 // CeilPrice is required_B = ceil(filled * rateNum / rateDen), rounding in the
-// maker's favour, matching the FILL leaf's on-chain arithmetic.
+// maker's favour, matching the FILL leaf's on-chain arithmetic. The product is
+// formed in 128 bits: a wrapped uint64 product would silently size a fill the
+// chain rejects (or, past 2^63, one the leaf cannot even compute — see
+// CheckArithmetic). Callers gate on CheckArithmetic; this never returns a
+// wrapped value.
 func CeilPrice(filled, rateNum, rateDen uint64) uint64 {
-	return (filled*rateNum + rateDen - 1) / rateDen
+	hi, lo := bits.Mul64(filled, rateNum)
+	lo, carry := bits.Add64(lo, rateDen-1, 0)
+	hi += carry
+	if hi >= rateDen {
+		return math.MaxUint64 // quotient does not fit; CheckArithmetic refuses such orders
+	}
+	q, _ := bits.Div64(hi, lo, rateDen)
+	return q
+}
+
+// MaxLeafProduct is the largest filled*rateNum + rateDen - 1 the FILL leaf can
+// evaluate: OP_MUL64/OP_ADD64 are signed 64-bit and push false on overflow, after
+// which the leaf's OP_VERIFY fails for every fill, full or partial, and the locked
+// asset is reachable only through REFUND at expiry.
+const MaxLeafProduct = math.MaxInt64
+
+// CheckArithmetic reports whether a fill of up to `locked` atoms stays within the
+// leaf's arithmetic. A maker that locks 1e10 atoms against a coprime 4e11-atom
+// price bakes rateNum ≈ 4e11 into the leaf; the product is 4e21, and the order is
+// dead on arrival. Every planner and the relay validator gate on this.
+func (o Order) CheckArithmetic(locked uint64) error {
+	if o.RateNum < 1 || o.RateDen < 1 {
+		return fmt.Errorf("rate %d/%d: numerator and denominator must be >= 1", o.RateNum, o.RateDen)
+	}
+	hi, lo := bits.Mul64(locked, o.RateNum)
+	lo, carry := bits.Add64(lo, o.RateDen-1, 0)
+	hi += carry
+	if hi != 0 || lo > MaxLeafProduct {
+		return fmt.Errorf("locked %d * rate_num %d + rate_den-1 overflows the FILL leaf's signed 64-bit arithmetic (max %d); reduce the rate by its gcd or the order size", locked, o.RateNum, uint64(MaxLeafProduct))
+	}
+	return nil
 }

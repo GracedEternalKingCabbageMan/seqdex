@@ -17,12 +17,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
 
 	seqobv1 "github.com/aejkcs50/seqdex/daemon/api-spec/protobuf/gen/seqob/v1"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/covenant"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"google.golang.org/protobuf/proto"
 )
@@ -247,7 +249,76 @@ func (v *Validator) checkTerms(o *seqobv1.Offer) error {
 	if o.GetLightning() != nil {
 		return v.checkLightning(o)
 	}
+	if o.GetCovenant() != nil {
+		return checkCovenant(o)
+	}
 	return nil
+}
+
+// checkCovenant ties the covenant's baked-in terms to the price the offer
+// advertises. Both are under the maker's signature, but takers price from the
+// offer fields and the chain enforces the terms: a covenant whose rate demands
+// more than want/offer would be paid whatever the leaf requires, and one whose
+// arithmetic overflows the leaf's signed 64-bit OP_MUL64 can never be filled at
+// all (the locked asset waits for REFUND). The relay refuses both up front.
+//
+// Asset A is the offer_asset and asset B the want_asset, in internal byte order;
+// that pairing is checked only when both sides are real 32-byte ids (fixtures use
+// placeholder names).
+func checkCovenant(o *seqobv1.Offer) error {
+	ct := o.GetCovenant()
+	if ct.GetRateNum() < 1 || ct.GetRateDen() < 1 {
+		return fmt.Errorf("covenant rate %d/%d: numerator and denominator must be >= 1", ct.GetRateNum(), ct.GetRateDen())
+	}
+	if ct.GetMinLot() < 1 {
+		return fmt.Errorf("covenant min_lot must be >= 1")
+	}
+	if ct.GetMinLot() > o.GetOfferAmount() {
+		return fmt.Errorf("covenant min_lot %d exceeds the locked amount %d", ct.GetMinLot(), o.GetOfferAmount())
+	}
+	// rate_num/rate_den == want_amount/offer_amount exactly, cross-multiplied in
+	// big.Int: the leaf prices filled*num/den, and a full fill must cost want_amount.
+	lhs := new(big.Int).Mul(new(big.Int).SetUint64(ct.GetRateNum()), new(big.Int).SetUint64(o.GetOfferAmount()))
+	rhs := new(big.Int).Mul(new(big.Int).SetUint64(ct.GetRateDen()), new(big.Int).SetUint64(o.GetWantAmount()))
+	if lhs.Cmp(rhs) != 0 {
+		return fmt.Errorf("covenant rate %d/%d does not equal the offer's want/offer %d/%d", ct.GetRateNum(), ct.GetRateDen(), o.GetWantAmount(), o.GetOfferAmount())
+	}
+	order := covenant.Order{RateNum: ct.GetRateNum(), RateDen: ct.GetRateDen()}
+	if err := order.CheckArithmetic(o.GetOfferAmount()); err != nil {
+		return fmt.Errorf("covenant: %w", err)
+	}
+	if a, ok := internalToDisplay(ct.GetAssetA()); ok {
+		if off, ok := asset32(o.GetOfferAsset()); ok && a != off {
+			return fmt.Errorf("covenant asset_a %s is not the offer_asset %s", a, off)
+		}
+	}
+	if b, ok := internalToDisplay(ct.GetAssetB()); ok {
+		if want, ok := asset32(o.GetWantAsset()); ok && b != want {
+			return fmt.Errorf("covenant asset_b %s is not the want_asset %s", b, want)
+		}
+	}
+	return nil
+}
+
+// asset32 normalises a 32-byte display-order asset id; ok=false for anything else.
+func asset32(s string) (string, bool) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return "", false
+	}
+	return strings.ToLower(s), true
+}
+
+// internalToDisplay converts a 32-byte internal-order asset id to display order.
+func internalToDisplay(s string) (string, bool) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return "", false
+	}
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return hex.EncodeToString(b), true
 }
 
 // checkConfidential enforces the blinded-book invariants on an offer flagged
