@@ -146,7 +146,10 @@ func (s *Service) SendToMany(
 
 		i := 0
 		for asset, amount := range changeAmountPerAsset {
-			info, _ := seqnet.FromConfidential(addresses[i], &net)
+			info, err := seqnet.FromAny(addresses[i], &net)
+			if err != nil {
+				return "", fmt.Errorf("change address %q: %w", addresses[i], err)
+			}
 			outputs = append(outputs, output{
 				asset, amount, hex.EncodeToString(info.Script),
 				hex.EncodeToString(info.BlindingKey),
@@ -181,7 +184,10 @@ func (s *Service) SendToMany(
 		if err != nil {
 			return "", err
 		}
-		info, _ := seqnet.FromConfidential(addresses[0], &net)
+		info, err := seqnet.FromAny(addresses[0], &net)
+		if err != nil {
+			return "", fmt.Errorf("fee change address %q: %w", addresses[0], err)
+		}
 		outputs = append(outputs, output{
 			lbtc, change, hex.EncodeToString(info.Script),
 			hex.EncodeToString(info.BlindingKey),
@@ -337,7 +343,13 @@ func (s *Service) CompleteSwap(
 	if err != nil {
 		return "", nil, -1, err
 	}
-	info, _ := seqnet.FromConfidential(addresses[0], &net)
+	// The account derives TRANSPARENT addresses unless blinded ones were asked
+	// for; decoding them as confidential returned nil and the swap panicked on
+	// info.Script — every same-chain lift against a transparent maker died here.
+	info, err := seqnet.FromAny(addresses[0], &net)
+	if err != nil {
+		return "", nil, -1, fmt.Errorf("receive address %q: %w", addresses[0], err)
+	}
 	amountP := swapRequest.GetAmountP()
 	if swapRequest.GetFeeAsset() == swapRequest.GetAssetP() && feesToAdd {
 		amountP += swapRequest.GetFeeAmount()
@@ -353,7 +365,10 @@ func (s *Service) CompleteSwap(
 		if err != nil {
 			return "", nil, -1, err
 		}
-		info, _ := seqnet.FromConfidential(addresses[0], &net)
+		info, err := seqnet.FromAny(addresses[0], &net)
+		if err != nil {
+			return "", nil, -1, fmt.Errorf("change address %q: %w", addresses[0], err)
+		}
 		outputs = append(outputs, output{
 			swapRequest.GetAssetR(), change, hex.EncodeToString(info.Script),
 			outBlindKey(info.BlindingKey),
@@ -502,7 +517,10 @@ func (s *Service) CompleteSwap(
 				if err != nil {
 					return "", nil, -1, err
 				}
-				info, _ := seqnet.FromConfidential(addresses[0], &net)
+				info, err := seqnet.FromAny(addresses[0], &net)
+				if err != nil {
+					return "", nil, -1, fmt.Errorf("fee change address %q: %w", addresses[0], err)
+				}
 				outputs = append(outputs, output{
 					feeAssetNet, change, hex.EncodeToString(info.Script),
 					outBlindKey(info.BlindingKey),
