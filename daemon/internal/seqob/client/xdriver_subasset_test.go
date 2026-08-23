@@ -398,8 +398,8 @@ func TestSubAssetPartialRejectsWrongBtc(t *testing.T) {
 		AssetAmount: takeAsset, MinBTCConf: 1,
 		Timing: XcTiming{TermsWait: 2 * time.Second, BtcConfWait: 3 * time.Second, SeqLockWait: 3 * time.Second, Poll: 5 * time.Millisecond},
 	}, net.takerSend, net.takerRecv)
-	_ = makerErr
 	wg.Wait()
+	_ = makerErr
 	if takerErr == nil {
 		t.Fatal("taker accepted a non-proportional BTC amount for a partial take")
 	}

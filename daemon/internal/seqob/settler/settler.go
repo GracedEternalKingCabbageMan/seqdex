@@ -11,8 +11,15 @@
 // (a) subscribes to the relay's both-covenant matches, (b) reads the two
 // covenant UTXOs from the chain, (c) plans the joint fill, (d) assembles one tx
 // spending both covenants via their FILL leaves plus its OWN bitcoin fee input,
-// and (e) broadcasts. Anyone may run one; settlers compete permissionlessly and
-// recoup costs from the price spread (a plain fee input suffices for the proof).
+// and (e) broadcasts. Anyone may run one; settlers compete permissionlessly.
+//
+// Economics, as implemented: the joint fill credits each maker exactly what its
+// own leaf demands and hands the whole price improvement between the two
+// crossed orders to the larger side's maker (its remainder re-rests at its own
+// price); the settler keeps nothing and pays the network fee and the gap outputs
+// from its own wallet. It runs at a small, bounded cost per cross, which is the
+// operator's choice on this testnet. A settler-change output at the surplus
+// would let a settler recoup; it is not built.
 //
 // Trust model (non-custodial). The settler never holds user funds and cannot
 // alter a payout. Every maker-facing output — asset, scriptPubKey, minimum value

@@ -304,6 +304,13 @@ func checkCovenant(o *seqobv1.Offer) error {
 	if ct.GetMinLot() < 1 {
 		return fmt.Errorf("covenant min_lot must be >= 1")
 	}
+	// Only the SELL orientation (asset A = the offered base) is served end to end:
+	// the matcher prices a resting BUY covenant in the wrong unit and the crosser's
+	// overlap clamp compares its min_lot in the wrong asset. Nothing posts one; refuse
+	// rather than rest an order every downstream step would mis-size.
+	if o.GetTradeDir() != seqobv1.TradeDir_TRADE_DIR_SELL {
+		return fmt.Errorf("covenant offers must be TRADE_DIR_SELL (asset A is the offered base)")
+	}
 	if ct.GetMinLot() > o.GetOfferAmount() {
 		return fmt.Errorf("covenant min_lot %d exceeds the locked amount %d", ct.GetMinLot(), o.GetOfferAmount())
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -258,7 +259,20 @@ func (s *Server) evictGhostOffersAfterGrace(pubkey string) {
 // while every second beyond that is one where the offer answers other takers with
 // "another lift is in flight". 45s was long enough that a taker retrying down the book
 // collided with offers its own previous attempt had wedged.
-var takerReattachGrace = 15 * time.Second
+var takerReattachGrace = newDurationVar(15 * time.Second)
+
+// durationVar is a duration that background goroutines read while tests (and a
+// future flag) set it: a plain variable written in a test's cleanup while the
+// abandoned-lift goroutine still reads it was a data race under -race.
+type durationVar struct{ ns atomic.Int64 }
+
+func newDurationVar(d time.Duration) *durationVar {
+	v := &durationVar{}
+	v.ns.Store(int64(d))
+	return v
+}
+func (v *durationVar) Get() time.Duration  { return time.Duration(v.ns.Load()) }
+func (v *durationVar) Set(d time.Duration) { v.ns.Store(int64(d)) }
 
 // releaseAbandonedLifts aborts the lift sessions whose TAKER just disconnected and did
 // not come back.
@@ -288,7 +302,7 @@ func (s *Server) releaseAbandonedLifts(c *wsConn) {
 	c.mu.Unlock()
 	for _, sid := range ids {
 		go func(sid string) {
-			time.Sleep(takerReattachGrace)
+			time.Sleep(takerReattachGrace.Get())
 			s.takerMu.Lock()
 			cur, ok := s.takerConns[sid]
 			if ok && cur == c {
