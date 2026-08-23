@@ -29,6 +29,13 @@ import (
 // Must exceed the relay's MinExpiry (30s) so a re-run always posts a valid window.
 const requoteExitMargin = 60 * time.Second
 
+// maxQuoteAge, when set, retires the maker for a re-price no later than this after
+// it posted, regardless of the offer's expiry. The maker has no price feed; its
+// quote is the flag pair for the whole -expiry window (an hour by default), and
+// the supervisor re-runs it at the current price on exit. A one-hour-old quote is
+// a free option on a moving market.
+var maxQuoteAge time.Duration
+
 // requotePending is set when the re-quote came due while a swap was in flight;
 // the session's completion path checks it and exits then. One offer per
 // process, so package scope is exact.
@@ -53,6 +60,12 @@ func requoteDelay(expiresAtUnix uint64, now time.Time) time.Duration {
 // was rejected must re-quote; sitting on a healthy socket with no resting
 // offer is exactly the silent-empty-book failure mode.
 func offerRejected(code uint32, msg string) bool {
+	// A rate-limit refusal means the relay would not take MORE, not that the resting
+	// offer is gone: exiting on it made a ladder re-post storm into a crash loop
+	// (restart, same pubkey, same exhausted budget, rejected again).
+	if strings.Contains(msg, "rate limit") {
+		return false
+	}
 	return code == 400 && strings.Contains(msg, "invalid offer")
 }
 
@@ -61,10 +74,14 @@ func offerRejected(code uint32, msg string) bool {
 // take the loop's own lock inside).
 func armRequoteExit(o *seqobv1.Offer, idle func() bool) {
 	d := requoteDelay(o.GetExpiresAtUnix(), time.Now())
+	reason := "offer expiring"
+	if maxQuoteAge > 0 && (d == 0 || maxQuoteAge < d) {
+		d, reason = maxQuoteAge, "quote older than -max-quote-age"
+	}
 	if d == 0 {
 		return
 	}
-	time.AfterFunc(d, func() { requoteExitIfIdle("offer expiring", idle) })
+	time.AfterFunc(d, func() { requoteExitIfIdle(reason, idle) })
 }
 
 // requoteExitIfIdle exits 0 (supervisor re-runs at a fresh price) when idle;

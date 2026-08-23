@@ -59,6 +59,7 @@ type subAssetMakerConfig struct {
 	spendFee     uint64        // BTC HTLC claim fee target (native sats)
 	holdTimeout  time.Duration // how long the maker waits for the taker to settle after it pays
 	requote      bool          // true = re-post a fresh offer after each settled fill instead of exiting
+	stateDir     string        // per-lift session persistence (P + the taker's on-chain leg once paid)
 }
 
 // buildSubAssetOffer builds a Lightning offer (base=asset, quote=the BTC sentinel)
@@ -220,6 +221,7 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 			}
 			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue)\n", err)
 			ws.redialLoop(wsURL, resubmit)
+			reattachSessions(ws, cfg.makerKey, &mu, inboxes)
 			continue
 		}
 		var from seqobv1.From
@@ -361,8 +363,16 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 					SpendFeeSats:     cfg.spendFee,
 					HoldTimeout:      cfg.holdTimeout,
 					Log:              logf,
+					// P is the only key to the taker's on-chain leg; write it down before the
+					// claim so a crash in between is a retry, not a loss.
+					OnPaid: func(preimage []byte, leg *xchain.LegLock, tBtc uint32) {
+						persistXSessionSubAsset(cfg.stateDir, sid, o.GetOfferId(), preimage, leg, tBtc, cfg.quoteAsset, false, "")
+					},
 				}
 				res, err := client.RunMakerSubAsset(p, in, send)
+				if res != nil && len(res.Preimage) > 0 && res.BtcLeg != nil {
+					persistXSessionSubAsset(cfg.stateDir, sid, o.GetOfferId(), res.Preimage, res.BtcLeg, res.BtcLocktime, cfg.quoteAsset, res.Settled, res.BtcClaimTxid)
+				}
 				if err != nil {
 					fmt.Printf("session %s: sub-asset swap ended: %v\n", sid, err)
 					if res != nil && len(res.Preimage) > 0 && res.BtcClaimTxid == "" {
@@ -400,6 +410,7 @@ func serveSubAsset(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAssetMake
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			releaseDetachedSession(e, &mu, inboxes)
 			if offerRejected(e.GetCode(), e.GetMessage()) {
 				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
 			}

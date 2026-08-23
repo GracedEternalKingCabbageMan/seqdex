@@ -115,7 +115,12 @@ func cmdXSubAsSell(args []string) {
 	}
 	var target *seqobv1.Offer
 	for _, o := range book.GetOffers() {
-		if *offerID != "" && (o.GetOfferId() != *offerID || o.GetMakerPubkey() != *makerPub) {
+		// A named maker is honoured on its own (a retry must find "the same maker,
+		// whatever its offer id is now": the HTLC's claim key is that maker's).
+		if *makerPub != "" && o.GetMakerPubkey() != *makerPub {
+			continue
+		}
+		if *offerID != "" && o.GetOfferId() != *offerID {
 			continue
 		}
 		lt := o.GetLightning()

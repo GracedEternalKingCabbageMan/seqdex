@@ -319,6 +319,7 @@ func (s *Service) CompleteSwap(
 	if err != nil {
 		return "", nil, -1, err
 	}
+	giveChange := change
 
 	for _, u := range utxos {
 		txid, _ := elementsutil.TxIDToBytes(u.GetTxid())
@@ -464,11 +465,27 @@ func (s *Service) CompleteSwap(
 		// Convert the required native-equivalent fee into feeAssetNet (round UP).
 		dummyFeeInAsset := feeInAsset(dummyFeeAmount, feeRate)
 		var change uint64
-		feeUtxos, change, _, err = txManager.SelectUtxos(
-			ctx, feeFundAccount, feeAssetNet, dummyFeeInAsset,
-		)
-		if err != nil {
-			return "", nil, -1, err
+		// When the fee is paid in the asset the give leg already spends, from the same
+		// account, and that leg's change covers it with room for a non-dust remainder,
+		// the fee comes OUT OF THAT CHANGE: no second coin selection. The give leg's
+		// coins are locked by the selection above, and Ocean's spendable query excludes
+		// locked coins, so an account holding its asset in a single UTXO failed every
+		// lift with "insufficient funds" until the coin had been split, and every lift
+		// pinned two coins for the lock window.
+		const changeDustFloor = 1000
+		feeFromGiveChange := feeAssetNet == swapRequest.GetAssetR() && feeFundAccount == account &&
+			giveChange > dummyFeeInAsset+changeDustFloor
+		if feeFromGiveChange {
+			last := outputs[len(outputs)-1].(output)
+			change = giveChange - dummyFeeInAsset
+			outputs[len(outputs)-1] = output{last.asset, change, last.script, last.blindKey}
+		} else {
+			feeUtxos, change, _, err = txManager.SelectUtxos(
+				ctx, feeFundAccount, feeAssetNet, dummyFeeInAsset,
+			)
+			if err != nil {
+				return "", nil, -1, err
+			}
 		}
 
 		for _, u := range feeUtxos {
@@ -478,17 +495,19 @@ func (s *Service) CompleteSwap(
 		feeAmount := dummyFeeAmount     // native-equivalent fee (atoms)
 		feeNetAmount := dummyFeeInAsset // fee vout value, denominated in feeAssetNet
 		if change > 0 {
-			addresses, err := accountManager.DeriveChangeAddresses(
-				ctx, feeFundAccount, 1,
-			)
-			if err != nil {
-				return "", nil, -1, err
+			if !feeFromGiveChange {
+				addresses, err := accountManager.DeriveChangeAddresses(
+					ctx, feeFundAccount, 1,
+				)
+				if err != nil {
+					return "", nil, -1, err
+				}
+				info, _ := seqnet.FromConfidential(addresses[0], &net)
+				outputs = append(outputs, output{
+					feeAssetNet, change, hex.EncodeToString(info.Script),
+					outBlindKey(info.BlindingKey),
+				})
 			}
-			info, _ := seqnet.FromConfidential(addresses[0], &net)
-			outputs = append(outputs, output{
-				feeAssetNet, change, hex.EncodeToString(info.Script),
-				outBlindKey(info.BlindingKey),
-			})
 
 			allInputs := append(existingInputs, inputs...)
 			allOutputs := append(existingOutputs, outputs...)
