@@ -209,6 +209,7 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 			}
 			fmt.Printf("ws read error: %v; reconnecting\n", err)
 			ws.redialLoop(wsURL, resubmit)
+			reattachSessions(ws, cfg.makerKey, &mu, inboxes)
 			continue
 		}
 		var from seqobv1.From
@@ -339,7 +340,7 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 				}
 				res, err := client.RunMakerSubAssetSell(p, in, send)
 				if res != nil && res.BtcLeg != nil {
-					persistXSessionSubAssetSell(cfg.stateDir, sid, o.GetOfferId(), res, refundKey)
+					persistXSessionSubAssetSell(cfg.stateDir, sid, o.GetOfferId(), res, refundKey, cfg.quoteAsset)
 				}
 				if err != nil {
 					fmt.Printf("session %s: sub-asset SELL swap ended: %v\n", sid, err)
@@ -373,6 +374,7 @@ func serveSubAssetSell(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg subAsset
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			releaseDetachedSession(e, &mu, inboxes)
 			if offerRejected(e.GetCode(), e.GetMessage()) {
 				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
 			}

@@ -152,9 +152,10 @@ func main() {
 	quoteAmt := flag.Uint64("quote-amount", 45, "quote size (quote atoms)")
 	feeAsset := flag.String("fee-asset", "", "preferred fee asset hint (any-asset fee market)")
 	expiry := flag.Duration("expiry", time.Hour, "time until the offer expires")
+	quoteAge := flag.Duration("max-quote-age", 0, "retire for a re-price no later than this after posting, regardless of -expiry (0 = only at expiry); the supervisor re-runs at the current price")
 	minAnchor := flag.Uint("min-anchor-depth", 0, "Bitcoin-anchor confs before FILLED (0 = 0-conf tolerant)")
 	confidential := flag.Bool("confidential", false, "post a confidential offer (blinded settlement); default explicit — Sequentia is transparent by default, confidentiality is opt-in")
-	msats := flag.Uint64("msats-per-byte", 110, "network fee rate (milli-sat/vByte); raise if the node rejects for low fee")
+	msats := flag.Uint64("msats-per-byte", 150, "network fee rate (milli-sat/vByte). The default keeps ~50%% headroom over the node's floor: a fee that clears the floor by a hair at build time strands the tx once the fee asset's published rate dips before confirmation")
 	offerID := flag.String("offer-id", "", "offer id (random 16-byte hex if empty)")
 	levels := flag.Int("levels", 1, "samechain: ladder depth — quote this many price levels on this side from ONE process/account (level 0 = the configured price/size; each deeper level rests further from the touch and larger). Every level is a real co-signable offer of this maker")
 	levelBps := flag.Int("level-bps", 40, "samechain ladder: extra distance from the touch per level, in basis points of the quote amount")
@@ -174,7 +175,7 @@ func main() {
 	spendFee := flag.Uint64("spend-fee", 1000, "cross: HTLC spend fee target in native sats (converted per-asset via the fee market)")
 	btcFeeRate := flag.Float64("btc-fee-rate", 2, "cross: sat/vB fee rate for funding the BTC HTLC leg (explicit, so it never depends on the node's estimatesmartfee/settxfee; 0 = node default)")
 	xstateDir := flag.String("xstate-dir", "xmaker-sessions", "cross: directory for per-lift session state (keys/legs; the recovery material)")
-	resume := flag.Bool("resume", false, "cross: instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund) and exit")
+	resume := flag.Bool("resume", false, "instead of serving, finish every non-terminal session in -xstate-dir (post-restart on-chain claim/refund: cross, submarine, submarine-reverse, subasset, subasset-sell) and exit; pass -maker-priv for sub-asset BUY claims")
 	lnSocket := flag.String("ln-socket", "", "lightning/pureln: the maker's SeqLN-on-Bitcoin lightning-rpc unix socket (BTC leg; required for -mode lightning and -mode pureln)")
 	subAnchor := flag.Int64("sub-anchor-depth", 3, "lightning: Bitcoin-anchor depth the maker requires on the taker's asset funding before it pays the invoice (>=2; the submarine cross-leg safety gate)")
 	max0conf := flag.Uint64("max-0conf", 0, "lightning: 0-conf LP-fronting cap (asset atoms). Trades whose on-chain asset leg is <= this settle INSTANTLY (skip the anchor-bury wait); the maker/taker fronts the Bitcoin-reorg risk. Advertised in the offer's LightningTerms. 0 = disabled (always anchor-gate).")
@@ -185,12 +186,24 @@ func main() {
 	holdTimeout := flag.Duration("hold-timeout", 2*time.Minute, "pureln: how long the maker waits for the taker to lock its hold and then fulfills before giving up")
 	requote := flag.Bool("requote", false, "cross/lightning/pureln: after each settled fill, reconnect dropped channel peers and re-post a FRESH offer (same offer id) instead of cancelling and exiting; keeps a live quote without a manual restart (default off = quote once then exit)")
 	flag.Parse()
+	// Secrets and RPC URLs may come from the environment instead of the command line,
+	// where `ps` shows them to every user on the box: SEQOB_MAKER_PRIV, SEQOB_BTC_RPC,
+	// SEQOB_XSEQ_RPC, SEQOB_NODE_RPC. A flag given explicitly wins.
+	envDefault(makerPriv, "SEQOB_MAKER_PRIV")
+	envDefault(btcRPCURL, "SEQOB_BTC_RPC")
+	envDefault(xseqRPCURL, "SEQOB_XSEQ_RPC")
+	envDefault(nodeRPC, "SEQOB_NODE_RPC")
 	// A reprice must never kill this process mid-swap; drain first (see armGracefulShutdown).
 	armGracefulShutdown(15 * time.Minute)
 
 	// Cross resume needs no maker key or offer: it drives on-chain settlement
 	// from persisted per-session keys. Handle it before the key/offer setup.
-	if strings.ToLower(*mode) == "cross" && *resume {
+	if *resume {
+		// The sub-asset BUY claim key is the identity key; a refund key is persisted
+		// per session. Only a key given explicitly is used here, never a generated one.
+		if *makerPriv != "" {
+			resumeIdentity = loadOrGenKey(*makerPriv)
+		}
 		resumeCrossSessions(*xstateDir, *btcRPCURL, *btcWallet, *btcChainName, *xseqRPCURL, *xseqWallet, *spendFee, *btcFeeRate, *lnSocket)
 		return
 	}
@@ -204,6 +217,7 @@ func main() {
 		fatal("-account is required (the Ocean account holding the offer asset)")
 	}
 
+	maxQuoteAge = *quoteAge
 	makerKey := loadOrGenKey(*makerPriv)
 	makerPubHex := hex.EncodeToString(makerKey.PubKey().SerializeCompressed())
 	ctx := context.Background()
@@ -237,6 +251,7 @@ func main() {
 			quoteAsset: *quoteAsset, seqRPCURL: *xseqRPCURL, seqWallet: *xseqWallet,
 			assetLnSock: *assetLnSocket, btcDelta: uint32(*btcDelta), minBTCConf: *minBTCConf,
 			spendFee: *spendFee, holdTimeout: *holdTimeout, requote: *requote,
+			stateDir: *xstateDir,
 		})
 		return
 	}
@@ -331,6 +346,12 @@ func main() {
 	if *levels < 1 {
 		fatal("-levels must be >= 1")
 	}
+	if *levelBps < 0 || *levels*(*levelBps) >= 10000 {
+		fatal("-level-bps must be >= 0 and -levels x -level-bps below 10000 (a negative bps makes deeper SELL rungs cheaper; past 100%% a BUY rung prices below zero)")
+	}
+	if *levelGrowth < 1 {
+		fatal("-level-growth must be >= 1 (a shrinking rung rounds to a size the relay refuses)")
+	}
 	ladder := make([]*seqobv1.Offer, 0, *levels)
 	for i := 0; i < *levels; i++ {
 		grow := math.Pow(*levelGrowth, float64(i))
@@ -358,6 +379,12 @@ func main() {
 		}
 		ladder = append(ladder, lo)
 	}
+	// A ladder advertises the SUM of its rungs, all funded from one account: ten
+	// rungs at 12% growth sum to 17.5x the base size. Depth the account cannot fund is
+	// phantom depth — the lift fails in coin selection after the taker built and
+	// couriered its PSET, which the relay's ghost filter cannot see. Trim the deepest
+	// rungs to what the account holds; refuse outright if even the first does not fit.
+	ladder = trimLadderToBalance(ctx, svc, *account, ladder)
 
 	// Maker-only backend: the LiveWallet only calls ResponderComplete, which uses
 	// CompleteSwapFn. Wire it to the blind-aware CompleteSwap; the taker-side seams
@@ -600,12 +627,16 @@ func serve(conn *websocket.Conn, makers map[string]*client.Maker, ladder []*seqo
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
-			// B1: a relay error can mean our offer was rejected/evicted (rate limit, expired) and is now
-			// off-book — the relay validates a submit ASYNC and reports rejection here, not as a write
-			// error. Re-post it (rate-limited, so a persistent-error loop can't storm the relay) so we
-			// don't sit silently unliftable on a still-open connection.
-			if !repost(conn, "after relay error") && offerRejected(e.GetCode(), e.GetMessage()) {
-				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+			// B1: a relay error can mean our offer was rejected/evicted (expired, bad window) and is
+			// now off-book — the relay validates a submit ASYNC and reports rejection here, not as
+			// a write error. Re-post on THAT (rate-limited), never on every error frame: a re-post
+			// re-signs every ladder level and each one is charged against the per-pubkey budget,
+			// so re-posting on a benign 409 or on a rate-limit refusal turned one error into a
+			// storm and then into a restart loop.
+			if offerRejected(e.GetCode(), e.GetMessage()) {
+				if !repost(conn, "after relay rejection") {
+					requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
+				}
 			}
 		}
 	}
@@ -719,25 +750,42 @@ func crossReRestRemainder(base, filledSeq, minFill uint64) (remainder uint64, re
 // timeout no longer strands the maker's asset leg. FORWARD sessions only for
 // now (the direction served today); reverse resume lands with reverse serving.
 func resumeCrossSessions(dir, btcRPCURL, btcWallet, btcChainName, seqRPCURL, seqWallet string, spendFee uint64, btcFeeRate float64, lnSocket string) {
-	if btcRPCURL == "" || seqRPCURL == "" {
-		fatal("-resume requires -btc-rpc and -xseq-rpc")
+	if btcRPCURL == "" && seqRPCURL == "" {
+		fatal("-resume requires -btc-rpc and/or -xseq-rpc (the chains the persisted legs live on)")
 	}
-	btcRPC, err := rpcFromURL(btcRPCURL)
-	if err != nil {
-		fatal("-btc-rpc: %v", err)
+	var btcChain *xchain.BitcoinChain
+	var seqChain *xchain.Chain
+	if btcRPCURL != "" {
+		btcRPC, err := rpcFromURL(btcRPCURL)
+		if err != nil {
+			fatal("-btc-rpc: %v", err)
+		}
+		params, err := xchain.BitcoinChainParams(btcChainName)
+		if err != nil {
+			fatal("-btc-chain: %v", err)
+		}
+		btcChain = xchain.NewBitcoinChain(btcRPC, btcWallet, params)
+		btcChain.SetFeeRate(btcFeeRate)
 	}
-	seqRPC, err := rpcFromURL(seqRPCURL)
-	if err != nil {
-		fatal("-xseq-rpc: %v", err)
+	if seqRPCURL != "" {
+		seqRPC, err := rpcFromURL(seqRPCURL)
+		if err != nil {
+			fatal("-xseq-rpc: %v", err)
+		}
+		seqChain = xchain.NewChain(seqRPC, seqWallet)
 	}
-	params, err := xchain.BitcoinChainParams(btcChainName)
-	if err != nil {
-		fatal("-btc-chain: %v", err)
-	}
-	btcChain := xchain.NewBitcoinChain(btcRPC, btcWallet, params)
-	btcChain.SetFeeRate(btcFeeRate)
-	seqChain := xchain.NewChain(seqRPC, seqWallet)
 	drivePendingCrossSessions(dir, btcChain, seqChain, spendFee, lnSocket)
+}
+
+// resumeIdentity is the -maker-priv key handed to -resume for directions whose
+// claim key is the identity key (sub-asset BUY). nil when not given.
+var resumeIdentity *btcec.PrivateKey
+
+func resumeIdentityKey() *xchain.Key {
+	if resumeIdentity == nil {
+		return nil
+	}
+	return xchain.KeyFromBytes(resumeIdentity.Serialize())
 }
 
 // drivePendingCrossSessions scans dir for non-terminal cross sessions and re-drives each to settlement
@@ -794,6 +842,18 @@ func drivePendingCrossSessions(dir string, btcChain *xchain.BitcoinChain, seqCha
 				defer wg.Done()
 				resumeSubmarineSession(&st, seqChain, lnSocket, spendFee, dir, name)
 			}(name, st)
+			continue
+		}
+		if st.Direction == "submarine-reverse" || st.Direction == "subasset-sell" || st.Direction == "subasset" {
+			wg.Add(1)
+			go func(name string, st xmakerSessionState) {
+				defer wg.Done()
+				resumeTimelockSession(&st, btcChain, seqChain, spendFee, dir, name)
+			}(name, st)
+			continue
+		}
+		if btcChain == nil || seqChain == nil {
+			fmt.Printf("%s: a %q session needs both -btc-rpc and -xseq-rpc to resume; skipping\n", name, st.Direction)
 			continue
 		}
 		if st.Direction == "reverse" {
@@ -1042,6 +1102,43 @@ func utxosToSwapUnblinded(utxos []ports.Utxo) []swap.UnblindedInput {
 		})
 	}
 	return ins
+}
+
+// trimLadderToBalance drops the deepest rungs until the ladder's total give-side
+// amount fits the account's confirmed balance of the give asset.
+func trimLadderToBalance(ctx context.Context, svc application.WalletService, account string, ladder []*seqobv1.Offer) []*seqobv1.Offer {
+	if len(ladder) == 0 {
+		return ladder
+	}
+	bals, err := svc.Account().GetBalance(ctx, account)
+	if err != nil {
+		fmt.Printf("ladder: cannot read account %q balance (%v); posting unchecked\n", account, err)
+		return ladder
+	}
+	giveAsset := ladder[0].GetOfferAsset()
+	var have uint64
+	if b, ok := bals[giveAsset]; ok {
+		have = b.GetConfirmedBalance()
+	}
+	var total uint64
+	for i, lo := range ladder {
+		if total+lo.GetOfferAmount() > have {
+			if i == 0 {
+				fatal("account %q holds %d of %s but even the first rung gives %d; fund it or lower -base-amount/-quote-amount", account, have, giveAsset, lo.GetOfferAmount())
+			}
+			fmt.Printf("ladder: account %q holds %d of %s; keeping %d of %d rungs (the rest would be phantom depth)\n", account, have, giveAsset, i, len(ladder))
+			return ladder[:i]
+		}
+		total += lo.GetOfferAmount()
+	}
+	return ladder
+}
+
+// envDefault fills an empty flag value from the named environment variable.
+func envDefault(flagVal *string, env string) {
+	if *flagVal == "" {
+		*flagVal = os.Getenv(env)
+	}
 }
 
 func loadOrGenKey(hexKey string) *btcec.PrivateKey {
@@ -1309,25 +1406,7 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			// The relay has implemented an authenticated session_reattach all along; nothing
 			// had ever sent one. Re-proving the offer key suffices: it is the maker's session
 			// key and the relay already holds it for this session, so no new trust appears.
-			mu.Lock()
-			live := make([]string, 0, len(inboxes))
-			for sid := range inboxes {
-				live = append(live, sid)
-			}
-			mu.Unlock()
-			for _, sid := range live {
-				if e := ws.write(&seqobv1.To{Msg: &seqobv1.To_SessionReattach{
-					SessionReattach: &seqobv1.SessionReattach{
-						SessionId: sid,
-						Role:      "maker",
-						Sig:       offer.SignReattach(sid, "maker", cfg.makerKey),
-					}}}); e != nil {
-					fmt.Printf("reconnect: re-attach of session %s FAILED: %v"+
-						" (its courier frames are stranded; the lift will time out)\n", sid, e)
-					continue
-				}
-				fmt.Printf("reconnect: re-attached session %s; couriered frames resume\n", sid)
-			}
+			reattachSessions(ws, cfg.makerKey, &mu, inboxes)
 			continue
 		}
 		var from seqobv1.From
@@ -1622,20 +1701,61 @@ func serveCross(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg crossMakerConfi
 			// Closing that session's inbox makes the driver's next receive return "session closed", so
 			// it unwinds through its normal error path and the deferred accounting frees the slot. No
 			// value is at risk: an abandoned lift is pre-lock by construction — the taker never funded.
-			if sid := sessionFromNotAttached(e.GetCode(), e.GetMessage()); sid != "" {
-				mu.Lock()
-				if in, ok := inboxes[sid]; ok {
-					delete(inboxes, sid)
-					close(in)
-					fmt.Printf("session %s: taker detached; releasing the lift slot\n", sid)
-				}
-				mu.Unlock()
-			}
+			releaseDetachedSession(e, &mu, inboxes)
 			if offerRejected(e.GetCode(), e.GetMessage()) {
 				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
 			}
 		}
 	}
+}
+
+// reattachSessions re-binds every in-flight courier session to a freshly dialled
+// socket. On the relay a role's courier frames are pumped by a goroutine started in
+// attach(), which exits when its connection closes; a new connection carries no
+// binding, so without this the counterparty's next frame is queued to nobody and
+// both sides wait out their deadlines with funds possibly locked. The cross loop
+// has done this since the rail-crossing take that died of it; the other loops
+// dialled back and went silent.
+func reattachSessions(ws *crossWS, makerKey *btcec.PrivateKey, mu *sync.Mutex, inboxes map[string]chan []byte) {
+	mu.Lock()
+	live := make([]string, 0, len(inboxes))
+	for sid := range inboxes {
+		live = append(live, sid)
+	}
+	mu.Unlock()
+	for _, sid := range live {
+		if e := ws.write(&seqobv1.To{Msg: &seqobv1.To_SessionReattach{
+			SessionReattach: &seqobv1.SessionReattach{
+				SessionId: sid,
+				Role:      "maker",
+				Sig:       offer.SignReattach(sid, "maker", makerKey),
+			}}}); e != nil {
+			fmt.Printf("reconnect: re-attach of session %s FAILED: %v (its courier frames are stranded; the lift will time out)\n", sid, e)
+			continue
+		}
+		fmt.Printf("reconnect: re-attached session %s; couriered frames resume\n", sid)
+	}
+}
+
+// releaseDetachedSession frees the lift slot of a session whose taker the relay
+// reports as gone ("the taker is not attached to session <id>", 409): closing the
+// inbox makes the driver's next receive return "session closed", so it unwinds
+// through its normal error path and the deferred accounting frees the slot. An
+// abandoned lift is pre-lock by construction — the taker never funded — so nothing
+// is at risk; what was at risk was every other taker being told "busy" for the
+// rest of a multi-hour driver deadline.
+func releaseDetachedSession(e *seqobv1.GenericError, mu *sync.Mutex, inboxes map[string]chan []byte) {
+	sid := sessionFromNotAttached(e.GetCode(), e.GetMessage())
+	if sid == "" {
+		return
+	}
+	mu.Lock()
+	if in, ok := inboxes[sid]; ok {
+		delete(inboxes, sid)
+		close(in)
+		fmt.Printf("session %s: taker detached; releasing the lift slot\n", sid)
+	}
+	mu.Unlock()
 }
 
 // sessionFromNotAttached returns the session id out of the relay's "counterparty is not attached to
@@ -1669,6 +1789,7 @@ type xmakerSessionState struct {
 	BtcRefundPrivHex   string `json:"btc_refund_priv_hex,omitempty"`   // reverse: refunds our BTC leg
 	BtcRefundTx        string `json:"btc_refund_tx,omitempty"`         // reverse
 	BtcLocktime        uint32 `json:"btc_locktime,omitempty"`
+	BtcLegBackend      string `json:"btc_leg_backend,omitempty"` // sub-asset rails: "bitcoin" | "seq:<quote asset>" (the chain the on-chain leg lives on)
 	SeqLocktime        uint32 `json:"seq_locktime,omitempty"`
 	BtcLegTxid         string `json:"btc_leg_txid,omitempty"`
 	BtcLegVout         uint32 `json:"btc_leg_vout"`
@@ -1868,7 +1989,7 @@ func persistXSessionSubmarineReverse(dir, sid, offerID string, r *client.MakerRe
 // persistXSessionSubAssetSell records a sub-asset SELL maker lift whose BTC (or
 // quote-asset) HTLC is funded and not yet settled, so the leg can be reclaimed at
 // T_btc with the identity-derived refund key.
-func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAssetSellResult, refund *xchain.Key) {
+func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAssetSellResult, refund *xchain.Key, quoteAsset string) {
 	if dir == "" {
 		dir = "xmaker-sessions"
 	}
@@ -1878,9 +1999,10 @@ func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAss
 	}
 	st := xmakerSessionState{
 		SessionID: sid, OfferID: offerID, Direction: "subasset-sell",
-		BtcLocktime: r.BtcLocktime,
-		Settled:     r.Settled,
-		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		BtcLocktime:   r.BtcLocktime,
+		BtcLegBackend: onchainBackend(quoteAsset),
+		Settled:       r.Settled,
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
 	if len(r.HashH) > 0 {
 		st.HashHex = hex.EncodeToString(r.HashH)
@@ -1891,6 +2013,45 @@ func persistXSessionSubAssetSell(dir, sid, offerID string, r *client.MakerSubAss
 	if r.BtcLeg != nil && r.BtcLeg.Funded != nil {
 		st.BtcLegTxid, st.BtcLegVout, st.BtcLegAmount = r.BtcLeg.Funded.TxID, r.BtcLeg.Funded.Vout, r.BtcLeg.Funded.Amount
 		st.BtcLegScriptHex = hex.EncodeToString(r.BtcLeg.Script)
+	}
+	writeSessionState(dir, sid, &st)
+}
+
+// onchainBackend names the chain a sub-asset rail's on-chain leg lives on: "bitcoin"
+// for the parent chain, or "seq:<asset>" for the mixed same-chain shape where a
+// Sequentia quote asset stands in BTC's place.
+func onchainBackend(quoteAsset string) string {
+	if quoteAsset == "" {
+		return "bitcoin"
+	}
+	return "seq:" + quoteAsset
+}
+
+// persistXSessionSubAsset records a sub-asset BUY maker lift from the moment P is
+// learned: the taker's on-chain leg is then claimable with P and the identity key
+// until T_btc, and only a record on disk makes a crash before the claim a retry.
+func persistXSessionSubAsset(dir, sid, offerID string, preimage []byte, leg *xchain.LegLock, tBtc uint32, quoteAsset string, settled bool, claimTxid string) {
+	if dir == "" {
+		dir = "xmaker-sessions"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Printf("session %s: persist mkdir: %v\n", sid, err)
+		return
+	}
+	st := xmakerSessionState{
+		SessionID: sid, OfferID: offerID, Direction: "subasset",
+		BtcLocktime:   tBtc,
+		BtcLegBackend: onchainBackend(quoteAsset),
+		SecretHex:     hex.EncodeToString(preimage),
+		BtcClaimTxid:  claimTxid,
+		Settled:       settled,
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	h := sha256.Sum256(preimage)
+	st.HashHex = hex.EncodeToString(h[:])
+	if leg != nil && leg.Funded != nil {
+		st.BtcLegTxid, st.BtcLegVout, st.BtcLegAmount = leg.Funded.TxID, leg.Funded.Vout, leg.Funded.Amount
+		st.BtcLegScriptHex = hex.EncodeToString(leg.Script)
 	}
 	writeSessionState(dir, sid, &st)
 }

@@ -190,6 +190,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 			}
 			fmt.Printf("ws read error: %v; reconnecting (in-flight settlements continue)\n", err)
 			ws.redialLoop(wsURL, resubmit)
+			reattachSessions(ws, cfg.makerKey, &mu, inboxes)
 			continue
 		}
 		var from seqobv1.From
@@ -417,6 +418,7 @@ func serveSubmarine(ws *crossWS, wsURL string, o *seqobv1.Offer, cfg submarineMa
 		case from.GetError() != nil:
 			e := from.GetError()
 			fmt.Printf("relay error %d: %s\n", e.GetCode(), e.GetMessage())
+			releaseDetachedSession(e, &mu, inboxes)
 			if offerRejected(e.GetCode(), e.GetMessage()) {
 				requoteExitIfIdle("relay rejected our offer ("+e.GetMessage()+")", idle)
 			}

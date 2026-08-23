@@ -257,6 +257,10 @@ type MakerSubAssetParams struct {
 	SpendFeeSats     uint64        // BTC HTLC claim fee target in native sats (default 1000)
 	HoldTimeout      time.Duration // how long to wait for the taker to settle after we pay (default 2m)
 	MakerBtcClaimKey *xchain.Key   // the key that claims the BTC HTLC (minted if nil)
+	// OnPaid is invoked the instant the asset is paid and P is learned, BEFORE the
+	// on-chain claim, with the verified leg and its refund height: a crash between
+	// paying (irreversible) and claiming must leave P and the leg on disk.
+	OnPaid func(preimage []byte, leg *xchain.LegLock, btcLocktime uint32)
 	Timing           XcTiming
 	Log              func(format string, args ...interface{})
 }
@@ -266,6 +270,8 @@ type MakerSubAssetResult struct {
 	Preimage     []byte
 	BtcClaimTxid string
 	Settled      bool
+	BtcLeg       *xchain.LegLock // the taker's verified on-chain leg (nil before verification)
+	BtcLocktime  uint32
 	// Partial fills (T8): the asset atoms + BTC sats this lift ACTUALLY took (<= the
 	// offer). For a whole-offer lift these equal the offer amounts; the maker's serve
 	// loop re-rests the remainder (offer - filled) when they are smaller.
@@ -504,6 +510,11 @@ func RunMakerSubAsset(p MakerSubAssetParams, in <-chan []byte, send XcSend) (*Ma
 		return res, fmt.Errorf("subasset maker: settled preimage does not hash to H")
 	}
 	res.Preimage = preimage
+	res.BtcLeg = verified.Leg
+	res.BtcLocktime = tBtc
+	if p.OnPaid != nil {
+		p.OnPaid(preimage, verified.Leg, tBtc)
+	}
 	p.logf("subasset maker: asset paid + settled; learned P; claiming BTC HTLC")
 
 	// 6. Feed P into the BTC-leg hashlock, then claim the on-chain BTC HTLC with it.
