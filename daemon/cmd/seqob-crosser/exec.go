@@ -30,8 +30,9 @@ package main
 //     asset A.
 
 import (
+	"sync"
+	"syscall"
 	"bufio"
-	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -280,10 +281,15 @@ func (e *Executor) appendSubAssetChain(args []string, n *NormOrder) []string {
 // is decided by the CLIs' OWN contract: every taker command prints "SWAP
 // SETTLED" exactly once on success — and some (xsubbuy) exit 0 on failure, so
 // the exit code alone is NOT trusted.
+// committedMarkers are the CLI log lines after which the leg has value on the
+// line (an HTLC funded, a Lightning hold being paid). A CLI past one of these is
+// never killed: SIGKILL mid-pay loses the preimage a settle would reveal, and
+// mid-fund leaves a leg only the state file knows about. It gets an extended
+// deadline and then a SIGTERM, which the CLIs handle by persisting and exiting.
+var committedMarkers = []string{"leg funded", "HTLC funded", "funds now committed", "paying ", "PAID"}
+
 func (e *Executor) runCLI(args []string) (settled bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), e.Caps.LegTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, e.Caps.SeqobCli, args...)
+	cmd := exec.Command(e.Caps.SeqobCli, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return false, err
@@ -292,6 +298,43 @@ func (e *Executor) runCLI(args []string) (settled bool, err error) {
 	if err := cmd.Start(); err != nil {
 		return false, fmt.Errorf("start %s %s: %w", e.Caps.SeqobCli, args[0], err)
 	}
+	var (
+		mu        sync.Mutex
+		committed bool
+		timedOut  bool
+	)
+	done := make(chan struct{})
+	go func() {
+		// Soft deadline: a CLI that has committed nothing is told to stop (SIGTERM,
+		// then SIGKILL after a grace); one that has committed funds gets four times
+		// the leg timeout, then only a SIGTERM.
+		soft := time.NewTimer(e.Caps.LegTimeout)
+		defer soft.Stop()
+		select {
+		case <-done:
+			return
+		case <-soft.C:
+		}
+		mu.Lock()
+		wasCommitted := committed
+		timedOut = true
+		mu.Unlock()
+		if !wasCommitted {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				_ = cmd.Process.Kill()
+			}
+			return
+		}
+		e.Logf("  [%s] past the %s leg timeout with funds committed; waiting for it to finish (no kill)", args[0], e.Caps.LegTimeout)
+		select {
+		case <-done:
+		case <-time.After(4 * e.Caps.LegTimeout):
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+	}()
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var lastLines []string
@@ -300,6 +343,14 @@ func (e *Executor) runCLI(args []string) (settled bool, err error) {
 		if strings.Contains(line, "SWAP SETTLED") {
 			settled = true
 		}
+		for _, m := range committedMarkers {
+			if strings.Contains(line, m) {
+				mu.Lock()
+				committed = true
+				mu.Unlock()
+				break
+			}
+		}
 		lastLines = append(lastLines, line)
 		if len(lastLines) > 20 {
 			lastLines = lastLines[1:]
@@ -307,10 +358,14 @@ func (e *Executor) runCLI(args []string) (settled bool, err error) {
 		e.Logf("  [%s] %s", args[0], line)
 	}
 	waitErr := cmd.Wait()
+	close(done)
+	mu.Lock()
+	wasTimeout := timedOut
+	mu.Unlock()
 	switch {
 	case settled:
 		return true, nil
-	case ctx.Err() != nil:
+	case wasTimeout:
 		return false, fmt.Errorf("%s timed out after %s", args[0], e.Caps.LegTimeout)
 	case waitErr != nil:
 		return false, fmt.Errorf("%s: %v (tail: %s)", args[0], waitErr, strings.Join(lastLines, " | "))

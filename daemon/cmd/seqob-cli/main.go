@@ -141,7 +141,7 @@ func cmdPost(args []string) {
 	quoteAmt := fs.Uint64("quote-amount", 45, "quote size (quote atoms)")
 	expiry := fs.Duration("expiry", time.Hour, "time until the offer expires")
 	feeAsset := fs.String("fee-asset", "", "preferred fee asset hint (any-asset fee market)")
-	recvAddr := fs.String("recv-addr", "el1qq-demo-recv-addr", "maker receive address (blinded only for a confidential offer)")
+	recvAddr := fs.String("recv-addr", "", "maker receive address (required; blinded only for a confidential offer)")
 	id := fs.String("id", "", "offer id (random 16-byte hex if empty)")
 	confidential := fs.Bool("confidential", false, "post to the blinded book: requires a blech32 -recv-addr and -blinding-pub")
 	blindingPub := fs.String("blinding-pub", "", "maker blinding pubkey (33-byte compressed hex; required with -confidential)")
@@ -149,6 +149,9 @@ func cmdPost(args []string) {
 	lnNode := fs.String("ln-node", "", "maker LN node pubkey (33-byte compressed hex; required for pure-LN and reverse-submarine directions)")
 	lnCltv := fs.Uint("ln-cltv", 240, "advisory CLTV delta for the Lightning offer's on-chain leg")
 	_ = fs.Parse(args)
+	if *recvAddr == "" {
+		fatal("post requires -recv-addr (a placeholder address posts an offer nobody can settle)")
+	}
 
 	k := loadOrGenKey(*priv)
 	o := &seqobv1.Offer{

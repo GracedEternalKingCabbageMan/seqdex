@@ -56,7 +56,7 @@ func cmdXSubBuy(args []string) {
 	asset := fs.String("asset", "", "Sequentia asset id (hex) to buy with BTC-LN (required)")
 	offerID := fs.String("offer-id", "", "offer id to lift (empty: first verified REVERSE lightning offer for -asset)")
 	makerPub := fs.String("maker-pubkey", "", "maker pubkey of the offer (with -offer-id)")
-	priv := fs.String("priv", "", "taker SESSION secret key (32-byte hex, E2E only); generated if empty")
+	priv := fs.String("priv", "", "DEPRECATED and ignored: the taker session key is minted fresh per run. A reused session key derives the same courier key with the same maker for every lift, which lets a relay replay one session's frames into another")
 	seqRPCURL := fs.String("seq-rpc", "", "Sequentia node RPC URL http://user:pass@host:port (required)")
 	seqWallet := fs.String("seq-wallet", "", "Sequentia node wallet receiving the asset")
 	lnSocket := fs.String("ln-socket", "", "the taker's SeqLN-on-Bitcoin lightning-rpc unix socket (pays the invoice) (required)")
@@ -160,7 +160,8 @@ func cmdXSubBuy(args []string) {
 	fmt.Printf("session state -> %s\n", *stateFile)
 
 	// 4. Open the lift session.
-	takerKey := loadOrGenKey(*priv)
+	_ = priv // deprecated: never reuse a session key across lifts
+	takerKey := loadOrGenKey("")
 	wsURL := "ws" + strings.TrimPrefix(*relay, "http") + "/v1/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
