@@ -89,6 +89,26 @@ func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidential
 	if err != nil {
 		return nil, err
 	}
+	// Mirror NewSwapTx's internal coin selection: only the SELECTED utxos become
+	// PSET inputs, so the UnblindedInputs must cover exactly those, in the same
+	// order. Passing every fetched utxo causes "unblinded input index N out of
+	// range" once the taker also holds other utxos (e.g. an asset received from a
+	// prior swap). SelectUnspents is deterministic on the same input slice, so it
+	// reproduces NewSwapTx's selection.
+	selected, _, err := explorer.SelectUnspents(utxos, req.PayAmount, req.PayAsset)
+	if err != nil {
+		return nil, err
+	}
+	// The taker's posture is what its coins ARE, not what a flag says. A
+	// confidential input carries blinding factors that only a blinded output can
+	// absorb, so a swap spending one with every output explicit can never balance
+	// (the node rejects it value in != value out). Whenever a selected coin is
+	// confidential the taker's receive and change outputs are blinded with its own
+	// key, whatever the flag said; the maker then sees real blinders and blinds.
+	if anyConfidential(selected) {
+		conf.TakerInputsConfidential = true
+		conf.TakerRecvConfidential = true
+	}
 	// Confidential receive output gets the taker's blinding key; explicit gets nil
 	// so NewSwapTx leaves the output unblinded.
 	var outBlindingKey []byte
@@ -100,16 +120,6 @@ func (b *RealBackend) ProposerBuildRequest(req ProposalReq, conf LegConfidential
 		utxos, req.PayAsset, req.RecvAsset, req.PayAmount, req.RecvAmount,
 		outScript, outBlindingKey,
 	)
-	if err != nil {
-		return nil, err
-	}
-	// Mirror NewSwapTx's internal coin selection: only the SELECTED utxos become
-	// PSET inputs, so the UnblindedInputs must cover exactly those, in the same
-	// order. Passing every fetched utxo causes "unblinded input index N out of
-	// range" once the taker also holds other utxos (e.g. an asset received from a
-	// prior swap). SelectUnspents is deterministic on the same input slice, so it
-	// reproduces NewSwapTx's selection.
-	selected, _, err := explorer.SelectUnspents(utxos, req.PayAmount, req.PayAsset)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +259,16 @@ func rawTxHex(signedPSET string) (string, error) {
 // utxosToUnblinded mirrors pkg/trade's proposer unblinded-input list. Confidential
 // UTXOs reveal real asset/amount blinders; explicit UTXOs carry all-zero blinders
 // (which the maker reads as "no blinding needed for this input").
+// anyConfidential reports whether any selected coin is a confidential output.
+func anyConfidential(utxos []explorer.Utxo) bool {
+	for _, u := range utxos {
+		if u.IsConfidential() {
+			return true
+		}
+	}
+	return false
+}
+
 func utxosToUnblinded(utxos []explorer.Utxo) []swap.UnblindedInput {
 	ins := make([]swap.UnblindedInput, 0, len(utxos))
 	for i, u := range utxos {
