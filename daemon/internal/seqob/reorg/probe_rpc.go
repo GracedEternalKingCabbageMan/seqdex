@@ -48,13 +48,32 @@ func (p *rpcProbe) TxPresent(txid string) (bool, error) {
 	return false, err
 }
 
+// TxConfirmations returns how deep txid is (0 for a mempool tx). An absent tx is an
+// error here; callers use TxPresent for absence.
+func (p *rpcProbe) TxConfirmations(txid string) (int64, error) {
+	var res struct {
+		Confirmations int64 `json:"confirmations"`
+	}
+	if err := p.call(&res, "getrawtransaction", txid, true); err != nil {
+		return 0, err
+	}
+	return res.Confirmations, nil
+}
+
 // isUnknownTx reports whether err is the node's "unknown transaction" response
 // (rpc -5), i.e. the tx is genuinely absent rather than a transient failure.
+//
+// A node WITHOUT -txindex answers the same code for a CONFIRMED tx it cannot look
+// up ("No such mempool transaction. Use -txindex ..."). That is not absence: on
+// such a node every settlement would read as orphaned the moment it confirmed,
+// re-opening the order and retracting a real trade. That message is a
+// configuration error and is reported as one, never as an orphan.
 func isUnknownTx(err error) bool {
 	s := err.Error()
-	return strings.Contains(s, "rpc -5") ||
-		strings.Contains(s, "No such mempool or blockchain transaction") ||
-		strings.Contains(s, "No such mempool transaction")
+	if strings.Contains(s, "txindex") {
+		return false
+	}
+	return strings.Contains(s, "No such mempool or blockchain transaction")
 }
 
 func (p *rpcProbe) call(out interface{}, method string, params ...interface{}) error {

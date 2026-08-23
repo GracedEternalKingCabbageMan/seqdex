@@ -115,19 +115,38 @@ func TestReopenRefusesCancelledOrder(t *testing.T) {
 		t.Fatal("cancelled order is back in the book")
 	}
 
-	// A cancel that predates the post (an earlier life of a re-used offer_id) does not block.
+	// A cancel from an EARLIER life of a re-used offer_id (cancelled, then re-posted
+	// with a later created_at) does not block a reopen of the new life.
 	o2 := mkOffer(t, k, "bbbb", 1750003600)
 	if _, err := s.Submit(o2); err != nil {
 		t.Fatal(err)
 	}
-	old := &seqobv1.OfferCancel{OfferId: "bbbb", Nonce: (o2.GetCreatedAtUnix() - 3600) * 1e9}
+	old := &seqobv1.OfferCancel{OfferId: "bbbb", Nonce: (o2.GetCreatedAtUnix() + 60) * 1e9}
 	if err := offer.SignCancel(old, k); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Cancel(old); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reopen(o2, 100); err != nil {
-		t.Fatalf("a pre-post cancel must not block the reopen: %v", err)
+	o3 := mkOffer(t, k, "bbbb", 1750003600)
+	o3.CreatedAtUnix = o2.GetCreatedAtUnix() + 3600
+	o3.MakerSig = nil
+	if err := offer.SignOffer(o3, k); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Submit(o3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reopen(o3, 100); err != nil {
+		t.Fatalf("a cancel from the previous life must not block the reopen: %v", err)
+	}
+
+	// And a captured cancel that predates the resting post is refused outright.
+	stale := &seqobv1.OfferCancel{OfferId: "bbbb", Nonce: (o3.GetCreatedAtUnix() - 1) * 1e9}
+	if err := offer.SignCancel(stale, k); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Cancel(stale); err == nil {
+		t.Fatal("a cancel signed before the resting offer was posted must be refused")
 	}
 }
