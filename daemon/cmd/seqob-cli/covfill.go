@@ -28,6 +28,7 @@ import (
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/bridge"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/covfill"
 	"github.com/aejkcs50/seqdex/daemon/internal/seqob/offer"
+	"github.com/aejkcs50/seqdex/daemon/pkg/covenant"
 	"github.com/aejkcs50/seqdex/daemon/pkg/xchain"
 )
 
@@ -44,6 +45,7 @@ func cmdCovFill(args []string) {
 	feeAsset := fs.String("fee-asset", "", "fee asset (display hex; default: the chain's pegged bitcoin asset)")
 	spendFee := fs.Uint64("spend-fee", 2000, "explicit network fee, in the fee asset's own atoms")
 	allowCancellable := fs.Bool("allow-maker-cancellable", false, "fill a non-NUMS-internal-key covenant (maker key-path cancel/rug risk); default: refuse")
+	maxPay := fs.Uint64("max-pay", 0, "refuse if the covenant demands more than this many asset-B atoms (0 = derive from the offer's own advertised price)")
 	_ = fs.Parse(args)
 
 	if *offerID == "" || *makerPub == "" || *seqRPCURL == "" || *seqWallet == "" {
@@ -87,6 +89,14 @@ func cmdCovFill(args []string) {
 	fmt.Printf("covenant offer %s: fills at rate %d/%d (min_lot %d), resting at %s:%d\n",
 		*offerID, ct.GetRateNum(), ct.GetRateDen(), ct.GetMinLot(), op.Txid, op.Vout)
 
+	ceiling := *maxPay
+	if ceiling == 0 {
+		// The offer's own terms are the price the taker agreed to: a full fill of
+		// offer_amount of asset A is worth want_amount of asset B, pro rata for a
+		// partial, rounded up as the leaf rounds. The covenant's baked-in rate must
+		// not demand more than that.
+		ceiling = offerCeiling(target, *amount)
+	}
 	res, err := covfill.FillCovenant(covfill.Params{
 		Order:                 order,
 		Txid:                  op.Txid,
@@ -96,6 +106,7 @@ func cmdCovFill(args []string) {
 		FeeAssetDisplay:       fee,
 		Node:                  chain.RPC(),
 		AllowMakerCancellable: *allowCancellable,
+		MaxPayB:               ceiling,
 	})
 	if err != nil {
 		fatal("covenant fill: %v", err)
@@ -104,6 +115,18 @@ func cmdCovFill(args []string) {
 	fmt.Printf("filled %d asset-A atoms%s, paid the maker %d asset-B atoms (remainder %d re-rested)\n",
 		res.Filled, partialNote(res.Filled, res.Locked), res.PaidB, res.Remainder)
 	fmt.Printf("SWAP SETTLED: txid %s\n", res.Txid)
+}
+
+// offerCeiling is the most asset B a fill of `take` asset-A atoms (0 = all) may
+// credit the maker under the OFFER's advertised price: ceil(take * want / offer).
+// The covenant's asset A is the offer_asset and asset B the want_asset, so the
+// advertised ratio and the baked-in rate price the same pair.
+func offerCeiling(o *seqobv1.Offer, take uint64) uint64 {
+	offerAmt, wantAmt := o.GetOfferAmount(), o.GetWantAmount()
+	if take == 0 || take >= offerAmt {
+		return wantAmt
+	}
+	return covenant.CeilPrice(take, wantAmt, offerAmt)
 }
 
 // findOffer locates the target offer: directly in one market's book when
