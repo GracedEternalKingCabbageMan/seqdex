@@ -92,6 +92,14 @@ type Params struct {
 	// AllowMakerCancellable opts in to filling a non-NUMS-internal-key order (a
 	// maker-cancellable/key-path-rug covenant). Default false: fail closed.
 	AllowMakerCancellable bool
+	// MaxPayB, when > 0, caps the asset-B atoms the fill may credit the maker. The
+	// price a taker decided on comes from the OFFER it read (offer_amount /
+	// want_amount); the price the fill actually pays is baked into the covenant's
+	// rate_num/rate_den, and both are under the maker's signature. A maker whose
+	// terms demand more than its offer advertises would otherwise be paid whatever
+	// the leaf requires. Dust folded into the credit (the taker's own change below
+	// the fold threshold) is not counted against the cap.
+	MaxPayB uint64
 }
 
 // Result is a settled fill.
@@ -167,6 +175,9 @@ func FillCovenant(p Params) (*Result, error) {
 	plan, err := p.Order.PlanFill(locked, take, 0)
 	if err != nil {
 		return nil, fmt.Errorf("fill plan: %w", err)
+	}
+	if p.MaxPayB > 0 && plan.RequiredB > p.MaxPayB {
+		return nil, fmt.Errorf("covenant rate %d/%d demands %d asset-B atoms for %d asset-A atoms, above the %d ceiling the taker priced from the offer", p.Order.RateNum, p.Order.RateDen, plan.RequiredB, plan.Filled, p.MaxPayB)
 	}
 
 	// --- select the taker's funding (credit asset B + the fee asset) --------

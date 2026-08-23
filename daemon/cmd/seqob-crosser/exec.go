@@ -231,10 +231,19 @@ func (e *Executor) legCommand(n *NormOrder, take uint64) (args []string, stateFi
 		if n.Side == SideBid && covAmt != 0 {
 			covAmt = floorMulDiv(take, n.QuoteNum, n.BaseDen)
 		}
+		// What the fill pays is asset B: the quote on an ASK (priced by CostFor, the
+		// same number the profitability gate used) and our own base on a BID. The
+		// covenant's baked-in rate is the maker's, not the offer's; the ceiling makes
+		// covfill refuse a covenant whose terms demand more than the offer advertised.
+		maxPay := n.CostFor(take)
+		if n.Side == SideBid {
+			maxPay = take
+		}
 		args = append([]string{"covfill",
 			"-base", n.Offer.GetPair().GetBaseAsset(), "-quote", n.Offer.GetPair().GetQuoteAsset(),
 			"-seq-rpc", c.SeqRPC, "-seq-wallet", c.SeqWallet,
 			"-spend-fee", fmt.Sprint(c.SpendFee),
+			"-max-pay", fmt.Sprint(maxPay),
 			"-amount", fmt.Sprint(covAmt)}, common...)
 		// Single-tx atomic: no refund state, nothing to resume.
 		resume = "covenant fill is one atomic FILL tx: nothing to refund on failure"

@@ -334,6 +334,9 @@ func (m *Matcher) walk(incoming *seqobv1.Offer) ([]Match, uint64) {
 				} else {
 					continue
 				}
+				if fillBase < ml {
+					continue // the trim itself fell below min_lot (restActive < 2*min_lot): no valid partial exists
+				}
 			}
 		}
 
