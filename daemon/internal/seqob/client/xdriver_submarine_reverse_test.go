@@ -74,7 +74,7 @@ func (o *fakeRevTakerOps) VerifySEQLeg(hashH, claimPub, refundPub, providedScrip
 func (o *fakeRevTakerOps) VerifySeqAnchorBuried(seqBlockHash string, minAnchorDepth int64) (*xchain.SubAnchorEvidence, error) {
 	return &xchain.SubAnchorEvidence{OK: true, AnchorDepth: minAnchorDepth, MinAnchorDepth: minAnchorDepth}, nil
 }
-func (o *fakeRevTakerOps) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
+func (o *fakeRevTakerOps) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64, _ uint32) ([]byte, error) {
 	o.st.mu.Lock()
 	defer o.st.mu.Unlock()
 	o.st.invoicePaid = true

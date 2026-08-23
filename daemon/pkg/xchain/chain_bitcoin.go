@@ -270,8 +270,23 @@ func (c *BitcoinChain) LocateFundedHTLC(redeemScript []byte) (*LocatedHTLC, bool
 		Address  string `json:"address"`
 		Category string `json:"category"`
 	}
-	if err := c.rpc.Call(&txns, "listtransactions", "*", 1000, 0, true); err != nil {
-		note("listtransactions", err)
+	var lterr error
+	for skip := 0; skip < 20000; skip += 1000 {
+		var page []struct {
+			TxID     string `json:"txid"`
+			Address  string `json:"address"`
+			Category string `json:"category"`
+		}
+		if lterr = c.rpc.Call(&page, "listtransactions", "*", 1000, skip, true); lterr != nil {
+			break
+		}
+		txns = append(txns, page...)
+		if len(page) < 1000 {
+			break
+		}
+	}
+	if lterr != nil {
+		note("listtransactions", lterr)
 	} else {
 		for _, tx := range txns {
 			if tx.Address != p2sh {

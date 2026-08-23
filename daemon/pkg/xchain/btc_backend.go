@@ -60,8 +60,9 @@ type btcBackend interface {
 // the Chain (chain.go) + ElementsLeg (leg_elements.go) that verified the
 // mechanism originally.
 type elementsBTCBackend struct {
-	chain *Chain
-	leg   *ElementsLeg
+	chain  *Chain
+	leg    *ElementsLeg
+	spends spendCache
 	// lockAsset is the asset LockBTCLeg funds the HTLC with ("" = the pegged
 	// bitcoin asset, the original behaviour). Set (via newElementsBTCBackendAsset)
 	// when this "BTC-position" leg is actually a Sequentia ISSUED asset — the
@@ -177,18 +178,16 @@ func (b *elementsBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64
 	if err != nil {
 		return "", err
 	}
-	rawHex, err := b.leg.Redeem(leg.Script, ElementsSpendInput{
-		TxID:    leg.Funded.TxID,
-		Vout:    leg.Funded.Vout,
-		Amount:  leg.Funded.Amount,
-		AssetID: leg.Funded.AssetID,
-		DestSPK: dest,
-		Fee:     fee,
-	}, claimKey)
-	if err != nil {
-		return "", err
-	}
-	txid, err := b.chain.Broadcast(rawHex)
+	txid, err := b.spends.once(b.chain, leg.Funded.TxID, leg.Funded.Vout, "claim", func() (string, error) {
+		return b.leg.Redeem(leg.Script, ElementsSpendInput{
+			TxID:    leg.Funded.TxID,
+			Vout:    leg.Funded.Vout,
+			Amount:  leg.Funded.Amount,
+			AssetID: leg.Funded.AssetID,
+			DestSPK: dest,
+			Fee:     fee,
+		}, claimKey)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -204,18 +203,16 @@ func (b *elementsBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTim
 	if err != nil {
 		return "", err
 	}
-	rawHex, err := b.leg.Refund(leg.Script, ElementsSpendInput{
-		TxID:    leg.Funded.TxID,
-		Vout:    leg.Funded.Vout,
-		Amount:  leg.Funded.Amount,
-		AssetID: leg.Funded.AssetID,
-		DestSPK: dest,
-		Fee:     fee,
-	}, nLockTime, refundKey)
-	if err != nil {
-		return "", err
-	}
-	txid, err := b.chain.Broadcast(rawHex)
+	txid, err := b.spends.once(b.chain, leg.Funded.TxID, leg.Funded.Vout, "refund", func() (string, error) {
+		return b.leg.Refund(leg.Script, ElementsSpendInput{
+			TxID:    leg.Funded.TxID,
+			Vout:    leg.Funded.Vout,
+			Amount:  leg.Funded.Amount,
+			AssetID: leg.Funded.AssetID,
+			DestSPK: dest,
+			Fee:     fee,
+		}, nLockTime, refundKey)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -231,8 +228,9 @@ func (b *elementsBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTim
 // the deferred "real-bitcoind-leg": the maker verifies + claims a genuine
 // Bitcoin HTLC in Bitcoin transaction format.
 type bitcoinBTCBackend struct {
-	chain *BitcoinChain
-	leg   *BitcoinLeg
+	chain  *BitcoinChain
+	leg    *BitcoinLeg
+	spends spendCache
 }
 
 func newBitcoinBTCBackend(chain *BitcoinChain, prim LockPrimitive) *bitcoinBTCBackend {
@@ -371,17 +369,15 @@ func (b *bitcoinBTCBackend) ClaimBTCLeg(leg *LegLock, claimKey *Key, fee uint64)
 	if err != nil {
 		return "", err
 	}
-	rawHex, err := b.leg.BuildClaimTx(leg.Script, BitcoinSpendInput{
-		TxID:   leg.Funded.TxID,
-		Vout:   leg.Funded.Vout,
-		Amount: leg.Funded.Amount,
-		DestPK: dest,
-		Fee:    fee,
-	}, claimKey)
-	if err != nil {
-		return "", err
-	}
-	return b.chain.Broadcast(rawHex)
+	return b.spends.once(b.chain, leg.Funded.TxID, leg.Funded.Vout, "claim", func() (string, error) {
+		return b.leg.BuildClaimTx(leg.Script, BitcoinSpendInput{
+			TxID:   leg.Funded.TxID,
+			Vout:   leg.Funded.Vout,
+			Amount: leg.Funded.Amount,
+			DestPK: dest,
+			Fee:    fee,
+		}, claimKey)
+	})
 }
 
 func (b *bitcoinBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTime uint32, fee uint64) (string, error) {
@@ -389,17 +385,15 @@ func (b *bitcoinBTCBackend) RefundBTCLeg(leg *LegLock, refundKey *Key, nLockTime
 	if err != nil {
 		return "", err
 	}
-	rawHex, err := b.leg.BuildRefundTx(leg.Script, BitcoinSpendInput{
-		TxID:   leg.Funded.TxID,
-		Vout:   leg.Funded.Vout,
-		Amount: leg.Funded.Amount,
-		DestPK: dest,
-		Fee:    fee,
-	}, nLockTime, refundKey)
-	if err != nil {
-		return "", err
-	}
-	return b.chain.Broadcast(rawHex)
+	return b.spends.once(b.chain, leg.Funded.TxID, leg.Funded.Vout, "refund", func() (string, error) {
+		return b.leg.BuildRefundTx(leg.Script, BitcoinSpendInput{
+			TxID:   leg.Funded.TxID,
+			Vout:   leg.Funded.Vout,
+			Amount: leg.Funded.Amount,
+			DestPK: dest,
+			Fee:    fee,
+		}, nLockTime, refundKey)
+	})
 }
 
 // locateHTLCOutput finds the (vout, value) of the output paying the script's

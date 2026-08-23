@@ -66,6 +66,11 @@ type Swap struct {
 	// 0-conf leg) before declaring the leg invalid. 0 = DefaultVerifyNotSeenWait.
 	// Settable via SetVerifyNotSeenWait.
 	verifyNotSeenWait time.Duration
+
+	// spends remembers the raw spend built per (outpoint, kind), so a retry after a
+	// broadcast whose reply was lost re-sends the SAME transaction instead of a new
+	// one to a fresh address that the node would reject as a conflict.
+	spends spendCache
 }
 
 // NewSwap wires an orchestrator to an ELEMENTS-mode parent (BTC leg) and the
@@ -273,18 +278,16 @@ func (s *Swap) ClaimSEQLeg(leg *LegLock, aliceClaim *Key, fee uint64) (string, e
 	if err != nil {
 		return "", err
 	}
-	rawHex, err := s.seqLeg.Redeem(leg.Script, ElementsSpendInput{
-		TxID:    leg.Funded.TxID,
-		Vout:    leg.Funded.Vout,
-		Amount:  leg.Funded.Amount,
-		AssetID: leg.Funded.AssetID,
-		DestSPK: dest,
-		Fee:     fee,
-	}, aliceClaim)
-	if err != nil {
-		return "", err
-	}
-	txid, err := s.seq.Broadcast(rawHex)
+	txid, err := s.spends.once(s.seq, leg.Funded.TxID, leg.Funded.Vout, "claim", func() (string, error) {
+		return s.seqLeg.Redeem(leg.Script, ElementsSpendInput{
+			TxID:    leg.Funded.TxID,
+			Vout:    leg.Funded.Vout,
+			Amount:  leg.Funded.Amount,
+			AssetID: leg.Funded.AssetID,
+			DestSPK: dest,
+			Fee:     fee,
+		}, aliceClaim)
+	})
 	if err != nil {
 		return "", err
 	}

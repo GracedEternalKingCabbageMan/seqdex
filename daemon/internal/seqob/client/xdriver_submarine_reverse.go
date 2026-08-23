@@ -119,7 +119,9 @@ type SubReverseTakerOps interface {
 	VerifySEQLeg(hashH, claimPub, refundPub, providedScript []byte, seqLocktime uint32,
 		txid string, vout uint32, amount uint64, assetID string, minConf int) (*xchain.VerifiedSEQLeg, error)
 	VerifySeqAnchorBuried(seqBlockHash string, minAnchorDepth int64) (*xchain.SubAnchorEvidence, error)
-	PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error)
+	// PayInvoice pays the maker's invoice with its route capped so it resolves before
+	// the asset HTLC's refund height seqLocktime.
+	PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64, seqLocktime uint32) ([]byte, error)
 	InjectSecret(secret []byte) error
 	ClaimSEQLeg(leg *xchain.LegLock, key *xchain.Key, fee uint64) (string, error)
 }
@@ -148,8 +150,8 @@ func (o *LiveSubReverseTakerOps) VerifySEQLeg(hashH, claimPub, refundPub, provid
 func (o *LiveSubReverseTakerOps) VerifySeqAnchorBuried(seqBlockHash string, minAnchorDepth int64) (*xchain.SubAnchorEvidence, error) {
 	return o.Sub.VerifySeqAnchorBuried(seqBlockHash, minAnchorDepth)
 }
-func (o *LiveSubReverseTakerOps) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64) ([]byte, error) {
-	return o.Sub.PayInvoice(bolt11, wantHash, amountMsat)
+func (o *LiveSubReverseTakerOps) PayInvoice(bolt11 string, wantHash []byte, amountMsat uint64, seqLocktime uint32) ([]byte, error) {
+	return o.Sub.PayInvoiceBefore(bolt11, wantHash, amountMsat, seqLocktime)
 }
 func (o *LiveSubReverseTakerOps) InjectSecret(secret []byte) error { return o.Sub.InjectSecret(secret) }
 func (o *LiveSubReverseTakerOps) ClaimSEQLeg(leg *xchain.LegLock, key *xchain.Key, fee uint64) (string, error) {
@@ -582,7 +584,7 @@ func RunTakerReverseSubmarine(p TakerReverseSubmarineParams, send XcSend, recv X
 	if _, err := verifyLeg(); err != nil {
 		return res, fmt.Errorf("taker reverse: asset HTLC no longer verifies before paying: %w", err)
 	}
-	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, p.ExpectInvoiceMsat)
+	preimage, err := ops.PayInvoice(locked.Bolt11, hashH, p.ExpectInvoiceMsat, leg.Locktime)
 	if err != nil {
 		return res, fmt.Errorf("taker reverse pay invoice: %w", err)
 	}

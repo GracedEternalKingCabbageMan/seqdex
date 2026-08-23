@@ -6,6 +6,9 @@ import (
 	"strings"
 )
 
+// PreimageLen is the only preimage length Lightning settles.
+const PreimageLen = 32
+
 var (
 	// errNoSecret is returned when a redeem spend is requested but the
 	// HashLock holds only the hash, not the preimage.
@@ -77,6 +80,11 @@ var (
 	// ErrLNLegTimeout means a Lightning-leg wait (e.g. a hold invoice never
 	// reaching "accepted") exceeded its deadline; fall back to the refund path.
 	ErrLNLegTimeout = errors.New("xchain: submarine LN leg timed out")
+
+	// ErrBadPreimageLen means a preimage is not the 32 bytes Lightning settles. The
+	// on-chain HTLC script accepts any length whose sha256 matches, so a value of
+	// another length is a claim that could never resolve a Lightning hold.
+	ErrBadPreimageLen = errors.New("xchain: preimage is not 32 bytes")
 
 	// ErrLNPayUnresolved means an outgoing Lightning payment could be neither
 	// confirmed complete nor confirmed failed: the node still reports it pending

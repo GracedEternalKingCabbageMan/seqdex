@@ -78,7 +78,7 @@ func (o *fakeSubAsMakerOps) VerifyBTCLeg(hashH, makerClaimPub, takerRefundPub, p
 
 // PayAssetHold "pays" the taker's hold invoice: it marks the payment held, then
 // blocks until the taker settles it (revealing P), returning P.
-func (o *fakeSubAsMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64) ([]byte, error) {
+func (o *fakeSubAsMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64, _ uint32) ([]byte, error) {
 	o.st.mu.Lock()
 	if hex.EncodeToString(h) != hex.EncodeToString(o.st.holdHash) {
 		o.st.mu.Unlock()
@@ -113,7 +113,7 @@ func (o *fakeSubAsMakerOps) PayAssetHold(bolt11 string, h []byte, amtMsat uint64
 // PayAssetHashHold is the pay-by-hash HODL variant: node id is ignored in the fake,
 // it drives the same held-then-settle simulation keyed by hash.
 func (o *fakeSubAsMakerOps) PayAssetHashHold(takerNodeID string, h []byte, amtMsat uint64) ([]byte, error) {
-	return o.PayAssetHold("", h, amtMsat)
+	return o.PayAssetHold("", h, amtMsat, 0)
 }
 
 func (o *fakeSubAsMakerOps) InjectSecret(preimage []byte) error {

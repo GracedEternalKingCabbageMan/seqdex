@@ -65,7 +65,7 @@ func TestPureLNBuyLive(t *testing.T) {
 
 	start := time.Now()
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfill(h, assetInv, assetAmt, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() { mp, e := maker.MakerFulfill(h, assetInv, assetAmt, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
 
 	takerP, err := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5a))
 	if err != nil {
@@ -104,7 +104,7 @@ func TestPureLNSellLive(t *testing.T) {
 
 	start := time.Now()
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfillSell(h, btcInv, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() { mp, e := maker.MakerFulfillSell(h, btcInv, btcAmt, assetAmt, 60*time.Second); makerDone <- result{mp, e} }()
 
 	takerP, err := taker.RunTakerSell(h, makerAssetID, assetAmt, 18, secret32(0x5b))
 	if err != nil {
@@ -144,7 +144,7 @@ func TestPureLNRefundLive(t *testing.T) {
 	}
 
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfill(h, assetInv, hugeAsset, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() { mp, e := maker.MakerFulfill(h, assetInv, hugeAsset, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
 
 	// The taker's BTC hold must be FAILED back (refund), so PayHash returns an error.
 	_, takerErr := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5c))
