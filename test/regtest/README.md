@@ -21,7 +21,7 @@ The design they implement is [`docs/simplicity-dex-covenant-offers-design.md`](.
 
 ## Running them
 
-They need a **configured, built** [Sequentia node](https://github.com/GracedEternalKingCabbageMan/Sequentia)
+They need a **configured, built** [Sequentia node](https://github.com/ConcatenaLabs/Sequentia)
 checkout, whose `test_framework` package they import and whose `test/config.ini`
 points at the built binary. Everything but `feature_seqob_covenant_fill.py` also
 needs the Go toolchain, and builds the daemon binaries it drives from this repo.

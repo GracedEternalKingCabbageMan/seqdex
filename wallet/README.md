@@ -6,7 +6,7 @@ through: `tdexd` talks to it over the unchanged `ocean.v1` gRPC contract
 (`api-spec/protobuf/ocean/v1`), and the SeqOB maker reuses its swap-completion
 service. It is an operator/market-maker wallet, not an end-user wallet
 (end-user wallets are built on
-[SWK](https://github.com/GracedEternalKingCabbageMan/SWK)).
+[SWK](https://github.com/ConcatenaLabs/SWK)).
 
 Testnet software. The daemon manages its operator's own funds; it never holds
 a counterparty's.

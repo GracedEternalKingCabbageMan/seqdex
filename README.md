@@ -15,16 +15,16 @@ Everything here is **testnet software**. There is no Sequentia mainnet.
 
 | Repo | One-liner |
 |---|---|
-| [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (Sequentia Core, a fork of Elements 23.3.3; binaries `sequentiad` / `sequentia-cli`): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
-| [`seqdex`](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX - P2P order book (seqob), same-chain swaps, and cross-chain BTC<->asset swaps made safe by Bitcoin anchoring. |
-| [`seqdex-web`](https://github.com/GracedEternalKingCabbageMan/seqdex-web) | The SeqDEX website, live at https://sequentiatestnet.com/dex/: three trading surfaces over the relay mounts, settling through the Ambra browser extension. |
-| [`SWK`](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK - Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
-| [`sequentia-web-wallet`](https://github.com/GracedEternalKingCabbageMan/sequentia-web-wallet) | Proof-of-concept browser wallet built on SWK, live at https://sequentiatestnet.com/wallet. |
-| [`seqln`](https://github.com/GracedEternalKingCabbageMan/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary - asset channels, any-asset payments, pure-Lightning swaps. |
+| [`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) | The Sequentia node (Sequentia Core, a fork of Elements 23.3.3; binaries `sequentiad` / `sequentia-cli`): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [`seqdex`](https://github.com/ConcatenaLabs/seqdex) | SeqDEX: non-custodial atomic-swap DEX - P2P order book (seqob), same-chain swaps, and cross-chain BTC<->asset swaps made safe by Bitcoin anchoring. |
+| [`seqdex-web`](https://github.com/ConcatenaLabs/seqdex-web) | The SeqDEX website, live at https://sequentiatestnet.com/dex/: three trading surfaces over the relay mounts, settling through the Ambra browser extension. |
+| [`SWK`](https://github.com/ConcatenaLabs/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK - Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
+| [`sequentia-web-wallet`](https://github.com/ConcatenaLabs/sequentia-web-wallet) | Proof-of-concept browser wallet built on SWK, live at https://sequentiatestnet.com/wallet. |
+| [`seqln`](https://github.com/ConcatenaLabs/seqln) | SeqLN: a Core Lightning fork that runs on Sequentia and Bitcoin from the same binary - asset channels, any-asset payments, pure-Lightning swaps. |
 
 Protocol-level background (anchoring, proof of stake, the open fee market) lives
 in the node repo's documentation:
-https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/master/doc/sequentia
+https://github.com/ConcatenaLabs/Sequentia/tree/master/doc/sequentia
 
 ## What is in this repo
 
@@ -213,7 +213,7 @@ end-to-end:
 Prerequisites: a recent Go toolchain (both modules build cleanly with Go 1.26;
 the daemon's release build uses CGO), and for full local loops a built Sequentia
 node (`sequentiad` and `sequentia-cli` from
-https://github.com/GracedEternalKingCabbageMan/Sequentia).
+https://github.com/ConcatenaLabs/Sequentia).
 
 Build every binary:
 

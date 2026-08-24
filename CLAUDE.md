@@ -4,7 +4,7 @@ The Sequentia DEX: a non-custodial order-book and atomic-swap system, in Go. For
 (`tdex-daemon`, `tdex-protobuf`) and Ocean.
 
 Everything here is testnet software. Node and consensus conventions live in the
-[`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) repo.
+[`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) repo.
 
 ## Branches
 
@@ -25,7 +25,7 @@ Seven Go modules; the root one only covers `proto/gen/go`. The two that matter a
 `wallet/`.
 
 The Go import path is `github.com/aejkcs50/seqdex/...` while the GitHub remote is
-`GracedEternalKingCabbageMan/seqdex`. That is a historical username, not a mistake — do not
+`ConcatenaLabs/seqdex`. That is a historical username, not a mistake — do not
 "fix" the module path.
 
 There is **no committed `go.work`**; it is kept local by design.

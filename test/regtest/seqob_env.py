@@ -44,7 +44,7 @@ if not os.path.isdir(_functional):
     raise SystemExit(
         "Sequentia node functional tests not found at %s.\n"
         "Set SEQUENTIA_DIR to a configured, built node checkout "
-        "(https://github.com/GracedEternalKingCabbageMan/Sequentia)." % _functional)
+        "(https://github.com/ConcatenaLabs/Sequentia)." % _functional)
 
 # Our own directory first, so `import seqob_covenant` resolves here and not to a
 # same-named module in the node checkout.
