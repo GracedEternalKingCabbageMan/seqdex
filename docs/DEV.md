@@ -13,7 +13,7 @@ is a 2026-07-08 snapshot).
   uses `CGO_ENABLED=1`).
 - For anything on-chain: a built Sequentia node, i.e. `sequentiad` and
   `sequentia-cli` from
-  https://github.com/GracedEternalKingCabbageMan/Sequentia (about an hour to
+  https://github.com/ConcatenaLabs/Sequentia (about an hour to
   build; see that repo's docs).
 - Optional: [`buf`](https://buf.build) for proto codegen, Docker for the
   inherited upstream compose files, a SeqLN node for the Lightning rails
@@ -233,7 +233,7 @@ finishes every non-terminal session (claim or refund) and exits.
 ### Submarine (Lightning) over the order book
 
 Requires a SeqLN/CLN node on the BTC side for each party
-(https://github.com/GracedEternalKingCabbageMan/seqln):
+(https://github.com/ConcatenaLabs/seqln):
 
 ```sh
 # maker: base = the asset, quote = the BTC sentinel
