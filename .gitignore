@@ -28,3 +28,6 @@ datadir/
 # Python bytecode from the regtest proofs
 __pycache__/
 *.py[cod]
+
+# Agent worktrees and local agent state (never belongs in the repo).
+.claude/
