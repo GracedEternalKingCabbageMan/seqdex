@@ -1,7 +1,7 @@
 # SeqDEX
 
 SeqDEX: non-custodial atomic-swap DEX for [Sequentia](https://sequentia.io), a
-Bitcoin sidechain for asset tokenization and decentralized exchange. It provides
+Bitcoin sidechain for asset tokenization and disintermediated exchanges. It provides
 a peer-to-peer order book (SeqOB), same-chain asset-to-asset atomic swaps, and
 cross-chain BTC-to-asset swaps whose safety comes from Sequentia's real-time
 Bitcoin anchoring. No component ever takes custody of user funds: settlement is
