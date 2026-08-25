@@ -49,8 +49,7 @@ Two cooperating DEX subsystems plus the shared settlement engines, all in Go:
    a liquidity-provider daemon forked from the TDEX stack. A trader asks it for
    a quote and settles a cooperative same-chain atomic swap against the daemon's
    own market-maker wallet, over gRPC, grpc-web and REST. Cross-chain
-   settlement is order-book only (item 3); the RFQ `XchainService` and its
-   takers were removed on 2026-07-29.
+   settlement is order-book only (item 3); the RFQ daemon does not do it.
 
 3. **The cross-chain HTLC engine** (`daemon/pkg/xchain`), driven by the SeqOB
    maker, CLI, settler and bridge: BTC-to-asset atomic swaps between Bitcoin
@@ -63,9 +62,10 @@ Both subsystems settle same-chain swaps through the same proven path: the
 `wallet/` daemon (a thin fork of Ocean) builds, blinds when requested, and
 co-signs the atomic swap PSET.
 
-## Status (2026-08-22)
+## What settles, and how it is proven
 
-Works today, exercised on the public testnet or in the committed test suites:
+Each of these is exercised on the public testnet or in the committed test
+suites:
 
 - SeqOB relay + maker + taker CLI: same-chain asset-to-asset lifts, partial
   fills, signed cancels, offer expiry, replay protection, rate limits.
@@ -100,12 +100,11 @@ Deliberate gaps, stated honestly:
   in-memory (`seqobd -trade-log` persists the trade feed); cross-chain sessions
   are persisted (`-xstate-dir`) and resumable, same-chain lifts simply expire
   and the book re-forms.
-- `phase3-pure-ln` has diverged from `main`; see "Development branches" below.
 
 ## The live public testnet deployment
 
 The public Sequentia testnet exposes the order book under
-https://sequentiatestnet.com (verified 2026-08-22):
+https://sequentiatestnet.com:
 
 - **SeqOB relays**, one per rail: `https://sequentiatestnet.com/seqob/v1/...`
   (on-chain: same-chain, covenant and cross-chain offers), `/seqob-pln/v1/...`
@@ -210,8 +209,8 @@ end-to-end:
 
 ## Running it yourself
 
-Prerequisites: a recent Go toolchain (both modules build cleanly with Go 1.26;
-the daemon's release build uses CGO), and for full local loops a built Sequentia
+Prerequisites: a recent Go toolchain (the daemon's release build uses CGO),
+and for full local loops a built Sequentia
 node (`sequentiad` and `sequentia-cli` from
 https://github.com/ConcatenaLabs/Sequentia).
 
@@ -263,6 +262,10 @@ daemon/                The Go daemon module (fork of tdex-daemon).
   cmd/seqob-covenant/  Covenant builder CLI (derive | fill): scriptPubKey and
                        FILL witness for a resting order, byte-identical to the
                        proven Python.
+  cmd/seqob-crosser/   Crossing agent: polls every relay, builds the union
+                       book per pair, and when a resting bid crosses a resting
+                       ask it takes BOTH sides with its own inventory. One
+                       participant, not infrastructure; anyone can run one.
   cmd/seqob-relaycli/  Scripting client for the relay (post | take), used by
                        the regtest matcher proof.
   cmd/seqob-octl/      Helper for inspecting/preparing Ocean maker accounts.
@@ -289,45 +292,28 @@ test/regtest/          Consensus-level proofs of the covenant order book, run
                        against a real Sequentia node (see its README).
 ```
 
-The `docs/` directory, with each file's status as of 2026-08-22:
+The `docs/` directory. These describe how the system works now:
 
-- `ARCHITECTURE.md` - **2026-07-08 snapshot**, superseded where its header says
-  (RFQ cross-chain rail, "not on main" claims); the SeqOB protocol, the
-  cross-chain safety model and the fee model are still as built.
-- `DEV.md` - current: local runs of every loop.
-- `seqdex-terminal-spec.md` - current product spec for the wallets' Swap tab
+- `DEV.md` - local runs of every loop.
+- `seqdex-terminal-spec.md` - the product spec for the wallets' Swap tab
   (cross-repo, self-declared canonical).
-- `simplicity-dex-covenant-offers-design.md` (+ `.html`/`.pdf`) - current
-  design for the covenant rail; the shipped leaf is tapscript introspection.
-- `rail-crossing-p2p-lsp-design.md` - current design, partially implemented
-  (`cmd/seqob-bridge`).
-- `seqdex-gap-closure-plan.md` - historical (audit snapshot of 2026-07-22).
-- `seqdex-orderbook-design.md` - historical design, implemented.
-- `cross-chain-orderbook-consolidation.md` - historical decision record,
-  implemented 2026-07-29.
-- `seqdex-simplicity-assessment.md`, `seqdex-lightning-feasibility.md` -
-  historical feasibility notes.
-- `seqln-phase2-dex-integration.md`, `seqln-dex-instant-swap-latency.md`,
-  `seqln-dex-instant-swap-latency-followup.md` - historical design notes,
-  implemented as `-mode lightning` and `-mode pureln`.
-- `HANDOVER-2026-07-31-dex-eight-rails.md` - historical handover.
+- `simplicity-dex-covenant-offers-design.md` (+ `.html`/`.pdf`) - the design of
+  the covenant rail; the shipped leaf is tapscript introspection.
+- `rail-crossing-p2p-lsp-design.md` - the rail-crossing design, partially
+  implemented (`cmd/seqob-bridge`).
+- `ARCHITECTURE.md` - the message flows, the cross-chain safety model and the
+  fee model. Its header names the parts it has outlived; read that first.
+
+The remaining files in `docs/` are design and handover notes kept as history.
+They record how a decision was reached, not how the code behaves, so take
+behaviour from the documents above or from the code itself.
 
 Component docs: [daemon/README.md](daemon/README.md),
 [wallet/README.md](wallet/README.md).
 
-## Development branches
+## Contributing
 
-`main` is the integration branch; PRs target `main`. Two feature branches exist
-(states verified 2026-08-22):
-
-- `phase2-submarine-ln`: historical; fully merged into `main` (its head is an
-  ancestor of `main`). It carried the submarine-swap work now on `main`.
-- `phase3-pure-ln`: has **diverged** from `main` (20 commits ahead, 12 behind).
-  The features it was started for - pure-Lightning swaps, the continuous
-  matcher and the covenant builder - are on `main`. What it still carries
-  exclusively is `seqob-crosser`, the crossing agent that polls every relay and
-  takes both sides; if one runs on the testnet box it is built from that
-  branch. Its docs are the older, pre-rewrite versions; see `CLAUDE.md`.
+`main` is the integration branch; open pull requests against it.
 
 ## License
 
