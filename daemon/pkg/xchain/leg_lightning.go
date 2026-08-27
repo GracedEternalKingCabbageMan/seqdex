@@ -588,38 +588,61 @@ type HeldInfo struct {
 }
 
 // WaitHeldInfo blocks until the hold on paymentHash is accepted and returns what
-// was held. The poll starts tight (the taker's HTLC lands within a commitment
-// round trip of the terms exchange) and backs off to a second after the first
-// second, so a multi-minute wait is not twenty socket dials a second through
-// lightningd's single RPC thread.
+// was held. It asks the plugin to answer the moment the HTLC lands
+// (holdinvoicewait, each call bounded so the socket read never outlives it);
+// against a plugin without that method it polls holdinvoicelookup instead,
+// tightly for the first second and then once a second.
 func (l *clnLNLeg) WaitHeldInfo(paymentHash []byte, timeout time.Duration) (HeldInfo, error) {
 	start := time.Now()
 	deadline := start.Add(timeout)
+	phHex := hex.EncodeToString(paymentHash)
+	canWait := true
 	for {
 		var res struct {
 			State        string `json:"state"`
 			AmountMsat   uint64 `json:"amount_msat"`
 			ReceivedMsat uint64 `json:"received_msat"`
 			CltvExpiry   uint32 `json:"cltv_expiry"`
+			Blockheight  uint32 `json:"blockheight"`
 		}
-		err := l.rpc.call(&res, "holdinvoicelookup",
-			map[string]interface{}{"payment_hash": hex.EncodeToString(paymentHash)})
+		var err error
+		if canWait {
+			secs := int(time.Until(deadline)/time.Second) + 1
+			if secs > 60 {
+				secs = 60
+			}
+			wrpc := &lnRPC{socketPath: l.rpc.socketPath, timeout: time.Duration(secs+10) * time.Second}
+			err = wrpc.call(&res, "holdinvoicewait",
+				map[string]interface{}{"payment_hash": phHex, "timeout": secs})
+			if err != nil && isUnknownMethod(err) {
+				canWait = false
+				continue
+			}
+		} else {
+			err = l.rpc.call(&res, "holdinvoicelookup",
+				map[string]interface{}{"payment_hash": phHex})
+		}
 		if err == nil && res.State == "accepted" {
-			info := HeldInfo{ReceivedMsat: res.ReceivedMsat, CltvExpiry: res.CltvExpiry}
+			info := HeldInfo{ReceivedMsat: res.ReceivedMsat, CltvExpiry: res.CltvExpiry, Tip: res.Blockheight}
 			if info.ReceivedMsat == 0 {
 				info.ReceivedMsat = res.AmountMsat // a plugin without the received field
 			}
-			var gi struct {
-				Blockheight uint32 `json:"blockheight"`
+			if info.Tip == 0 { // a plugin without the blockheight field
+				var gi struct {
+					Blockheight uint32 `json:"blockheight"`
+				}
+				if err := l.rpc.call(&gi, "getinfo", map[string]interface{}{}); err != nil {
+					return info, fmt.Errorf("getinfo: %w", err)
+				}
+				info.Tip = gi.Blockheight
 			}
-			if err := l.rpc.call(&gi, "getinfo", map[string]interface{}{}); err != nil {
-				return info, fmt.Errorf("getinfo: %w", err)
-			}
-			info.Tip = gi.Blockheight
 			return info, nil
 		}
 		if time.Now().After(deadline) {
 			return HeldInfo{}, fmt.Errorf("%w: hold invoice not accepted within %s (last err: %v)", ErrLNLegTimeout, timeout, err)
+		}
+		if canWait {
+			continue
 		}
 		if time.Since(start) < time.Second {
 			time.Sleep(50 * time.Millisecond)
@@ -627,6 +650,16 @@ func (l *clnLNLeg) WaitHeldInfo(paymentHash []byte, timeout time.Duration) (Held
 			time.Sleep(time.Second)
 		}
 	}
+}
+
+// isUnknownMethod reports whether an RPC error means the node has no such
+// method: JSON-RPC's -32601, which CLN answers for a command no plugin provides.
+func isUnknownMethod(err error) bool {
+	var re *rpcErr
+	if errors.As(err, &re) {
+		return re.Code == -32601
+	}
+	return false
 }
 
 func (l *clnLNLeg) SettleHold(paymentHash, preimage []byte) error {
