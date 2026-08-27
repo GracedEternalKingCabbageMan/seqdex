@@ -21,6 +21,10 @@ import (
 //	SEQLN_BTC_AMT_MSAT   = "BTC" amount (default 200000000 = 0.002; arbitrary rate)
 //
 //	go test ./pkg/xchain -run TestPureLN -v
+//
+// seqln's contrib/pureln-lab.sh brings up such a pair (a regtest Sequentia
+// node, two SeqLN nodes, a GOLD and a SILV channel, the hold plugin on the
+// maker) and prints this env with `pureln-lab.sh env`.
 func plnEnv(t *testing.T) (taker, maker, asset, btc string, assetAmt, btcAmt uint64) {
 	t.Helper()
 	taker = os.Getenv("SEQLN_TAKER_SOCK")
@@ -63,11 +67,21 @@ func TestPureLNBuyLive(t *testing.T) {
 		t.Fatalf("maker btc NodeID: %v", err)
 	}
 
+	// The hold's timelock must outlast the maker's outgoing pay plus its settle
+	// margin, so ask the maker what it needs, as the order-book driver does.
+	holdCltv, err := maker.HoldCltvForBuy(assetInv, 60*time.Second)
+	if err != nil {
+		t.Fatalf("HoldCltvForBuy: %v", err)
+	}
+
 	start := time.Now()
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfill(h, assetInv, assetAmt, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() {
+		mp, e := maker.MakerFulfill(h, assetInv, assetAmt, btcAmt, 60*time.Second)
+		makerDone <- result{mp, e}
+	}()
 
-	takerP, err := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5a))
+	takerP, err := taker.RunTakerBuy(h, makerBTCID, btcAmt, holdCltv, secret32(0x5a))
 	if err != nil {
 		t.Fatalf("RunTakerBuy: %v", err)
 	}
@@ -102,11 +116,19 @@ func TestPureLNSellLive(t *testing.T) {
 		t.Fatalf("maker asset NodeID: %v", err)
 	}
 
+	holdCltv, err := maker.HoldCltvForSell(btcInv, 60*time.Second)
+	if err != nil {
+		t.Fatalf("HoldCltvForSell: %v", err)
+	}
+
 	start := time.Now()
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfillSell(h, btcInv, btcAmt, assetAmt, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() {
+		mp, e := maker.MakerFulfillSell(h, btcInv, btcAmt, assetAmt, 60*time.Second)
+		makerDone <- result{mp, e}
+	}()
 
-	takerP, err := taker.RunTakerSell(h, makerAssetID, assetAmt, 18, secret32(0x5b))
+	takerP, err := taker.RunTakerSell(h, makerAssetID, assetAmt, holdCltv, secret32(0x5b))
 	if err != nil {
 		t.Fatalf("RunTakerSell: %v", err)
 	}
@@ -143,11 +165,19 @@ func TestPureLNRefundLive(t *testing.T) {
 		t.Fatalf("maker btc NodeID: %v", err)
 	}
 
+	holdCltv, err := maker.HoldCltvForBuy(assetInv, 60*time.Second)
+	if err != nil {
+		t.Fatalf("HoldCltvForBuy: %v", err)
+	}
+
 	makerDone := make(chan result, 1)
-	go func() { mp, e := maker.MakerFulfill(h, assetInv, hugeAsset, btcAmt, 60*time.Second); makerDone <- result{mp, e} }()
+	go func() {
+		mp, e := maker.MakerFulfill(h, assetInv, hugeAsset, btcAmt, 60*time.Second)
+		makerDone <- result{mp, e}
+	}()
 
 	// The taker's BTC hold must be FAILED back (refund), so PayHash returns an error.
-	_, takerErr := taker.RunTakerBuy(h, makerBTCID, btcAmt, 18, secret32(0x5c))
+	_, takerErr := taker.RunTakerBuy(h, makerBTCID, btcAmt, holdCltv, secret32(0x5c))
 	mr := <-makerDone
 
 	if mr.err == nil {
